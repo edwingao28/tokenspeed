@@ -150,15 +150,7 @@ def verify_state_blocks(
 
 
 @triton.jit(
-    do_not_specialize=[
-        "bs",
-        "num_slots",
-        "draft_tokens",
-        "granularity",
-        "table_stride",
-        "out_row",
-        "out_stride",
-    ]
+    do_not_specialize=["bs", "num_slots", "draft_tokens", "granularity", "table_stride"]
 )
 def _commit_state_pages_kernel(
     accepted,
@@ -171,8 +163,6 @@ def _commit_state_pages_kernel(
     draft_tokens,
     granularity,
     table_stride,
-    out_row,
-    out_stride,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
@@ -188,8 +178,8 @@ def _commit_state_pages_kernel(
     last = tl.load(committed + row, mask=live, other=0) + steps - 1
     slot = tl.minimum(tl.maximum(last, 0) // granularity, num_slots - 1)
     page = tl.load(table + row * table_stride + slot, mask=live, other=0)
-    tl.store(pages_out + out_row * out_stride + row, page.to(tl.int32), mask=live)
-    tl.store(steps_out + row, steps.to(tl.int32), mask=live)
+    tl.store(pages_out + row, page, mask=live)
+    tl.store(steps_out + row, steps, mask=live)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -202,7 +192,6 @@ def _torch_commit_state_pages(
     draft_tokens,
     granularity,
     pages_out,
-    out_row,
     steps_out,
 ):
     """Portable spelling, kept for non-CUDA callers (the backends' CPU tests)."""
@@ -212,7 +201,7 @@ def _torch_commit_state_pages(
         min=0, max=table.shape[1] - 1
     )
     pages = table[:batch_size].gather(1, slots.unsqueeze(1)).squeeze(1)
-    pages_out[out_row, :batch_size].copy_(pages.to(torch.int32))
+    pages_out[:batch_size].copy_(pages.to(torch.int32))
     steps_out[:batch_size].copy_(steps.to(torch.int32))
 
 
@@ -225,14 +214,12 @@ def commit_state_pages(
     draft_tokens: int,
     granularity: int,
     pages_out: torch.Tensor,
-    out_row: int,
     steps_out: torch.Tensor,
 ) -> None:
     """Resolve where each request's accepted state is written back.
 
-    The commit's torch spelling took a dozen elementwise launches to turn accept
-    lengths into per-group write pages, then stacked the groups. Writing row
-    ``out_row`` of a preallocated ``[groups, batch]`` buffer skips the stack too.
+    Cast, clamp, checkpoint-slot calculation and page lookup share one launch.
+    Pass a row view of a preallocated group buffer to avoid stacking outputs.
 
     Args:
         accepted_length: Draft matches per request ``[>=batch_size]``.
@@ -241,16 +228,20 @@ def commit_state_pages(
         batch_size: Live requests.
         draft_tokens: Speculative window; a round commits at most this many.
         granularity: Positions per checkpoint slot.
-        pages_out: INT32 ``[groups, >=batch_size]`` destination.
-        out_row: Which group row to fill.
+        pages_out: Contiguous INT32 ``[>=batch_size]`` destination for this group.
         steps_out: INT32 destination ``[>=batch_size]`` for the clamped steps.
+
+    Returns:
+        None. The first ``batch_size`` entries of both outputs are written in place.
     """
     enable_pdl = pdl_enabled()
+    if pages_out.ndim != 1:
+        raise ValueError("pages_out must be one-dimensional")
     if (
         accepted_length.stride(0) != 1
         or committed.stride(0) != 1
         or table.stride(1) != 1
-        or pages_out.stride(1) != 1
+        or pages_out.stride(0) != 1
         or steps_out.stride(0) != 1
     ):
         raise ValueError("commit state pages need unit-stride rows")
@@ -258,9 +249,7 @@ def commit_state_pages(
         raise ValueError(f"granularity must be positive, got {granularity}")
     if pages_out.dtype != torch.int32 or steps_out.dtype != torch.int32:
         raise ValueError("pages_out and steps_out must be INT32")
-    if not 0 <= out_row < pages_out.shape[0]:
-        raise ValueError(f"out_row {out_row} outside {pages_out.shape[0]} groups")
-    if pages_out.shape[1] < batch_size or steps_out.numel() < batch_size:
+    if pages_out.numel() < batch_size or steps_out.numel() < batch_size:
         raise ValueError("outputs cannot hold batch_size rows")
     if batch_size > table.shape[0] or batch_size > committed.shape[0]:
         raise ValueError("batch_size exceeds the committed or table rows")
@@ -277,7 +266,6 @@ def commit_state_pages(
             draft_tokens,
             granularity,
             pages_out,
-            out_row,
             steps_out,
         )
 
@@ -293,8 +281,6 @@ def commit_state_pages(
         draft_tokens,
         granularity,
         table.stride(0),
-        out_row,
-        pages_out.stride(0),
         BLOCK=block,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),

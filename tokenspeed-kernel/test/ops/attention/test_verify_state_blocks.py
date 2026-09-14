@@ -199,8 +199,7 @@ def test_commit_matches_the_torch_chain(bs, draft_tokens):
         batch_size=bs,
         draft_tokens=draft_tokens,
         granularity=64,
-        pages_out=pages,
-        out_row=1,
+        pages_out=pages[1],
         steps_out=steps,
     )
     want_p, want_s = _commit_reference(
@@ -224,8 +223,7 @@ def test_commit_always_advances_at_least_one_step():
         batch_size=4,
         draft_tokens=4,
         granularity=64,
-        pages_out=pages,
-        out_row=0,
+        pages_out=pages[0],
         steps_out=steps,
     )
     want_p, want_s = _commit_reference(
@@ -252,33 +250,36 @@ def test_commit_writes_only_its_group_row():
         batch_size=bs,
         draft_tokens=4,
         granularity=64,
-        pages_out=pages,
-        out_row=2,
+        pages_out=pages[2],
         steps_out=steps,
     )
     assert (pages[0] == -9).all() and (pages[1] == -9).all()
     assert not (pages[2] == -9).any()
 
 
-def test_commit_rejects_a_group_row_outside_the_buffer():
+def test_commit_rejects_invalid_destination_views():
     bs = 4
     accepted = torch.zeros(bs, device="cuda", dtype=torch.int32)
     committed = torch.zeros(bs, device="cuda", dtype=torch.int64)
     table = torch.randint(1, 900, (bs, 8), device="cuda", dtype=torch.int32)
     pages = torch.empty((2, bs), dtype=torch.int32, device="cuda")
     steps = torch.empty(bs, dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match="out_row"):
-        commit_state_pages(
-            accepted,
-            committed,
-            table,
-            batch_size=bs,
-            draft_tokens=4,
-            granularity=64,
-            pages_out=pages,
-            out_row=2,
-            steps_out=steps,
-        )
+    for invalid, message in (
+        (pages, "one-dimensional"),
+        (pages[0, :-1], "outputs cannot hold"),
+        (pages[:, 0], "unit-stride"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            commit_state_pages(
+                accepted,
+                committed,
+                table,
+                batch_size=bs,
+                draft_tokens=4,
+                granularity=64,
+                pages_out=invalid,
+                steps_out=steps,
+            )
 
 
 def test_commit_honours_a_destination_row_stride_wider_than_the_batch():
@@ -297,8 +298,7 @@ def test_commit_honours_a_destination_row_stride_wider_than_the_batch():
         batch_size=bs,
         draft_tokens=4,
         granularity=64,
-        pages_out=wide,
-        out_row=1,
+        pages_out=wide[1],
         steps_out=steps,
     )
     want_p, _ = _commit_reference(
@@ -334,8 +334,7 @@ def test_a_table_without_slots_is_rejected_by_both_resolves():
             batch_size=bs,
             draft_tokens=4,
             granularity=64,
-            pages_out=torch.empty((1, bs), dtype=torch.int32, device="cuda"),
-            out_row=0,
+            pages_out=pages,
             steps_out=torch.empty(bs, dtype=torch.int32, device="cuda"),
         )
 
@@ -373,8 +372,7 @@ def test_cpu_callers_get_the_portable_path():
         batch_size=bs,
         draft_tokens=4,
         granularity=64,
-        pages_out=stack,
-        out_row=1,
+        pages_out=stack[1],
         steps_out=steps,
     )
     want_wp, want_s = _commit_reference(

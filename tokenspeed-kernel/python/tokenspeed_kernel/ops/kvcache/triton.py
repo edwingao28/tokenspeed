@@ -583,30 +583,51 @@ def copy_state_rows(
 def _state_verify_commit_rows_kernel(
     accepted_ptr,
     pages_ptr,
+    group_indices_ptr,
     src_rows_ptr,
     dst_rows_ptr,
     batch_size,
     verify_width,
+    accepted_stride,
+    page_group_stride,
+    page_request_stride,
+    group_index_stride,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Emit one (source scratch row, destination page row) pair per request.
 
-    ``program_id(0)`` is the request and ``program_id(1)`` the layer, so the
-    outputs land layer-major exactly as :func:`copy_state_rows` expects. A null
-    page id (0) becomes destination row -1, which the copy kernel skips.
+    ``program_id(0)`` tiles requests and ``program_id(1)`` selects the layer.
+    Resolve its group in-kernel so the layer-major outputs need no eager
+    index_select, source-row arithmetic or repeat. Non-positive pages become
+    destination row -1, which the copy kernel skips.
     """
-    request = tl.program_id(0).to(tl.int64)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    request = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    live = request < batch_size
     layer = tl.program_id(1).to(tl.int64)
     out = layer * batch_size + request
-    accepted = tl.load(accepted_ptr + request).to(tl.int64)
+    accepted = tl.load(accepted_ptr + request * accepted_stride, mask=live, other=1).to(
+        tl.int64
+    )
     accepted = tl.minimum(tl.maximum(accepted, 1), verify_width)
-    src_dtype = src_rows_ptr.dtype.element_ty
     tl.store(
         src_rows_ptr + out,
-        (request * (verify_width + 1) + accepted).to(src_dtype),
+        request * (verify_width + 1) + accepted,
+        mask=live,
     )
-    page = tl.load(pages_ptr + request).to(tl.int64)
-    dst_dtype = dst_rows_ptr.dtype.element_ty
-    tl.store(dst_rows_ptr + out, tl.where(page > 0, page, -1).to(dst_dtype))
+    group = 0
+    if group_indices_ptr is not None:
+        group = tl.load(group_indices_ptr + layer * group_index_stride).to(tl.int64)
+    page = tl.load(
+        pages_ptr + group * page_group_stride + request * page_request_stride,
+        mask=live,
+        other=0,
+    ).to(tl.int64)
+    tl.store(dst_rows_ptr + out, tl.where(page > 0, page, -1), mask=live)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def state_verify_commit_rows(
@@ -617,6 +638,7 @@ def state_verify_commit_rows(
     *,
     verify_width: int,
     num_layers: int,
+    group_indices: torch.Tensor | None,
 ) -> None:
     """Build batched verify-commit row ids for :func:`copy_state_rows`.
 
@@ -632,14 +654,19 @@ def state_verify_commit_rows(
         accepted_lengths: CUDA ``[batch_size]`` per-request accepted widths.
             Values are clamped to ``[1, verify_width]`` because the first
             verified token is always accepted.
-        destination_pages: CUDA ``[batch_size]`` committed page ids; id 0 is
-            the null page and is emitted as destination row ``-1``.
+        destination_pages: CUDA int32 or int64 committed page ids, shaped
+            ``[batch_size]`` when shared by all layers, or
+            ``[num_groups, batch_size]`` when ``group_indices`` is supplied.
+            Non-positive ids become destination row ``-1``.
         src_rows: CUDA int32 or int64 ``[num_layers * batch_size]`` output,
             layer-major, holding ``request * (verify_width + 1) + accepted``.
         dst_rows: Same layout, holding the destination page id or ``-1``.
         verify_width: Candidate width per request; the scratch row block is
             ``verify_width + 1`` rows whose first row is the carried state.
         num_layers: Layer repetitions to tile, matching ``copy_state_rows``.
+        group_indices: CUDA int32 or int64 ``[num_layers]`` mapping each layer
+            to a valid row of ``destination_pages``. Pass None explicitly
+            when all layers share the same one-dimensional page vector.
 
     Returns:
         None. Both output tensors are written in place in one launch.
@@ -654,22 +681,57 @@ def state_verify_commit_rows(
         raise ValueError("verify_width must be at least one candidate per request")
     if num_layers < 1:
         raise ValueError("num_layers must be at least one")
-    if destination_pages.numel() != batch_size:
-        raise ValueError("destination_pages must hold exactly one page id per request")
+    row_id_dtypes = (torch.int32, torch.int64)
+    if group_indices is None:
+        if destination_pages.ndim != 1 or destination_pages.numel() != batch_size:
+            raise ValueError(
+                "destination_pages must hold exactly one page id per request"
+            )
+    else:
+        if (
+            destination_pages.ndim != 2
+            or destination_pages.shape[0] < 1
+            or destination_pages.shape[1] != batch_size
+        ):
+            raise ValueError(
+                "grouped destination_pages must have shape [num_groups, batch_size]"
+            )
+        if (
+            group_indices.ndim != 1
+            or group_indices.numel() != num_layers
+            or group_indices.dtype not in row_id_dtypes
+        ):
+            raise ValueError("group_indices must hold one int32 or int64 id per layer")
     total = num_layers * batch_size
     if src_rows.numel() != total or dst_rows.numel() != total:
         raise ValueError("row id outputs must hold num_layers * batch_size entries")
-    row_id_dtypes = (torch.int32, torch.int64)
-    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
+    if any(
+        t.dtype not in row_id_dtypes
+        for t in (accepted_lengths, destination_pages, src_rows, dst_rows)
+    ):
         raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
+    if accepted_lengths.ndim != 1:
+        raise ValueError("accepted_lengths must be one-dimensional")
+    if any(t.ndim != 1 or not t.is_contiguous() for t in (src_rows, dst_rows)):
+        raise ValueError("row id outputs must be contiguous one-dimensional tensors")
 
-    _state_verify_commit_rows_kernel[(batch_size, num_layers)](
+    enable_pdl = pdl_enabled()
+    block = 256
+    _state_verify_commit_rows_kernel[(triton.cdiv(batch_size, block), num_layers)](
         accepted_lengths,
         destination_pages,
+        group_indices,
         src_rows,
         dst_rows,
         batch_size,
         verify_width,
+        accepted_lengths.stride(0),
+        destination_pages.stride(0) if group_indices is not None else 0,
+        destination_pages.stride(-1),
+        group_indices.stride(0) if group_indices is not None else 0,
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 

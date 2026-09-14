@@ -167,6 +167,11 @@ def test_ple_capture_and_verify_use_own_stable_metadata(backend, monkeypatch):
     backend.commit_verified_state(torch.tensor([2, 3], dtype=torch.int32))
     backend.commit_verified_state(torch.tensor([2, 3], dtype=torch.int32))
     assert len(rows_calls) == 1
+    assert rows_calls[0][1] == {
+        "verify_width": 3,
+        "num_layers": 2,
+        "group_indices": None,
+    }
     assert backend._verify_commit_ctx is None
 
 
