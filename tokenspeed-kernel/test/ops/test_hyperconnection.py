@@ -31,7 +31,6 @@ from tokenspeed_kernel import (
     gated_residual_combine_norm,
     gated_residual_mix,
     grouped_gemma_rmsnorm,
-    prepare_gated_residual_weight_cache,
 )
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -63,13 +62,6 @@ def restore_kernel_state():
     )
     capture.enabled = previous_capture
     capture.clear()
-
-
-def _require_cute_hc() -> None:
-    if not current_platform().is_blackwell:
-        pytest.skip("warp-specialized HC requires Blackwell")
-    if KernelRegistry.get().get_by_name("cute_dsl_hyperconnection_mix") is None:
-        pytest.skip("CuTeDSL dependencies are unavailable")
 
 
 def _require_fused_hc() -> None:
@@ -224,36 +216,6 @@ def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
     _assert_mix_close((actual, actual_inject), (normalized, projection, up), 1.0, 0.03)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("rows", [1, 8, 16])
-def test_persistent_mix_matches_fp64_reference(rows: int, dtype: torch.dtype) -> None:
-    if not current_platform().is_nvidia:
-        pytest.skip("the persistent grid barrier is NVIDIA-only")
-    normalized, projection, up = _inputs(rows, dtype, seed=17)
-    actual = _mix(
-        (normalized, projection, up),
-        override="triton_persistent_hyperconnection_mix",
-        projection_scale=1.0,
-        weights_independent=False,
-    )
-    tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
-    _assert_mix_close(actual, (normalized, projection, up), 1.0, tolerance)
-
-
-@pytest.mark.parametrize("rows", [1, 8])
-def test_cute_dsl_mix_matches_fp64_reference(rows: int) -> None:
-    _require_cute_hc()
-    inputs = _inputs(rows, torch.bfloat16, seed=17)
-    assert prepare_gated_residual_weight_cache(inputs[2], LOWRANK)
-    actual = _mix(
-        inputs,
-        override="cute_dsl_hyperconnection_mix",
-        projection_scale=1.0,
-        weights_independent=False,
-    )
-    _assert_mix_close(actual, inputs, 1.0, 0.03)
-
-
 @pytest.mark.parametrize(
     (
         "rows",
@@ -303,65 +265,6 @@ def test_fused_cute_mix_matches_fp64_and_graph(
         graph.replay()
     for actual in outputs:
         torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-
-
-def test_cute_dsl_graph_replay_observes_reloaded_up_weight() -> None:
-    _require_cute_hc()
-    normalized, projection, up = _inputs(1, torch.bfloat16, seed=23)
-    up.zero_()
-    assert prepare_gated_residual_weight_cache(up, LOWRANK)
-
-    def mix() -> tuple[torch.Tensor, torch.Tensor | None]:
-        return _mix(
-            (normalized, projection, up),
-            override="cute_dsl_hyperconnection_mix",
-            projection_scale=1.0,
-            weights_independent=False,
-        )
-
-    before, _ = mix()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual, actual_inject = mix()
-
-    generator = torch.Generator(device="cuda").manual_seed(29)
-    up.data.copy_(
-        torch.randn(up.shape, dtype=up.dtype, device=up.device, generator=generator)
-        * 0.1
-    )
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(actual, before, rtol=3e-2, atol=3e-2)
-
-    assert prepare_gated_residual_weight_cache(up, LOWRANK)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    _assert_mix_close((actual, actual_inject), (normalized, projection, up), 1.0, 0.03)
-    assert not torch.allclose(actual, before, rtol=3e-2, atol=3e-2)
-
-
-def test_cute_dsl_mix_rejects_unprepared_up_weight() -> None:
-    _require_cute_hc()
-    normalized, projection, up = _inputs(1, torch.bfloat16, seed=31)
-
-    with pytest.raises(RuntimeError, match="was not prepared"):
-        _mix(
-            (normalized, projection, up),
-            override="cute_dsl_hyperconnection_mix",
-            projection_scale=1.0,
-            weights_independent=False,
-        )
-
-
-def test_cute_dsl_weight_preparation_rejects_capture(monkeypatch) -> None:
-    _require_cute_hc()
-    _, _, up = _inputs(1, torch.bfloat16, seed=37)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-
-    with pytest.raises(RuntimeError, match="outside CUDA Graph capture"):
-        prepare_gated_residual_weight_cache(up, LOWRANK)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -628,8 +531,8 @@ def test_grouped_gemma_rmsnorm_validates_out_for_zero_rows() -> None:
 @pytest.mark.parametrize(
     ("rows", "enable_pdl", "backend"),
     [
-        (1, False, "triton_persistent_hyperconnection_mix"),
-        (8, True, "triton_persistent_hyperconnection_mix"),
+        (1, False, "triton_hyperconnection_mix"),
+        (8, True, "triton_hyperconnection_mix"),
         (4, False, "cute_fused_hyperconnection_mix"),
         (16, True, "cute_fused_hyperconnection_mix"),
     ],
@@ -638,7 +541,7 @@ def test_hc_full_chain_cuda_graph_replays(
     rows: int, enable_pdl: bool, backend: str
 ) -> None:
     if not current_platform().is_nvidia:
-        pytest.skip("the persistent grid barrier is NVIDIA-only")
+        pytest.skip("CUDA graph coverage requires NVIDIA")
     if enable_pdl and not current_platform().is_hopper_plus:
         pytest.skip("PDL requires NVIDIA Hopper or newer")
     residual, projection, up = _inputs(rows, torch.bfloat16, seed=17)
@@ -703,97 +606,9 @@ def test_hc_full_chain_cuda_graph_replays(
     )
 
 
-def test_persistent_mix_uses_stream_private_barriers() -> None:
+def test_general_fallback_supports_deterministic_mode() -> None:
     if not current_platform().is_nvidia:
-        pytest.skip("the persistent grid barrier is NVIDIA-only")
-    inputs_a = _inputs(8, torch.bfloat16, seed=53)
-    inputs_b = _inputs(8, torch.bfloat16, seed=59)
-    streams = (torch.cuda.Stream(), torch.cuda.Stream())
-
-    # First calls compile and create one barrier workspace per stream.
-    for stream, values in zip(streams, (inputs_a, inputs_b), strict=True):
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            _mix(
-                values,
-                override="triton_persistent_hyperconnection_mix",
-                projection_scale=1.0,
-                weights_independent=False,
-            )
-    for stream in streams:
-        stream.synchronize()
-
-    outputs = []
-    for stream, values in zip(streams, (inputs_a, inputs_b), strict=True):
-        with torch.cuda.stream(stream):
-            outputs.append(
-                _mix(
-                    values,
-                    override="triton_persistent_hyperconnection_mix",
-                    projection_scale=1.0,
-                    weights_independent=False,
-                )
-            )
-    for stream in streams:
-        stream.synchronize()
-    for values, actual in zip((inputs_a, inputs_b), outputs, strict=True):
-        expected = _mix_reference(*values, 1.0)
-        torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
-
-    graphs = []
-    outputs = []
-    for stream, values in zip(streams, (inputs_a, inputs_b), strict=True):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            for _ in range(3):
-                result = _mix(
-                    values,
-                    override="triton_persistent_hyperconnection_mix",
-                    projection_scale=1.0,
-                    weights_independent=False,
-                )
-        graphs.append(graph)
-        outputs.append(result)
-    for _ in range(16):
-        for stream, graph in zip(streams, graphs, strict=True):
-            with torch.cuda.stream(stream):
-                graph.replay()
-    for stream in streams:
-        stream.synchronize()
-    for values, actual in zip((inputs_a, inputs_b), outputs, strict=True):
-        expected = _mix_reference(*values, 1.0)
-        torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
-
-
-@pytest.mark.parametrize(
-    ("rows", "expected_kernel"),
-    [
-        (8, "triton_persistent_hyperconnection_mix"),
-        (24, "triton_hyperconnection_mix"),
-    ],
-)
-def test_default_dispatch_uses_persistent_only_for_low_m(
-    rows: int, expected_kernel: str
-) -> None:
-    if not current_platform().is_nvidia:
-        pytest.skip("the persistent grid barrier is NVIDIA-only")
-    normalized, projection, up = _inputs(rows, torch.bfloat16, seed=67 + rows)
-    capture = ShapeCapture.get()
-    capture.clear()
-    capture.enabled = True
-    _mix(
-        (normalized, projection, up),
-        override=None,
-        projection_scale=1.0,
-        weights_independent=False,
-    )
-    torch.cuda.synchronize()
-    assert capture._records[-1].kernel_name == expected_kernel
-
-
-def test_deterministic_mode_filters_atomic_persistent_mix() -> None:
-    if not current_platform().is_nvidia:
-        pytest.skip("the persistent grid barrier is NVIDIA-only")
+        pytest.skip("CUDA graph coverage requires NVIDIA")
     normalized, projection, up = _inputs(8, torch.bfloat16, seed=61)
     capture = ShapeCapture.get()
     capture.clear()
@@ -809,111 +624,35 @@ def test_deterministic_mode_filters_atomic_persistent_mix() -> None:
     assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
 
 
-@pytest.mark.parametrize(("has_inject", "enable_pdl"), [(False, False), (True, True)])
-def test_persistent_mix_reuses_workspace_across_shapes(
-    has_inject: bool, enable_pdl: bool
-) -> None:
-    if not current_platform().is_nvidia:
-        pytest.skip("the persistent grid barrier is NVIDIA-only")
-    if enable_pdl and not current_platform().is_hopper_plus:
-        pytest.skip("PDL requires NVIDIA Hopper or newer")
-    pdl_enabled(enable_pdl)
-    # These calls share the same stream workspace, including across dtypes.
-    # Every call must leave scratch ready for a different subsequent shape.
-    for index, rows in enumerate((4, 1, 16, 3, 8, 15, 4)):
-        dtype = torch.bfloat16 if index % 2 == 0 else torch.float16
-        normalized, projection, up = _inputs(rows, dtype, seed=101 + index)
-        if not has_inject:
-            projection = projection[:LOWRANK]
-        actual = _mix(
-            (normalized, projection, up),
-            override="triton_persistent_hyperconnection_mix",
-            projection_scale=0.25,
-            weights_independent=False,
-        )
-        tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
-        _assert_mix_close(actual, (normalized, projection, up), 0.25, tolerance)
+def test_hc_mix_has_only_fused_and_general_implementations() -> None:
+    from tokenspeed_kernel.ops.residual import cute_fused
+
+    expected = {"triton_hyperconnection_mix"}
+    if cute_fused._AVAILABLE:
+        expected.add("cute_fused_hyperconnection_mix")
+    kernels = KernelRegistry.get().list_kernels("residual", "hyperconnection_mix")
+    assert {kernel.name for kernel in kernels} == expected
 
 
-@pytest.mark.parametrize(
-    ("calls_per_replay", "enable_pdl"), [(1, False), (3, True), (4, False)]
-)
-def test_persistent_mix_graph_observes_changed_inputs(
-    enable_pdl: bool, calls_per_replay: int
-) -> None:
-    if not current_platform().is_nvidia:
-        pytest.skip("the persistent grid barrier is NVIDIA-only")
-    if enable_pdl and not current_platform().is_hopper_plus:
-        pytest.skip("PDL requires NVIDIA Hopper or newer")
-    normalized, projection, up = _inputs(4, torch.bfloat16, seed=113)
+@pytest.mark.parametrize("reason", ["dtype", "strides", "capacity", "unavailable"])
+def test_unsupported_fused_contract_uses_general_fallback(monkeypatch, reason) -> None:
+    from tokenspeed_kernel.ops.residual import cute_fused
 
-    def mix() -> tuple[torch.Tensor, torch.Tensor | None]:
-        return _mix(
-            (normalized, projection, up),
-            override="triton_persistent_hyperconnection_mix",
-            projection_scale=1.0,
-            weights_independent=False,
-        )
-
-    pdl_enabled(enable_pdl)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    # Create the workspace before capture, so graph replay advances the
-    # device generation rather than replaying workspace initialization.
-    with torch.cuda.stream(stream):
-        mix()
-    stream.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        outputs = [mix() for _ in range(calls_per_replay)]
-    for _ in range(4):
-        normalized.mul_(-0.75)
-        projection.mul_(0.5)
-        up.mul_(-0.5)
-        graph.replay()
-        expected = _mix_reference(normalized, projection, up, 1.0)
-        for actual in outputs:
-            torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
-
-
-@pytest.mark.parametrize("enable_pdl", [False, True])
-def test_persistent_mix_generation_crosses_uint32(enable_pdl: bool) -> None:
-    if not current_platform().is_nvidia:
-        pytest.skip("the persistent grid barrier is NVIDIA-only")
-    if enable_pdl and not current_platform().is_hopper_plus:
-        pytest.skip("PDL requires NVIDIA Hopper or newer")
-    from tokenspeed_kernel.ops.residual.triton import _persistent_workspace
-
-    normalized, projection, up = _inputs(4, torch.bfloat16, seed=127)
-    raw, counters = _persistent_workspace(normalized.device, LOWRANK + HC_COUNT)
-    num_ctas = torch.cuda.get_device_properties(normalized.device).multi_processor_count
-    generation = (1 << 32) - 1
-    try:
-        pdl_enabled(enable_pdl)
-        raw.zero_()
-        counters.copy_(
-            torch.tensor(
-                [generation * num_ctas, generation],
-                device=counters.device,
-                dtype=torch.int64,
-            )
-        )
-        expected = _mix_reference(normalized, projection, up, 1.0)
-        for step in range(3):
-            actual = _mix(
-                (normalized, projection, up),
-                override="triton_persistent_hyperconnection_mix",
-                projection_scale=1.0,
-                weights_independent=False,
-            )
-            torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
-            next_generation = generation + step + 1
-            assert counters.tolist() == [next_generation * num_ctas, next_generation]
-            assert torch.count_nonzero(raw[next_generation & 1]).item() == 0
-    finally:
-        torch.cuda.synchronize()
-        raw.zero_()
-        counters.zero_()
+    dtype = torch.float32 if reason == "dtype" else torch.bfloat16
+    values = list(_inputs(4, dtype, seed=73))
+    if reason == "strides":
+        up = values[2]
+        storage = up.new_empty((WIDE, LOWRANK * 2))
+        values[2] = storage[:, ::2].copy_(up)
+    elif reason == "capacity":
+        monkeypatch.setattr(cute_fused, "_resident_clusters", lambda index, stream: 5)
+    elif reason == "unavailable":
+        monkeypatch.setattr(cute_fused, "_AVAILABLE", False)
+    capture = ShapeCapture.get()
+    capture.enabled = True
+    actual = _mix(values, override=None, projection_scale=1.0, weights_independent=True)
+    assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
+    _assert_mix_close(actual, values, 1.0, 0.04)
 
 
 @triton.jit
@@ -939,8 +678,6 @@ def _publish_mix_inputs_kernel(
 @pytest.mark.parametrize(
     ("rows", "dtype", "has_inject", "backend", "weights_independent", "scale"),
     [
-        (1, torch.bfloat16, True, "triton_persistent", False, 1.0),
-        (16, torch.float16, False, "triton_persistent", False, 1.0),
         (4, torch.bfloat16, True, "cute_fused", False, 0.25),
         (1, torch.float16, False, "cute_fused", True, 0.25),
         (16, torch.bfloat16, True, "cute_fused", True, 0.25),
@@ -1019,35 +756,6 @@ def test_mix_prefetch_observes_pdl_producer_updates(
 
 
 @pytest.mark.parametrize(
-    ("input_index", "dtype"),
-    [(0, torch.bfloat16), (1, torch.float16), (2, torch.bfloat16)],
-)
-def test_persistent_prefetch_accepts_unaligned_contiguous_views(
-    input_index: int, dtype: torch.dtype
-) -> None:
-    if not current_platform().is_hopper_plus:
-        pytest.skip("bulk weight prefetch and PDL require NVIDIA Hopper or newer")
-    inputs = list(_inputs(4, dtype, seed=149))
-    original = inputs[input_index]
-    storage = torch.empty(original.numel() + 1, dtype=dtype, device=original.device)
-    unaligned = storage[1:].view_as(original)
-    unaligned.copy_(original)
-    assert unaligned.is_contiguous()
-    assert unaligned.data_ptr() % 16 != 0
-    inputs[input_index] = unaligned
-    normalized, projection, up = inputs
-    pdl_enabled(True)
-    actual = _mix(
-        (normalized, projection, up),
-        override="triton_persistent_hyperconnection_mix",
-        projection_scale=1.0,
-        weights_independent=False,
-    )
-    tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
-    _assert_mix_close(actual, (normalized, projection, up), 1.0, tolerance)
-
-
-@pytest.mark.parametrize(
     ("rows", "enable_pdl", "weights_independent"),
     [(1, True, True), (16, False, True), (9, True, False), (24, True, True)],
 )
@@ -1069,11 +777,7 @@ def test_fused_cute_dispatch_requires_explicit_weight_contract(
     expected_name = (
         "cute_fused_hyperconnection_mix"
         if weights_independent and rows <= 16
-        else (
-            "triton_persistent_hyperconnection_mix"
-            if rows <= 16
-            else "triton_hyperconnection_mix"
-        )
+        else "triton_hyperconnection_mix"
     )
     assert capture._records[-1].kernel_name == expected_name
     _assert_mix_close(actual, (x, w, u), 1.0, 0.04)
@@ -1095,7 +799,7 @@ def test_fused_cute_dispatch_checks_all_tma_alignments(input_index, offset):
     expected_name = (
         "cute_fused_hyperconnection_mix"
         if offset == 8
-        else "triton_persistent_hyperconnection_mix"
+        else "triton_hyperconnection_mix"
     )
     assert capture._records[-1].kernel_name == expected_name
     _assert_mix_close(actual, values, 1.0, 0.04)

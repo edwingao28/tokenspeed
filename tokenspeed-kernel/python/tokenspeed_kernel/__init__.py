@@ -85,7 +85,6 @@ from tokenspeed_kernel.ops.residual import (
     mhc_fused_hc,
     mhc_post,
     mhc_pre,
-    prepare_gated_residual_weight_cache,
 )
 from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.transform import hadamard_transform
@@ -124,7 +123,6 @@ __all__ = [
     "mhc_fused_hc",
     "mhc_post",
     "mhc_pre",
-    "prepare_gated_residual_weight_cache",
     # layernorm
     "grouped_gemma_rmsnorm",
     # attention

@@ -140,7 +140,9 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         ctx = kwargs["ctx"]
         hidden_states = kwargs["hidden_states"]
         input_ids = kwargs["input_ids"]
-        mixed, residuals = self._prepare_attention(hidden_states, input_ids, ctx)
+        mixed, residuals = self._prepare_attention(
+            hidden_states, kwargs["residual"], input_ids, ctx
+        )
         attention_output = (
             mixed
             if ctx.forward_mode.is_idle()
@@ -151,7 +153,7 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
                 value.index_select(0, ctx.gather_ids) for value in residuals
             )
         mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(mixed, residuals, ctx), None
+        return self._run_mlp(mixed, residuals, ctx)
 
 
 class Qwen4ExpDraftModel(Qwen4ExpModel):

@@ -134,7 +134,7 @@ if _AVAILABLE:
             "fused_tma_aligned": frozenset({True}),
             "fused_grid_supported": frozenset({True}),
         },
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         tags={"cute_dsl", "decode", "latency"},
     )
     def cute_fused_hyperconnection_mix(

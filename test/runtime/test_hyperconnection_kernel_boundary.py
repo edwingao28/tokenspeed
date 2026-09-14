@@ -41,7 +41,6 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
-    GatedResidualUpdate,
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.models.qwen4_exp import Qwen4ExpModel, _Qwen4ExpDecoderMixin
@@ -80,11 +79,7 @@ def test_kernel_boundary_is_gpu_only() -> None:
         )
 
 
-def test_up_weight_loader_prepares_kernel_cache(monkeypatch) -> None:
-    prepare = mock.Mock(return_value=True)
-    monkeypatch.setattr(
-        hyperconnection_module, "prepare_gated_residual_weight_cache", prepare
-    )
+def test_up_weight_loader_copies_checkpoint() -> None:
     lowrank = 3
     mixer = GatedResidualSimple(
         HyperConnectionConfig(hc_count=2, hidden_size=4, hc_lowrank=lowrank)
@@ -95,14 +90,9 @@ def test_up_weight_loader_prepares_kernel_cache(monkeypatch) -> None:
     param.weight_loader(param, loaded)
 
     torch.testing.assert_close(param, loaded)
-    prepare.assert_called_once_with(param, lowrank)
 
 
-def test_up_weight_loader_rejects_shape_change(monkeypatch) -> None:
-    prepare = mock.Mock(return_value=True)
-    monkeypatch.setattr(
-        hyperconnection_module, "prepare_gated_residual_weight_cache", prepare
-    )
+def test_up_weight_loader_rejects_shape_change() -> None:
     mixer = GatedResidualSimple(
         HyperConnectionConfig(hc_count=2, hidden_size=4, hc_lowrank=3)
     )
@@ -110,8 +100,6 @@ def test_up_weight_loader_rejects_shape_change(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="shape mismatch"):
         param.weight_loader(param, torch.empty(8, 4))
-
-    prepare.assert_not_called()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -123,7 +111,7 @@ def test_up_weight_loader_rejects_shape_change(monkeypatch) -> None:
         (True, torch.float32),
     ],
 )
-def test_mix_fuses_previous_combine_with_its_own_norm(
+def test_combine_norm_uses_consumers_norm(
     per_branch_norm: bool, dtype: torch.dtype
 ) -> None:
     config = HyperConnectionConfig(
@@ -145,22 +133,17 @@ def test_mix_fuses_previous_combine_with_its_own_norm(
         current.hc_norm.weight.fill_(-0.125)
     residual = torch.randn(5, 39, device="cuda", dtype=dtype)
     block = torch.randn(5, 13, device="cuda", dtype=dtype)
-    _, previous_residuals = previous.mix(residual)
+    _, previous_residuals = previous.mix(residual, normalized=None)
     combined = previous.combine(block, previous_residuals)
-    expected_mix, expected_residuals = current.mix(combined)
+    expected_mix, expected_residuals = current.mix(combined, normalized=None)
 
     with mock.patch.object(
         current.hc_norm,
         "forward",
         side_effect=AssertionError("unexpected separate norm"),
     ):
-        actual_mix, actual_residuals = current.mix(
-            GatedResidualUpdate(
-                residual=residual,
-                block_output=block,
-                inject_logits=previous_residuals[2],
-            )
-        )
+        combined, normalized = current.combine_norm(block, previous_residuals)
+        actual_mix, actual_residuals = current.mix(combined, normalized=normalized)
 
     torch.testing.assert_close(actual_mix, expected_mix, rtol=0, atol=0)
     torch.testing.assert_close(actual_residuals, expected_residuals, rtol=0, atol=0)
@@ -190,13 +173,13 @@ def test_attention_to_mlp_fusion_after_communication(communication: str) -> None
     rows = 0 if communication == "idle" else 6
     residual = torch.randn(rows, 32, device="cuda")
     output = torch.randn(rows, 8, device="cuda")
-    _, residuals = attention.mix(residual)
+    _, residuals = attention.mix(residual, normalized=None)
     row_slice = slice(2, 5) if communication == "row_slice" else slice(None)
     communicated_residual = residual[row_slice]
     communicated_output = output[row_slice]
     aligned_residuals = attention.norm_for(communicated_residual, residuals)
     combined = attention.combine(communicated_output, aligned_residuals)
-    expected_mix, expected_residuals = mlp.mix(combined)
+    expected_mix, expected_residuals = mlp.mix(combined, normalized=None)
     post_attn_comm = mock.Mock(
         return_value=(communicated_output, communicated_residual)
     )
@@ -245,7 +228,7 @@ def test_non_power_of_two_hc_scales_projection_results() -> None:
 
     hyper_input = torch.randn(5, hc_count * hidden_size, device="cuda")
     block_output = torch.randn(5, hidden_size, device="cuda")
-    mixed, residuals = mixer.mix(hyper_input)
+    mixed, residuals = mixer.mix(hyper_input, normalized=None)
     combined = mixer.combine(block_output, residuals)
     normalized = residuals[1]
 
@@ -276,12 +259,12 @@ def test_runtime_declares_loaded_hc_weights_independent(monkeypatch) -> None:
     monkeypatch.setattr(mixer, "_normalize", lambda x: x)
     call = mock.Mock(return_value=(mixed, inject))
     monkeypatch.setattr(hyperconnection_module, "gated_residual_mix", call)
-    mixer.mix(value)
+    mixer.mix(value, normalized=None)
     assert call.call_args.kwargs["weights_independent"] is True
 
 
-@pytest.mark.parametrize("pending_update", [False, True])
-def test_mix_rejects_wrong_residual_width(pending_update: bool) -> None:
+@pytest.mark.parametrize("has_normalized", [False, True])
+def test_mix_rejects_wrong_residual_width(has_normalized: bool) -> None:
     mixer = GatedResidualSimple(
         HyperConnectionConfig(
             hc_count=4,
@@ -295,14 +278,8 @@ def test_mix_rejects_wrong_residual_width(pending_update: bool) -> None:
         use_combine=True,
     )
     value = torch.empty(2, 31)
-    if pending_update:
-        value = GatedResidualUpdate(
-            residual=value,
-            block_output=torch.empty(2, 8),
-            inject_logits=torch.empty(2, 4),
-        )
     with pytest.raises(ValueError, match="hyper input width must be 32, got 31"):
-        mixer.mix(value)
+        mixer.mix(value, normalized=value if has_normalized else None)
 
 
 @pytest.mark.parametrize(
@@ -397,13 +374,17 @@ class _TailFusionLayer(torch.nn.Module, _Qwen4ExpDecoderMixin):
         )
 
     def forward(self, positions, hidden_states, residual, ctx, input_ids):
-        del positions, residual
-        mixed, residuals = self._prepare_attention(hidden_states, input_ids, ctx)
+        del positions
+        mixed, residuals = self._prepare_attention(
+            hidden_states, residual, input_ids, ctx
+        )
         attention_output = mixed if ctx.forward_mode.is_idle() else mixed * 0.125
         mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
-        update = self._run_mlp(mixed, residuals, ctx)
-        assert isinstance(update, GatedResidualUpdate)
-        return update.materialize() if self.materialize_tail else update, None
+        output, residuals = self._run_mlp(mixed, residuals, ctx)
+        assert isinstance(output, torch.Tensor)
+        if self.materialize_tail:
+            return self.mlp_hyper_connection.combine(output, residuals), None
+        return output, residuals
 
 
 def _tail_fusion_model(
@@ -576,22 +557,32 @@ def test_mtp_tail_fusion_preserves_narrowed_residual_rows() -> None:
     layer.self_attention = (
         lambda positions, mixed, ctx: mixed.index_select(0, ctx.gather_ids) * 0.125
     )
-    mixed, residuals = layer._prepare_attention(value, ids, ctx)
+    mixed, residuals = layer._prepare_attention(value, None, ids, ctx)
     output = layer.self_attention(ids, mixed, ctx)
     residuals = tuple(tensor.index_select(0, ctx.gather_ids) for tensor in residuals)
     combined = layer.attn_hyper_connection.combine(output, residuals)
-    mixed, residuals = layer.mlp_hyper_connection.mix(combined)
+    mixed, residuals = layer.mlp_hyper_connection.mix(combined, normalized=None)
     expected_hc = layer.mlp_hyper_connection.combine(layer.mlp(mixed), residuals)
-    expected, _ = model.hyper_connection_mixer.mix(expected_hc)
+    expected, _ = model.hyper_connection_mixer.mix(expected_hc, normalized=None)
 
     with mock.patch.object(
         hyperconnection_module,
         "gated_residual_combine",
         side_effect=AssertionError("unexpected separate combine"),
     ):
-        update, _ = Qwen4ExpDraftAttentionDecoderLayer.forward(
-            layer, positions=ids, hidden_states=value, input_ids=ids, ctx=ctx
+        output, residuals = Qwen4ExpDraftAttentionDecoderLayer.forward(
+            layer,
+            positions=ids,
+            hidden_states=value,
+            residual=None,
+            input_ids=ids,
+            ctx=ctx,
         )
-        actual, actual_residuals = model.hyper_connection_mixer.mix(update)
+        combined, normalized = model.hyper_connection_mixer.combine_norm(
+            output, residuals
+        )
+        actual, actual_residuals = model.hyper_connection_mixer.mix(
+            combined, normalized=normalized
+        )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual_residuals[0], expected_hc, rtol=0, atol=0)

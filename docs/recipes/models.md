@@ -702,9 +702,11 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
-Adjacent residual injection and grouped RMSNorm run in one kernel. PLE,
-deepstack updates and row-gather boundaries materialize the residual first;
-the updated HC state remains available for MTP.
+The decoder passes ordinary sublayer-output tensors and residual tuples between
+layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's
+`combine_norm()` to fuse residual injection with that mixer's grouped RMSNorm.
+PLE, deepstack updates and row-gather boundaries combine the residual first;
+the updated, unnormalized HC state remains available for MTP.
 
 ```bash
 ts serve \
