@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
     gated_residual_combine,
+    gated_residual_combine_norm,
     gated_residual_mix,
     grouped_gemma_rmsnorm,
     prepare_gated_residual_weight_cache,
@@ -76,6 +77,32 @@ def _matching_rows(base: torch.Tensor, derived: torch.Tensor):
     if start + derived.shape[0] > base.shape[0]:
         return None
     return start
+
+
+@dataclass(frozen=True)
+class GatedResidualUpdate:
+    """Forward-local residual injection awaiting its consuming normalization.
+
+    All three tensors share a dtype and row layout. ``residual`` contains the
+    branch streams, ``block_output`` one sublayer output per row, and
+    ``inject_logits`` one gate per row and branch. Materialize before an
+    intervening operation that needs the updated, unnormalized streams.
+    The producing sublayer has already consumed ``residual``, so a consuming
+    mixer may preload it and its immutable norm weights before the PDL wait.
+    """
+
+    residual: torch.Tensor
+    block_output: torch.Tensor
+    inject_logits: torch.Tensor
+
+    def materialize(self) -> torch.Tensor:
+        return gated_residual_combine(
+            self.block_output,
+            self.residual,
+            self.inject_logits,
+            self.inject_logits.shape[-1],
+            self.block_output.shape[-1],
+        )
 
 
 class GroupedGemmaRMSNorm(nn.Module):
@@ -229,19 +256,38 @@ class GatedResidualSimple(nn.Module):
         rows = slice(start, start + value.shape[0])
         return value, normalized[rows], inject_logits[rows]
 
-    def mix(self, hyper_input: torch.Tensor):
+    def mix(self, hyper_input: torch.Tensor | GatedResidualUpdate):
         """Mix ``hc_count`` residual branches into one sublayer input.
+
+        Args:
+            hyper_input: Residual streams shaped ``[..., hc_count * hidden_size]``
+                or a pending update to fuse into this mixer's normalization.
 
         Returns:
             A pair containing the mixed ``[..., hidden_size]`` input and the
             residual tuple required by :meth:`combine`.
         """
+        update = hyper_input if isinstance(hyper_input, GatedResidualUpdate) else None
+        if update is not None:
+            hyper_input = update.residual
         expected = self.hc_count * self.hidden_size
         if hyper_input.shape[-1] != expected:
             raise ValueError(
                 f"hyper input width must be {expected}, got {hyper_input.shape[-1]}"
             )
-        normalized = self._normalize(hyper_input)
+        if update is None:
+            normalized = self._normalize(hyper_input)
+        else:
+            hyper_input, normalized = gated_residual_combine_norm(
+                update.block_output,
+                hyper_input,
+                update.inject_logits,
+                self.hc_norm.weight,
+                self.hc_count,
+                self.hidden_size,
+                self.hc_norm.variance_epsilon,
+                preload_residual=True,
+            )
         mixed, inject_logits = gated_residual_mix(
             normalized,
             self.mix_inject_proj.weight,
@@ -250,6 +296,7 @@ class GatedResidualSimple(nn.Module):
             self.hidden_size,
             self.hc_lowrank,
             projection_scale=self._projection_scale,
+            weights_independent=True,
         )
         mixed = mixed.to(self.config.params_dtype)
         return mixed, (
@@ -272,6 +319,7 @@ class GatedResidualSimple(nn.Module):
 
 __all__ = [
     "GatedResidualSimple",
+    "GatedResidualUpdate",
     "GroupedGemmaRMSNorm",
     "HyperConnectionConfig",
 ]

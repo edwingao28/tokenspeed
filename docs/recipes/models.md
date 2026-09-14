@@ -702,6 +702,12 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
+Residual injection and the next mixer's grouped RMSNorm run in one kernel,
+both from attention to MLP and from MLP to the next attention or final output
+mixer. PLE, deepstack updates and row-gather boundaries first materialize the
+residual. Mixers accept either those materialized streams or a pending residual
+update, keeping the updated HC hidden state available for MTP.
+
 ```bash
 ts serve \
     --model Qwen/Qwen3.8-Flash-Next-FP8 \

@@ -41,6 +41,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
+    GatedResidualUpdate,
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -208,10 +209,14 @@ class _Qwen4ExpDecoderMixin:
 
     def _prepare_attention(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | GatedResidualUpdate,
         input_ids: torch.Tensor,
         ctx: ForwardContext,
     ):
+        if isinstance(hidden_states, GatedResidualUpdate):
+            if self.ple is None and not self.comm_manager.needs_pre_attn_all_gather():
+                return self.attn_hyper_connection.mix(hidden_states)
+            hidden_states = hidden_states.materialize()
         expected = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] == self.hidden_size:
             hidden_states = hidden_states.repeat(1, self.hc_count)
@@ -231,19 +236,23 @@ class _Qwen4ExpDecoderMixin:
         attention_output: torch.Tensor,
         residuals,
         ctx: ForwardContext,
-    ) -> torch.Tensor:
-        if ctx.forward_mode.is_idle():
-            return self.attn_hyper_connection.combine(attention_output, residuals)
-        attention_output, residual = self.comm_manager.post_attn_comm(
-            attention_output, residuals[0], ctx
-        )
-        return self.attn_hyper_connection.combine(
-            attention_output,
-            self.attn_hyper_connection.norm_for(residual, residuals),
+    ):
+        if not ctx.forward_mode.is_idle():
+            attention_output, residual = self.comm_manager.post_attn_comm(
+                attention_output, residuals[0], ctx
+            )
+            residuals = self.attn_hyper_connection.norm_for(residual, residuals)
+        # The MLP consumes this updated residual immediately, so inject the
+        # attention output in the MLP's grouped norm before its mix projection.
+        return self.mlp_hyper_connection.mix(
+            GatedResidualUpdate(
+                residual=residuals[0],
+                block_output=attention_output,
+                inject_logits=residuals[2],
+            )
         )
 
-    def _run_mlp(self, hidden_states: torch.Tensor, ctx: ForwardContext):
-        mixed, residuals = self.mlp_hyper_connection.mix(hidden_states)
+    def _run_mlp(self, mixed: torch.Tensor, residuals, ctx: ForwardContext):
         num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(ctx)
         if self.is_moe:
             deferred_reduce = (
@@ -259,7 +268,11 @@ class _Qwen4ExpDecoderMixin:
             mixed = self.comm_manager.pre_mlp_comm(mixed, ctx)
             output = self.mlp(mixed)
             output, _ = self.comm_manager.post_mlp_comm(output, residuals[0], ctx)
-        return self.mlp_hyper_connection.combine(output, residuals)
+        return GatedResidualUpdate(
+            residual=residuals[0],
+            block_output=output,
+            inject_logits=residuals[2],
+        )
 
 
 class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLayer):
@@ -306,7 +319,7 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | GatedResidualUpdate,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
@@ -317,8 +330,8 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
         attention_output = (
             mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, ctx)
         )
-        hidden_states = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(hidden_states, ctx), None
+        mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
+        return self._run_mlp(mixed, residuals, ctx), None
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -458,7 +471,7 @@ class Qwen4ExpAttentionDecoderLayer(
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | GatedResidualUpdate,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
@@ -471,8 +484,8 @@ class Qwen4ExpAttentionDecoderLayer(
             if ctx.forward_mode.is_idle()
             else self.self_attention(positions, mixed, ctx)
         )
-        hidden_states = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(hidden_states, ctx), None
+        mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
+        return self._run_mlp(mixed, residuals, ctx), None
 
 
 class Qwen4ExpModel(Qwen3_5ForCausalLM):
@@ -553,19 +566,22 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 and input_deepstack_embeds.numel()
                 and layer_id < 3
             ):
+                if isinstance(hidden_states, GatedResidualUpdate):
+                    hidden_states = hidden_states.materialize()
                 start = self.hidden_size * layer_id
                 deepstack = input_deepstack_embeds[
                     :, start : start + self.hidden_size
                 ].repeat(1, self.config.hc_count)
                 hidden_states.add_(deepstack)
 
-        if self.layers:
+        if self.layers and self.layers[-1].comm_manager.needs_final_all_gather():
+            if isinstance(hidden_states, GatedResidualUpdate):
+                hidden_states = hidden_states.materialize()
             hidden_states, _ = self.layers[-1].comm_manager.post_final_norm_comm(
                 hidden_states, hidden_states, ctx
             )
-        hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-        return hidden_states, [hc_hidden_states]
+        hidden_states, residuals = self.hyper_connection_mixer.mix(hidden_states)
+        return hidden_states, [residuals[0]]
 
 
 def _normalize_checkpoint_name(name: str) -> str:

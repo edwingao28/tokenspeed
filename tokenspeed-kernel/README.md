@@ -149,6 +149,18 @@ cases from the merge base and candidate revision. See the
 contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
 for workflow behavior and runner requirements.
 
+The gated-residual mix requires an explicit `weights_independent` contract.
+Blackwell HC4/H2560/R320 with 1–16 rows can use a single CuTe kernel with a
+shared Down/Up weight TMA warp, K128 stages and fixed-order cluster16
+reduction. Two-GEMM CuTe and persistent Triton cover their supported fallback
+shapes. Prepare the two-GEMM backend's weight cache after loading weights and
+before forward or graph capture. Use `test/ops/bench_hyperconnection.py` for
+mix/chain benchmarks with resident and rotating weights.
+
+`test/ops/test_hyperconnection.py` shares FP64 reference checks across CuTe
+backends in eager execution and CUDA graphs, while keeping synchronization,
+weight reload and dispatch regressions as separate cases.
+
 ### Plugins
 
 `python -m tokenspeed_kernel.plugins` lists discovered out-of-tree backends.

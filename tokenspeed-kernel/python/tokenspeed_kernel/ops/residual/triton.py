@@ -160,6 +160,9 @@ def _combine_kernel(
     mask = offsets < hidden_size
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # The following normalization can prepare while the residual update
+        # runs. Its own PDL wait still protects every load of this output.
+        tl.extra.cuda.gdc_launch_dependents()
     value = tl.load(
         block_ptr + row * block_row_stride + offsets, mask=mask, other=0.0
     ).to(tl.float32)
@@ -176,15 +179,48 @@ def _combine_kernel(
             residual + value * 2.0 * tl.sigmoid(logit),
             mask=mask,
         )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
-def _grid_barrier(counter_ptr, num_ctas):
+def _grid_barrier(counter_ptr, arrival_target):
     tl.atomic_add(counter_ptr, 1, sem="acq_rel", scope="gpu")
-    while tl.atomic_add(counter_ptr, 0, sem="acq_rel", scope="gpu") < num_ctas:
+    while (
+        tl.inline_asm_elementwise(
+            "ld.global.acquire.gpu.u64 $0, [$1];",
+            constraints="=l,l",
+            args=[counter_ptr],
+            dtype=tl.int64,
+            is_pure=False,
+            pack=1,
+        )
+        < arrival_target
+    ):
         pass
+
+
+@triton.jit
+def _prefetch_weight_l2(weight_ptr, numel, pid, BYTES: tl.constexpr):
+    """Issue one bounded, asynchronous cache hint from the CTA leader."""
+    offset = pid * BYTES
+    size = tl.minimum(BYTES, numel * 2 - offset)
+    # Contiguous tensor views need not have a 16-byte-aligned base address.
+    # The prefetch instruction requires alignment; ordinary loads do not.
+    if (size > 0) & ((weight_ptr.to(tl.uint64) & 15) == 0):
+        tl.inline_asm_elementwise(
+            """{
+                .reg .pred leader;
+                .reg .u32 tid;
+                mov.u32 tid, %tid.x;
+                setp.eq.u32 leader, tid, 0;
+                @leader cp.async.bulk.prefetch.L2.global [$1], $2;
+                mov.u32 $0, 0;
+            }""",
+            constraints="=r,l,r",
+            args=[weight_ptr + offset // 2, size],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
 
 
 @triton.jit
@@ -212,23 +248,34 @@ def _persistent_mix_kernel(
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
-    """One-resident-grid decode mix with stream-private barrier state."""
+    """One resident grid with alternating, stream-private projection buffers."""
     pid = tl.program_id(0)
     offsets_m = tl.arange(0, ROWS)
     mask_m = offsets_m < num_rows
 
-    # A preceding PDL producer may still be draining. This kernel reuses a
-    # stream-private scratch tensor across layers, so wait before even zeroing
-    # it; consecutive persistent launches are therefore safe as well.
+    # PDL is available on SM90+, as is bulk L2 prefetch. Hints can overlap the
+    # producer without consuming weight values: actual loads still follow the
+    # wait, including when a graph updates weights in its preceding kernel.
+    if ENABLE_PDL:
+        _prefetch_weight_l2(up_weight_ptr, HC_COUNT * HIDDEN_SIZE * LOWRANK, pid, 49152)
+        _prefetch_weight_l2(projection_weight_ptr, PROJECTION_ROWS * K, pid, 49152)
+
+    # A previous launch may still use either buffer or publish its generation.
+    # Wait before accessing stream-private state, including the generation.
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    zero_span = ROWS * PROJECTION_ROWS
+    generation = tl.load(counters_ptr + 1, volatile=True)
+    # Keep every row's 32-column atomic tiles within aligned 128-byte segments,
+    # including the production projection's four trailing inject columns.
+    PROJECTION_STRIDE: tl.constexpr = tl.cdiv(PROJECTION_ROWS, BLOCK_N) * BLOCK_N
+    buffer_span = ROWS * PROJECTION_STRIDE
+    next_raw_ptr = projection_raw_ptr + ((generation + 1) & 1) * buffer_span
+    projection_raw_ptr += (generation & 1) * buffer_span
     offsets_z = tl.arange(0, 256)
-    for zero_start in range(pid * 256, zero_span, num_ctas * 256):
+    for zero_start in range(pid * 256, buffer_span, num_ctas * 256):
         indices = zero_start + offsets_z
-        tl.store(projection_raw_ptr + indices, 0.0, mask=indices < zero_span)
-    _grid_barrier(counters_ptr, num_ctas)
+        tl.store(next_raw_ptr + indices, 0.0, mask=indices < buffer_span)
 
     offsets_k = tl.arange(0, BLOCK_K)
     offsets_n = tl.arange(0, BLOCK_N)
@@ -252,13 +299,22 @@ def _persistent_mix_kernel(
         )
         partial = tl.dot(x, tl.trans(weight))
         tl.atomic_add(
-            projection_raw_ptr + offsets_m[:, None] * PROJECTION_ROWS + n[None, :],
+            projection_raw_ptr + offsets_m[:, None] * PROJECTION_STRIDE + n[None, :],
             partial,
-            mask=mask_n[None, :],
+            mask=mask_m[:, None] & mask_n[None, :],
             sem="relaxed",
             scope="gpu",
         )
-    _grid_barrier(counters_ptr + 1, num_ctas)
+    # All projection work is issued. Let the consumer prepare while this grid
+    # finishes its reduction and up projection; it must still wait for results.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    _grid_barrier(counters_ptr, (generation + 1) * num_ctas)
+    if pid == 0:
+        # Every CTA has consumed this generation and cleared its next-buffer
+        # slice before arrival. Keep the arrival count monotonic so a slow
+        # poller can still observe completion after the generation advances.
+        tl.store(counters_ptr + 1, generation + 1)
 
     if HAS_INJECT:
         # Production HC=4 and ROWS=16 fit in one power-of-two vector. Only CTA
@@ -269,7 +325,7 @@ def _persistent_mix_kernel(
             branch = offsets_i - inject_row * HC_COUNT
             inject_mask = (inject_row < num_rows) & (branch < HC_COUNT)
             logits = tl.load(
-                projection_raw_ptr + inject_row * PROJECTION_ROWS + LOWRANK + branch,
+                projection_raw_ptr + inject_row * PROJECTION_STRIDE + LOWRANK + branch,
                 mask=inject_mask,
                 other=0.0,
             )
@@ -298,7 +354,7 @@ def _persistent_mix_kernel(
             mask_r = rank < LOWRANK
             down = tl.load(
                 projection_raw_ptr
-                + offsets_m[:, None] * PROJECTION_ROWS
+                + offsets_m[:, None] * PROJECTION_STRIDE
                 + rank[None, :],
                 mask=mask_m[:, None] & mask_r[None, :],
                 other=0.0,
@@ -326,14 +382,6 @@ def _persistent_mix_kernel(
             mixed,
             mask=mask_m[:, None] & mask_j[None, :],
         )
-
-    ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
-    if ticket == num_ctas - 1:
-        tl.store(counters_ptr, 0)
-        tl.store(counters_ptr + 1, 0)
-        tl.store(counters_ptr + 2, 0)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _launch_projection_epilogue(
@@ -428,6 +476,7 @@ def triton_hyperconnection_mix(
     hidden_size: int,
     lowrank: int,
     projection_scale: float,
+    weights_independent: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """GEMM plus Triton-epilogue path for general decode and prefill shapes."""
     projected = F.linear(normalized, projection_weight)
@@ -469,10 +518,14 @@ def _persistent_workspace(
         with _WORKSPACE_LOCK:
             workspace = _PERSISTENT_WORKSPACES.get(key)
             if workspace is None:
-                raw = torch.empty(
-                    (16, projection_rows), dtype=torch.float32, device=device
+                raw = torch.zeros(
+                    (2, 16, triton.cdiv(projection_rows, 32) * 32),
+                    dtype=torch.float32,
+                    device=device,
                 )
-                counters = torch.zeros(3, dtype=torch.int32, device=device)
+                # Cumulative arrivals and the next launch's generation. Both
+                # buffers start clear; each launch clears the other buffer.
+                counters = torch.zeros(2, dtype=torch.int64, device=device)
                 workspace = (raw, counters)
                 _PERSISTENT_WORKSPACES[key] = workspace
     return workspace
@@ -489,7 +542,7 @@ def _persistent_workspace(
     ),
     signatures=_PERSISTENT_MIX_SIGNATURES,
     traits=_PERSISTENT_TRAITS,
-    priority=Priority.SPECIALIZED + 2,
+    priority=Priority.SPECIALIZED + 1,
     tags={"decode", "latency"},
 )
 def triton_persistent_hyperconnection_mix(
@@ -500,8 +553,9 @@ def triton_persistent_hyperconnection_mix(
     hidden_size: int,
     lowrank: int,
     projection_scale: float,
+    weights_independent: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Single persistent decode kernel with per-stream barrier workspaces."""
+    """Single persistent decode kernel with per-stream projection workspaces."""
     rows, wide = normalized.shape
     if (
         not current_platform().is_nvidia
@@ -530,6 +584,7 @@ def triton_persistent_hyperconnection_mix(
         if has_inject
         else None
     )
+    # The cumulative arrival target requires a fixed grid size per workspace.
     num_ctas = torch.cuda.get_device_properties(normalized.device).multi_processor_count
     enable_pdl = pdl_enabled()
     launch_kwargs = {"launch_pdl": True} if enable_pdl else {}
@@ -556,7 +611,8 @@ def triton_persistent_hyperconnection_mix(
         BLOCK_K=256,
         BLOCK_J=32,
         BLOCK_R=64,
-        num_warps=8,
+        num_warps=4,
+        num_stages=3,
         **launch_kwargs,
     )
     return mixed, inject
