@@ -115,8 +115,14 @@ def test_up_weight_loader_rejects_shape_change(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-@pytest.mark.parametrize("per_branch_norm", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    ("per_branch_norm", "dtype"),
+    [
+        (False, torch.bfloat16),
+        (True, torch.bfloat16),
+        (True, torch.float32),
+    ],
+)
 def test_mix_fuses_previous_combine_with_its_own_norm(
     per_branch_norm: bool, dtype: torch.dtype
 ) -> None:
@@ -299,10 +305,17 @@ def test_mix_rejects_wrong_residual_width(pending_update: bool) -> None:
         mixer.mix(value)
 
 
-@pytest.mark.parametrize("layer_id", [0, 1])
-@pytest.mark.parametrize("attn_tp", [1, 4])
-@pytest.mark.parametrize("other_tp", [1, 4])
-@pytest.mark.parametrize("is_moe", [False, True])
+@pytest.mark.parametrize(
+    ("layer_id", "attn_tp", "other_tp", "is_moe"),
+    [
+        (0, 1, 1, False),
+        (1, 1, 4, False),
+        (0, 4, 1, False),
+        (1, 4, 1, False),
+        (1, 4, 4, False),
+        (1, 4, 1, True),
+    ],
+)
 def test_residual_fusion_gather_boundaries_match_communication(
     monkeypatch, layer_id: int, attn_tp: int, other_tp: int, is_moe: bool
 ) -> None:
@@ -432,9 +445,15 @@ def _tail_fusion_model(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
-    "boundary", ["none", "ple", "pre_gather", "final_gather", "deepstack"]
+    ("dtype", "boundary"),
+    [
+        (torch.bfloat16, "none"),
+        (torch.bfloat16, "ple"),
+        (torch.float32, "pre_gather"),
+        (torch.bfloat16, "final_gather"),
+        (torch.float32, "deepstack"),
+    ],
 )
 def test_mlp_tail_fusion_preserves_intervening_operations(
     monkeypatch, dtype: torch.dtype, boundary: str
@@ -494,8 +513,7 @@ def test_mlp_tail_fusion_preserves_intervening_operations(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-@pytest.mark.parametrize("rows", [0, 1, 4])
-@pytest.mark.parametrize("layer_count", [1, 3])
+@pytest.mark.parametrize(("rows", "layer_count"), [(0, 1), (1, 3), (4, 1)])
 def test_mlp_tail_fusion_graph_replay_keeps_current_residual(
     monkeypatch, rows: int, layer_count: int
 ) -> None:

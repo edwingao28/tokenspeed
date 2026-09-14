@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.layernorm.triton import (
+    gated_residual_combine_norm as _gated_residual_combine_norm,
+)
+from tokenspeed_kernel.ops.layernorm.triton import (
     grouped_gemma_rmsnorm as _grouped_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
@@ -116,9 +119,8 @@ def grouped_gemma_rmsnorm(
 
     Args:
         x: GPU input shaped ``[..., width]``.
-        weight: Gemma checkpoint weight offset shaped ``[width]`` or
-            ``[group_size]`` for shared group weights; the effective multiplier
-            is ``1 + weight``.
+        weight: Gemma checkpoint weight offset shaped ``[width]``; the
+            effective multiplier is ``1 + weight``.
         group_size: Elements sharing one variance statistic. ``None`` means
             the full last dimension.
         eps: Epsilon added before reciprocal square root.
@@ -131,17 +133,7 @@ def grouped_gemma_rmsnorm(
         raise ValueError("grouped_gemma_rmsnorm requires GPU tensors")
     width = int(x.shape[-1])
     effective_group_size = width if group_size is None else int(group_size)
-    return _grouped_gemma_rmsnorm(
-        x,
-        weight,
-        effective_group_size,
-        eps,
-        out=out,
-        block_output=None,
-        inject_logits=None,
-        residual_out=None,
-        preload_residual=False,
-    )
+    return _grouped_gemma_rmsnorm(x, weight, effective_group_size, eps, out=out)
 
 
 def grouped_rmsnorm(
@@ -209,19 +201,15 @@ def gated_residual_combine_norm(
         raise ValueError("hc_count must exceed one and hidden_size must be positive")
     if residual.ndim < 1 or residual.shape[-1] != hc_count * hidden_size:
         raise ValueError("residual last dimension must equal hc_count * hidden_size")
-    combined = torch.empty_like(residual, memory_format=torch.contiguous_format)
-    normalized = _grouped_gemma_rmsnorm(
+    return _gated_residual_combine_norm(
+        block_output,
         residual,
+        inject_logits,
         weight,
         hidden_size,
         eps,
-        out=None,
-        block_output=block_output,
-        inject_logits=inject_logits,
-        residual_out=combined,
-        preload_residual=preload_residual,
+        preload_residual,
     )
-    return combined, normalized
 
 
 __all__ = [

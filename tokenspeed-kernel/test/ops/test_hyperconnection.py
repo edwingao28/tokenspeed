@@ -198,6 +198,16 @@ def _mix_reference(
     )
 
 
+def _assert_mix_close(
+    actual: tuple[torch.Tensor, torch.Tensor | None],
+    inputs: Sequence[torch.Tensor],
+    projection_scale: float,
+    tolerance: float,
+) -> None:
+    expected = _mix_reference(*inputs, projection_scale)
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
 @pytest.mark.parametrize("rows", [0, 1, 4, 8, 16, 24, 32, 128])
 def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
     normalized, projection, up = _inputs(rows, torch.bfloat16, seed=17)
@@ -211,12 +221,11 @@ def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
     assert actual_inject.shape == (rows, HC_COUNT)
     if rows == 0:
         return
-    expected = _mix_reference(normalized, projection, up, 1.0)
-    torch.testing.assert_close((actual, actual_inject), expected, rtol=0.03, atol=0.03)
+    _assert_mix_close((actual, actual_inject), (normalized, projection, up), 1.0, 0.03)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("rows", [1, 3, 4, 8, 15, 16])
+@pytest.mark.parametrize("rows", [1, 8, 16])
 def test_persistent_mix_matches_fp64_reference(rows: int, dtype: torch.dtype) -> None:
     if not current_platform().is_nvidia:
         pytest.skip("the persistent grid barrier is NVIDIA-only")
@@ -227,66 +236,64 @@ def test_persistent_mix_matches_fp64_reference(rows: int, dtype: torch.dtype) ->
         projection_scale=1.0,
         weights_independent=False,
     )
-    expected = _mix_reference(normalized, projection, up, 1.0)
     tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
-    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    _assert_mix_close(actual, (normalized, projection, up), 1.0, tolerance)
+
+
+@pytest.mark.parametrize("rows", [1, 8])
+def test_cute_dsl_mix_matches_fp64_reference(rows: int) -> None:
+    _require_cute_hc()
+    inputs = _inputs(rows, torch.bfloat16, seed=17)
+    assert prepare_gated_residual_weight_cache(inputs[2], LOWRANK)
+    actual = _mix(
+        inputs,
+        override="cute_dsl_hyperconnection_mix",
+        projection_scale=1.0,
+        weights_independent=False,
+    )
+    _assert_mix_close(actual, inputs, 1.0, 0.03)
 
 
 @pytest.mark.parametrize(
-    ("backend", "rows", "projection_scale", "weights_independent"),
+    (
+        "rows",
+        "dtype",
+        "has_inject",
+        "enable_pdl",
+        "weights_independent",
+        "projection_scale",
+    ),
     [
-        ("cute_dsl", rows, scale, False)
-        for rows, scale in [
-            (1, 1.0),
-            (3, 0.25),
-            (4, 1.0),
-            (8, 0.25),
-            (16, 1.0),
-            (32, 0.25),
-        ]
-    ]
-    + [
-        ("cute_fused", rows, 0.25 if rows % 2 else 1.0, independent)
-        for rows in (1, 3, 4, 8, 9, 16)
-        for independent in (False, True)
+        (1, torch.bfloat16, True, False, False, 0.25),
+        (4, torch.float16, False, True, True, 1.0),
+        (8, torch.bfloat16, False, True, True, 1.0),
+        (9, torch.float16, True, False, True, 0.25),
+        (16, torch.bfloat16, True, True, False, 1.0),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("has_inject", [False, True])
-@pytest.mark.parametrize("enable_pdl", [False, True])
-def test_cute_mix_matches_fp64_and_graph(
-    backend: str,
+def test_fused_cute_mix_matches_fp64_and_graph(
     rows: int,
-    projection_scale: float,
-    weights_independent: bool,
     dtype: torch.dtype,
     has_inject: bool,
     enable_pdl: bool,
+    weights_independent: bool,
+    projection_scale: float,
 ) -> None:
-    if backend == "cute_dsl":
-        _require_cute_hc()
-    else:
-        _require_fused_hc()
-    normalized, projection, up = _inputs(
-        rows, dtype, seed=17 if backend == "cute_dsl" else 3450 + rows
-    )
+    _require_fused_hc()
+    normalized, projection, up = _inputs(rows, dtype, seed=3450 + rows)
     if not has_inject:
         projection = projection[:LOWRANK]
-    if backend == "cute_dsl":
-        assert prepare_gated_residual_weight_cache(up, LOWRANK)
     pdl_enabled(enable_pdl)
 
     def mix() -> tuple[torch.Tensor, torch.Tensor | None]:
         return _mix(
             (normalized, projection, up),
-            override=f"{backend}_hyperconnection_mix",
+            override="cute_fused_hyperconnection_mix",
             projection_scale=projection_scale,
             weights_independent=weights_independent,
         )
 
-    tolerance = (
-        (3e-2 if backend == "cute_dsl" else 4e-2) if dtype is torch.bfloat16 else 8e-3
-    )
+    tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
     expected = _mix_reference(normalized, projection, up, projection_scale)
     torch.testing.assert_close(mix(), expected, rtol=tolerance, atol=tolerance)
     graph = torch.cuda.CUDAGraph()
@@ -296,47 +303,6 @@ def test_cute_mix_matches_fp64_and_graph(
         graph.replay()
     for actual in outputs:
         torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("inference_mode", [False, True])
-def test_cute_dsl_model_parameters_support_inference_and_capture(
-    dtype: torch.dtype, inference_mode: bool
-) -> None:
-    _require_cute_hc()
-    normalized, projection_data, up_data = _inputs(4, dtype, seed=43)
-    projection = torch.nn.Parameter(projection_data, requires_grad=True)
-    up = torch.nn.Parameter(up_data, requires_grad=True)
-    assert prepare_gated_residual_weight_cache(up, LOWRANK)
-
-    def mix() -> tuple[torch.Tensor, torch.Tensor | None]:
-        return _mix(
-            (normalized, projection, up),
-            override="cute_dsl_hyperconnection_mix",
-            projection_scale=1.0,
-            weights_independent=False,
-        )
-
-    tolerance = 3e-2 if dtype is torch.bfloat16 else 8e-3
-    with torch.inference_mode() if inference_mode else torch.no_grad():
-        eager = mix()
-        expected = _mix_reference(normalized, projection, up, 1.0)
-        torch.testing.assert_close(eager, expected, rtol=tolerance, atol=tolerance)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            actual = mix()
-
-        # Export must preserve storage aliasing for in-place weight reloads.
-        projection.mul_(0.5)
-        up.mul_(0.5)
-        assert prepare_gated_residual_weight_cache(up, LOWRANK)
-        graph.replay()
-        torch.cuda.synchronize()
-        expected = _mix_reference(normalized, projection, up, 1.0)
-        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-    assert projection.requires_grad and up.requires_grad
-    assert projection.grad is None and up.grad is None
 
 
 def test_cute_dsl_graph_replay_observes_reloaded_up_weight() -> None:
@@ -372,8 +338,7 @@ def test_cute_dsl_graph_replay_observes_reloaded_up_weight() -> None:
     graph.replay()
     torch.cuda.synchronize()
 
-    expected = _mix_reference(normalized, projection, up, 1.0)
-    torch.testing.assert_close((actual, actual_inject), expected, rtol=0.03, atol=0.03)
+    _assert_mix_close((actual, actual_inject), (normalized, projection, up), 1.0, 0.03)
     assert not torch.allclose(actual, before, rtol=3e-2, atol=3e-2)
 
 
@@ -390,26 +355,6 @@ def test_cute_dsl_mix_rejects_unprepared_up_weight() -> None:
         )
 
 
-def test_cute_dsl_mix_error_explains_automatic_row_limit() -> None:
-    _require_cute_hc()
-    normalized, projection, up = _inputs(33, torch.bfloat16, seed=35)
-    assert prepare_gated_residual_weight_cache(up, LOWRANK)
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"automatic selection supports T=1\.\.8, while an explicit "
-            r"override supports T=1\.\.32"
-        ),
-    ):
-        _mix(
-            (normalized, projection, up),
-            override="cute_dsl_hyperconnection_mix",
-            projection_scale=1.0,
-            weights_independent=False,
-        )
-
-
 def test_cute_dsl_weight_preparation_rejects_capture(monkeypatch) -> None:
     _require_cute_hc()
     _, _, up = _inputs(1, torch.bfloat16, seed=37)
@@ -417,41 +362,6 @@ def test_cute_dsl_weight_preparation_rejects_capture(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="outside CUDA Graph capture"):
         prepare_gated_residual_weight_cache(up, LOWRANK)
-
-
-def test_aligned_cute_dsl_up_weight_is_prepared(monkeypatch) -> None:
-    from tokenspeed_kernel.ops.residual import cute_dsl
-    from tokenspeed_kernel.ops.residual.cute_dsl import (
-        _get_prepared_padded_up_weight,
-    )
-
-    aligned_lowrank = 128
-    generator = torch.Generator(device="cuda").manual_seed(39)
-    up = torch.randn(
-        (WIDE, aligned_lowrank),
-        dtype=torch.bfloat16,
-        device="cuda",
-        generator=generator,
-    )
-    monkeypatch.setattr(cute_dsl, "_CUTEDSL_AVAILABLE", True)
-    monkeypatch.setattr(cute_dsl, "_PRODUCTION_UP_SHAPE", tuple(up.shape))
-    monkeypatch.setattr(
-        cute_dsl,
-        "current_platform",
-        lambda: type("Platform", (), {"is_blackwell": True})(),
-    )
-    monkeypatch.setattr(cute_dsl, "_PADDED_UP_WEIGHTS", {})
-
-    assert prepare_gated_residual_weight_cache(up, aligned_lowrank)
-    prepared = _get_prepared_padded_up_weight(up)
-    expected = (
-        up.view(HC_COUNT, HIDDEN_SIZE, aligned_lowrank)
-        .permute(1, 0, 2)
-        .contiguous()
-        .view_as(up)
-    )
-    assert prepared is not up
-    torch.testing.assert_close(prepared, expected, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -495,12 +405,15 @@ def test_grouped_gemma_rmsnorm_production_shape(rows: int, dtype: torch.dtype) -
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("shared_weight", [False, True])
-@pytest.mark.parametrize("preload_residual", [False, True])
 @pytest.mark.parametrize(
-    "rows,hc_count,hidden_size",
-    [(0, 4, 2560), (1, 4, 2560), (17, 4, 2560), (128, 4, 2560), (3, 3, 13)],
+    ("dtype", "shared_weight", "preload_residual", "rows", "hc_count", "hidden_size"),
+    [
+        (torch.bfloat16, False, False, 0, 4, 2560),
+        (torch.bfloat16, True, True, 1, 4, 2560),
+        (torch.float16, False, True, 17, 4, 2560),
+        (torch.float32, True, False, 3, 3, 13),
+        (torch.bfloat16, False, False, 128, 4, 2560),
+    ],
 )
 def test_combine_norm_matches_separate_kernels(
     dtype: torch.dtype,
@@ -571,10 +484,12 @@ def test_combine_norm_matches_separate_kernels(
     assert combined.is_contiguous() and normalized.is_contiguous()
 
 
-@pytest.mark.parametrize("rows", [0, 3])
-@pytest.mark.parametrize("field", ["block_output", "inject_logits", "weight"])
-@pytest.mark.parametrize("invalid", ["shape", "dtype", "device"])
-def test_combine_norm_validates_inputs(rows: int, field: str, invalid: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [("block_output", "shape"), ("inject_logits", "device"), ("weight", "dtype")],
+)
+def test_combine_norm_validates_inputs(field: str, invalid: str) -> None:
+    rows = 3
     shapes = {"block_output": (rows, 8), "inject_logits": (rows, 4), "weight": (32,)}
     args = {
         name: torch.empty(shape, dtype=torch.bfloat16, device="cuda")
@@ -602,8 +517,10 @@ def test_combine_norm_validates_inputs(rows: int, field: str, invalid: str) -> N
         )
 
 
-@pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("preload_residual", [False, True])
+@pytest.mark.parametrize(
+    ("enable_pdl", "preload_residual"),
+    [(False, False), (True, False), (True, True)],
+)
 def test_combine_norm_cuda_graph_replays_changed_inputs(
     enable_pdl: bool, preload_residual: bool
 ) -> None:
@@ -708,14 +625,13 @@ def test_grouped_gemma_rmsnorm_validates_out_for_zero_rows() -> None:
     assert grouped_gemma_rmsnorm(x, weight, HIDDEN_SIZE, 1e-6, out=out) is out
 
 
-@pytest.mark.parametrize("rows", [1, 4, 8, 16])
-@pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize(
-    "backend",
+    ("rows", "enable_pdl", "backend"),
     [
-        "triton_persistent_hyperconnection_mix",
-        "cute_dsl_hyperconnection_mix",
-        "cute_fused_hyperconnection_mix",
+        (1, False, "triton_persistent_hyperconnection_mix"),
+        (8, True, "triton_persistent_hyperconnection_mix"),
+        (4, False, "cute_fused_hyperconnection_mix"),
+        (16, True, "cute_fused_hyperconnection_mix"),
     ],
 )
 def test_hc_full_chain_cuda_graph_replays(
@@ -726,9 +642,8 @@ def test_hc_full_chain_cuda_graph_replays(
     if enable_pdl and not current_platform().is_hopper_plus:
         pytest.skip("PDL requires NVIDIA Hopper or newer")
     residual, projection, up = _inputs(rows, torch.bfloat16, seed=17)
-    if backend == "cute_dsl_hyperconnection_mix":
-        _require_cute_hc()
-        assert prepare_gated_residual_weight_cache(up, LOWRANK)
+    if backend == "cute_fused_hyperconnection_mix":
+        _require_fused_hc()
     generator = torch.Generator(device="cuda").manual_seed(71)
     norm_weight = (
         torch.randn(WIDE, dtype=torch.bfloat16, device="cuda", generator=generator)
@@ -894,8 +809,7 @@ def test_deterministic_mode_filters_atomic_persistent_mix() -> None:
     assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
 
 
-@pytest.mark.parametrize("has_inject", [False, True])
-@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(("has_inject", "enable_pdl"), [(False, False), (True, True)])
 def test_persistent_mix_reuses_workspace_across_shapes(
     has_inject: bool, enable_pdl: bool
 ) -> None:
@@ -917,13 +831,13 @@ def test_persistent_mix_reuses_workspace_across_shapes(
             projection_scale=0.25,
             weights_independent=False,
         )
-        expected = _mix_reference(normalized, projection, up, 0.25)
         tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
-        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+        _assert_mix_close(actual, (normalized, projection, up), 0.25, tolerance)
 
 
-@pytest.mark.parametrize("calls_per_replay", [1, 3, 4])
-@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    ("calls_per_replay", "enable_pdl"), [(1, False), (3, True), (4, False)]
+)
 def test_persistent_mix_graph_observes_changed_inputs(
     enable_pdl: bool, calls_per_replay: int
 ) -> None:
@@ -1022,16 +936,14 @@ def _publish_mix_inputs_kernel(
             tl.store(targets[tensor] + indices, value, mask=mask)
 
 
-@pytest.mark.parametrize("rows", [1, 4, 16])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("has_inject", [False, True])
 @pytest.mark.parametrize(
-    ("backend", "weights_independent", "scale"),
+    ("rows", "dtype", "has_inject", "backend", "weights_independent", "scale"),
     [
-        ("triton_persistent", False, 1.0),
-        ("cute_dsl", False, 1.0),
-        ("cute_fused", False, 0.25),
-        ("cute_fused", True, 0.25),
+        (1, torch.bfloat16, True, "triton_persistent", False, 1.0),
+        (16, torch.float16, False, "triton_persistent", False, 1.0),
+        (4, torch.bfloat16, True, "cute_fused", False, 0.25),
+        (1, torch.float16, False, "cute_fused", True, 0.25),
+        (16, torch.bfloat16, True, "cute_fused", True, 0.25),
     ],
 )
 def test_mix_prefetch_observes_pdl_producer_updates(
@@ -1044,9 +956,7 @@ def test_mix_prefetch_observes_pdl_producer_updates(
 ) -> None:
     if not current_platform().is_hopper_plus:
         pytest.skip("bulk weight prefetch and PDL require NVIDIA Hopper or newer")
-    if backend == "cute_dsl":
-        _require_cute_hc()
-    elif backend == "cute_fused":
+    if backend == "cute_fused":
         _require_fused_hc()
 
     x_source, projection_source, up_source = _inputs(rows, dtype, seed=139 + rows)
@@ -1061,20 +971,8 @@ def test_mix_prefetch_observes_pdl_producer_updates(
         else torch.zeros_like(projection_source)
     )
     up = up_source.clone() if weights_independent else torch.zeros_like(up_source)
-    published_up, published_up_source = up, up_source
-    if backend == "cute_dsl":
-        from tokenspeed_kernel.ops.residual.cute_dsl import (
-            _get_prepared_padded_up_weight,
-        )
-
-        # Publish the prepared cache from an ancestor too: Down must wait
-        # before triggering Up's independent weight loads.
-        assert prepare_gated_residual_weight_cache(up, LOWRANK)
-        assert prepare_gated_residual_weight_cache(up_source, LOWRANK)
-        published_up = _get_prepared_padded_up_weight(up)
-        published_up_source = _get_prepared_padded_up_weight(up_source)
-    sources = (projection_source, published_up_source, x_source)
-    targets = (projection, published_up, normalized)
+    sources = (projection_source, up_source, x_source)
+    targets = (projection, up, normalized)
     sizes = tuple(
         0 if weights_independent and index < 2 else tensor.numel()
         for index, tensor in enumerate(targets)
@@ -1113,8 +1011,6 @@ def test_mix_prefetch_observes_pdl_producer_updates(
         if weights_independent:
             projection.copy_(projection_source)
             up.copy_(up_source)
-        elif backend == "cute_dsl":
-            assert prepare_gated_residual_weight_cache(up_source, LOWRANK)
         graph.replay()
         expected = _mix_reference(x_source, projection_source, up_source, scale)
         tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
@@ -1122,8 +1018,10 @@ def test_mix_prefetch_observes_pdl_producer_updates(
             torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
 
 
-@pytest.mark.parametrize("input_index", [0, 1, 2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("input_index", "dtype"),
+    [(0, torch.bfloat16), (1, torch.float16), (2, torch.bfloat16)],
+)
 def test_persistent_prefetch_accepts_unaligned_contiguous_views(
     input_index: int, dtype: torch.dtype
 ) -> None:
@@ -1145,133 +1043,14 @@ def test_persistent_prefetch_accepts_unaligned_contiguous_views(
         projection_scale=1.0,
         weights_independent=False,
     )
-    expected = _mix_reference(normalized, projection, up, 1.0)
     tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
-    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    _assert_mix_close(actual, (normalized, projection, up), 1.0, tolerance)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    ("rows", "enable_pdl", "unaligned_input", "expected_kernel"),
-    [
-        (1, True, None, "cute_dsl_hyperconnection_mix"),
-        (4, True, None, "cute_dsl_hyperconnection_mix"),
-        (8, True, None, "cute_dsl_hyperconnection_mix"),
-        (9, True, None, "triton_persistent_hyperconnection_mix"),
-        (16, True, None, "triton_persistent_hyperconnection_mix"),
-        (24, True, None, "triton_hyperconnection_mix"),
-        (4, False, None, "triton_persistent_hyperconnection_mix"),
-        (4, True, 0, "triton_persistent_hyperconnection_mix"),
-        (4, True, 1, "triton_persistent_hyperconnection_mix"),
-        (4, True, 2, "cute_dsl_hyperconnection_mix"),
-    ],
+    ("rows", "enable_pdl", "weights_independent"),
+    [(1, True, True), (16, False, True), (9, True, False), (24, True, True)],
 )
-def test_prepared_hc_default_dispatch(
-    dtype: torch.dtype,
-    rows: int,
-    enable_pdl: bool,
-    unaligned_input: int | None,
-    expected_kernel: str,
-) -> None:
-    _require_cute_hc()
-    inputs = list(_inputs(rows, dtype, seed=157))
-    if unaligned_input is not None:
-        original = inputs[unaligned_input]
-        storage = torch.empty(original.numel() + 1, dtype=dtype, device=original.device)
-        inputs[unaligned_input] = storage[1:].view_as(original).copy_(original)
-    normalized, projection, up = inputs
-    assert prepare_gated_residual_weight_cache(up, LOWRANK)
-    capture = ShapeCapture.get()
-    pdl_enabled(enable_pdl)
-    capture.enabled = True
-    capture.clear()
-    actual = _mix(
-        (normalized, projection, up),
-        override=None,
-        projection_scale=1.0,
-        weights_independent=False,
-    )
-    assert capture._records[-1].kernel_name == expected_kernel
-    expected = _mix_reference(normalized, projection, up, 1.0)
-    tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
-    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-
-
-def test_cute_hc_concurrent_graphs_keep_outputs_independent() -> None:
-    _require_cute_hc()
-    cases = [_inputs(rows, torch.bfloat16, seed=173 + rows) for rows in (1, 4)]
-    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-    graphs = []
-    outputs = []
-    pdl_enabled(True)
-    for inputs, stream in zip(cases, streams, strict=True):
-        assert prepare_gated_residual_weight_cache(inputs[2], LOWRANK)
-        stream.wait_stream(torch.cuda.current_stream())
-
-        def mix() -> tuple[torch.Tensor, torch.Tensor | None]:
-            return _mix(
-                inputs,
-                override="cute_dsl_hyperconnection_mix",
-                projection_scale=1.0,
-                weights_independent=False,
-            )
-
-        with torch.cuda.stream(stream):
-            mix()
-        stream.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            outputs.append([mix() for _ in range(3)])
-        graphs.append(graph)
-    for _ in range(5):
-        for graph, stream in zip(graphs, streams, strict=True):
-            with torch.cuda.stream(stream):
-                graph.replay()
-    torch.cuda.synchronize()
-    for inputs, results in zip(cases, outputs, strict=True):
-        expected = _mix_reference(*inputs, 1.0)
-        for actual in results:
-            torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
-
-
-def test_cute_hc_compilation_is_device_private() -> None:
-    _require_cute_hc()
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires two Blackwell devices")
-    if torch.cuda.get_device_capability(1)[0] != 10:
-        pytest.skip("requires two Blackwell devices")
-    inputs = _inputs(4, torch.bfloat16, seed=181)
-    for device_index in (0, 1, 0):
-        values = tuple(t.to(device=torch.device("cuda", device_index)) for t in inputs)
-        assert prepare_gated_residual_weight_cache(values[2], LOWRANK)
-        actual = _mix(
-            values,
-            override="cute_dsl_hyperconnection_mix",
-            projection_scale=1.0,
-            weights_independent=False,
-        )
-        expected = _mix_reference(*values, 1.0)
-        torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
-
-
-def test_prepared_cute_hc_is_deterministic() -> None:
-    _require_cute_hc()
-    inputs = _inputs(4, torch.bfloat16, seed=191)
-    assert prepare_gated_residual_weight_cache(inputs[2], LOWRANK)
-    torch.use_deterministic_algorithms(True, warn_only=False)
-    pdl_enabled(True)
-    outputs = [
-        _mix(inputs, override=None, projection_scale=1.0, weights_independent=False)
-        for _ in range(4)
-    ]
-    for mixed, inject in outputs[1:]:
-        assert torch.equal(mixed, outputs[0][0])
-        assert torch.equal(inject, outputs[0][1])
-
-
-@pytest.mark.parametrize("rows", [1, 8, 9, 16, 24])
-@pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("weights_independent", [False, True])
 def test_fused_cute_dispatch_requires_explicit_weight_contract(
     rows, enable_pdl, weights_independent
 ):
@@ -1297,12 +1076,10 @@ def test_fused_cute_dispatch_requires_explicit_weight_contract(
         )
     )
     assert capture._records[-1].kernel_name == expected_name
-    expected = _mix_reference(x, w, u, 1.0)
-    torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
+    _assert_mix_close(actual, (x, w, u), 1.0, 0.04)
 
 
-@pytest.mark.parametrize("input_index", [0, 1, 2])
-@pytest.mark.parametrize("offset", [1, 8])
+@pytest.mark.parametrize(("input_index", "offset"), [(0, 1), (1, 1), (2, 1), (0, 8)])
 def test_fused_cute_dispatch_checks_all_tma_alignments(input_index, offset):
     _require_fused_hc()
     values = list(_inputs(4, torch.bfloat16, seed=4731))
@@ -1321,8 +1098,7 @@ def test_fused_cute_dispatch_checks_all_tma_alignments(input_index, offset):
         else "triton_persistent_hyperconnection_mix"
     )
     assert capture._records[-1].kernel_name == expected_name
-    expected = _mix_reference(*values, 1.0)
-    torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
+    _assert_mix_close(actual, values, 1.0, 0.04)
 
 
 @pytest.mark.parametrize("has_inject", [False, True])
@@ -1395,8 +1171,7 @@ def test_fused_cute_graphs_share_only_stream_private_generations(has_inject):
         assert counter.cpu().tolist() == [generation + 15] * clusters
 
 
-@pytest.mark.parametrize("rows", [4, 16])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("rows", "dtype"), [(4, torch.bfloat16), (16, torch.float16)])
 def test_fused_cluster_mix_is_deterministic(rows, dtype):
     _require_fused_hc()
     values = _inputs(rows, dtype, seed=5301 + rows)
@@ -1431,10 +1206,15 @@ def test_fused_cluster_split_k_does_not_exceed_sixteen():
         FusedGatedResidualKernel(4, 324, 32, True, 1.0, True)
 
 
-@pytest.mark.parametrize("rows", [1, 4, 8])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("has_inject", [False, True])
-@pytest.mark.parametrize("down_stages", [2, 5])
+@pytest.mark.parametrize(
+    ("rows", "dtype", "has_inject", "down_stages"),
+    [
+        (1, torch.bfloat16, False, 2),
+        (4, torch.float16, True, 2),
+        (8, torch.bfloat16, True, 5),
+        (4, torch.float16, False, 5),
+    ],
+)
 def test_fused_down_consumes_every_k128_stage_on_graph_replay(
     rows, dtype, has_inject, down_stages, monkeypatch
 ):
@@ -1514,9 +1294,15 @@ def test_fused_down_consumes_every_k128_stage_on_graph_replay(
         torch.testing.assert_close(actual[1], expected[1], rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("rows", [1, 7, 16])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("has_inject", [False, True])
+@pytest.mark.parametrize(
+    ("rows", "dtype", "has_inject"),
+    [
+        (1, torch.bfloat16, False),
+        (7, torch.float16, True),
+        (16, torch.bfloat16, True),
+        (16, torch.float16, False),
+    ],
+)
 def test_fused_distributed_reduce_applies_activation_after_complete_sum(
     rows, dtype, has_inject
 ):

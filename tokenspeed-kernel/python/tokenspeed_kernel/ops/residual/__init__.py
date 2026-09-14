@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 
 import torch as _torch
-from tokenspeed_kernel.platform import Platform, pdl_enabled
+from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -390,9 +390,6 @@ def gated_residual_mix(
         )
         return mixed, inject
 
-    from tokenspeed_kernel.ops.residual.cute_dsl import (
-        _find_prepared_padded_up_weight,
-    )
     from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
 
     traits = {
@@ -415,10 +412,6 @@ def gated_residual_mix(
         "folded_scale": projection_scale == 1.0,
         "deterministic": _torch.are_deterministic_algorithms_enabled(),
         "capturing": bool(flat.is_cuda and _torch.cuda.is_current_stream_capturing()),
-        "prepared_up_weight": (_find_prepared_padded_up_weight(up_weight) is not None),
-        "tma_aligned": flat.data_ptr() % 32 == 0
-        and projection_weight.data_ptr() % 32 == 0,
-        "pdl": pdl_enabled(None),
     }
     signature = format_signature(
         normalized=dense_tensor_format(flat.dtype),

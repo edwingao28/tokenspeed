@@ -63,7 +63,7 @@ def _cutedsl_available() -> bool:
         import cutlass  # noqa: F401
         import cutlass.cute  # noqa: F401
         import quack.compile_utils  # noqa: F401
-    except ImportError:
+    except (AttributeError, ImportError):
         return False
     return True
 
