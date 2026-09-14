@@ -449,6 +449,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             dst_rows,
             verify_width=width,
             num_layers=num_layers,
+            group_indices=None,
         )
         tables = self._ple_verify_tables
         if tables["context_row_bytes"]:

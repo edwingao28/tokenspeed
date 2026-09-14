@@ -155,6 +155,18 @@ live rows are fully written, while negative padding rows skip state access
 and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
 
+After verification, GDN resolves the accepted checkpoint with
+`commit_state_pages`, once per state group. GDN and KDA share the backend page
+resolver; it passes each group's output row as a view, so the kernel only
+addresses requests within that row. The resolve casts and clamps the
+accepted width, computes the checkpoint slot and gathers its destination page
+inside one kernel; do not reconstruct that elementwise chain in the backend.
+`state_verify_commit_rows` maps its group-major output to layers and computes
+`request * (verify_width + 1) + accepted` in one launch. These layer-major
+indices feed both the batched state-row copies and ReplaySSM; do not materialize
+them with eager `index_select`, source-row arithmetic or `repeat`. Non-positive
+destination pages resolve to row -1 so copies cannot write the null page.
+
 GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
 reading inputs and signal after computation; FlashInfer adapters preserve the
 upstream CuTe body and isolate PDL compilation caches. Graphs retain their
