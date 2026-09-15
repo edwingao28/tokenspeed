@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -43,6 +44,8 @@ SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 
 @dataclass
 class SamplingBackendConfig:
+
+    synthetic_acceptance_length: float | None = None
 
     enable_nan_detection: bool = False
 
@@ -84,6 +87,7 @@ class SamplingBackendConfig:
     ) -> SamplingBackendConfig:
 
         return cls(
+            synthetic_acceptance_length=server_args.synthetic_acceptance_length,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             max_bs=max_bs,
@@ -122,6 +126,21 @@ class SamplingBackend(ABC):
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         self.config = config
+
+        if config.synthetic_acceptance_length is not None:
+            al = config.synthetic_acceptance_length
+            if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
+                raise ValueError(
+                    "synthetic_acceptance_length must be within the verify width"
+                )
+            tp_size = len(config.tp_group) if config.tp_group is not None else 1
+            max_bs = (config.max_bs + tp_size - 1) // tp_size * tp_size
+            self._synthetic_generator = torch.Generator(device="cpu").manual_seed(
+                config.random_seed
+            )
+            self._synthetic_lengths = torch.full(
+                (max_bs,), math.floor(al), dtype=torch.int32, device=config.device
+            )
 
         # Sentinel of "which rid currently owns each slot from this backend's
         # point of view". rid is just a comparison value here, not a lookup
@@ -226,6 +245,7 @@ class SamplingBackend(ABC):
         Stateless backends (greedy) short-circuit both phases.
         """
 
+        self._prepare_synthetic_acceptance()
         if not self._HAS_POOL_STATE:
             return
 
@@ -260,10 +280,104 @@ class SamplingBackend(ABC):
         captured graph sees a fully-written state.
         Default: no-op.
         """
+        self._prepare_synthetic_acceptance()
         self._prepare_step_hook(
             num_tokens_per_req=num_tokens_per_req,
             bs=bs,
             request_pool_indices=None,
+        )
+
+    def _prepare_synthetic_acceptance(self) -> None:
+        al = self.config.synthetic_acceptance_length
+        if al is None:
+            return
+        if al == math.floor(al):
+            self._synthetic_lengths.fill_(int(al))
+            return
+        # Refill outside capture, like the rejection sampler's coin buffers.
+        # A private CPU generator keeps TP ranks independent of device RNG use.
+        coins = torch.rand(
+            self._synthetic_lengths.shape, generator=self._synthetic_generator
+        )
+        self._synthetic_lengths.copy_((coins < al % 1).to(torch.int32) + math.floor(al))
+
+    def synthetic_lengths(
+        self, candidates: torch.Tensor, row_offset: int
+    ) -> torch.Tensor:
+        bs, n = candidates.shape
+        return self._synthetic_lengths[row_offset : row_offset + bs].clamp(max=n)
+
+    def limit_synthetic_acceptance(
+        self, force_single_token: torch.Tensor, row_offset: int
+    ) -> None:
+        """Bootstrap rows without draft candidates must sample one target token."""
+        self._synthetic_lengths[
+            row_offset : row_offset + force_single_token.numel()
+        ].masked_fill_(force_single_token, 1)
+
+    def write_synthetic_outputs(
+        self,
+        candidates: torch.Tensor,
+        target_tokens: torch.Tensor,
+        lengths: torch.Tensor,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+    ) -> None:
+        """Commit a draft prefix followed by its target correction/bonus token."""
+        bs, n = candidates.shape
+        positions = torch.arange(n, device=candidates.device).expand(bs, n)
+        output = predict.view(bs, n)
+        output.zero_()
+        output[:, : n - 1].copy_(candidates[:, 1:])
+        output.masked_fill_(positions >= lengths[:, None] - 1, 0)
+        output.scatter_(
+            1, (lengths - 1).long()[:, None], target_tokens.to(predict.dtype)[:, None]
+        )
+        accept_index.copy_(
+            torch.where(
+                positions < lengths[:, None],
+                positions + torch.arange(bs, device=candidates.device)[:, None] * n,
+                -1,
+            )
+        )
+        accept_length.copy_(lengths - 1)
+
+    def verify_synthetic_probs(
+        self,
+        candidates: torch.Tensor,
+        target_probs: torch.Tensor,
+        final_coins: torch.Tensor,
+        lengths: torch.Tensor,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        deterministic: bool,
+    ) -> None:
+        from tokenspeed_kernel.ops.sampling.cuda import (
+            chain_speculative_sampling_target_only,
+        )
+
+        bs = candidates.shape[0]
+        rows = torch.arange(bs, device=candidates.device)
+        # N=1 is the existing sampler's ordinary target-token sampling path.
+        probs = target_probs[rows, (lengths - 1).long()].unsqueeze(1)
+        target_tokens = torch.empty((bs,), dtype=predict.dtype, device=predict.device)
+        chain_speculative_sampling_target_only(
+            predicts=target_tokens,
+            accept_index=torch.empty((bs, 1), dtype=torch.int32, device=predict.device),
+            accept_token_num=accept_length,
+            candidates=candidates[:, :1].to(torch.int32).contiguous(),
+            uniform_samples=final_coins[:, None],
+            uniform_samples_for_final_sampling=final_coins,
+            target_probs=probs,
+            draft_probs=None,
+            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+            deterministic=deterministic,
+        )
+        self.write_synthetic_outputs(
+            candidates, target_tokens, lengths, predict, accept_index, accept_length
         )
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
