@@ -51,6 +51,7 @@ result = harness.run(
         },
         solution=None,
         registration="gluon_bmm_a16w16_gfx950",
+        cold_cache=True,
         seed=42,
         definition_version=1,
     )
@@ -68,10 +69,14 @@ Input creation, selection, compilation, eager warmup, graph capture, replay
 warmup, correctness checks, and result serialization are outside the reported
 device time.
 
-Each measurement block times a captured graph containing `calls_per_graph`
-invocations, then reports time per invocation. Timing settings are part of the
-benchmark definition and must match across revisions before measurements can be
-compared.
+By default, each captured invocation clears the device caches immediately
+before the operation runs. Device events surround only the operation, so cache
+clearing is excluded from its reported time. A case can set `cold_cache` to
+`false` for hot-cache experiments.
+
+Each measurement block reports the mean device time across `calls_per_graph`
+invocations. Timing settings and cache mode are part of the benchmark definition
+and must match across revisions before measurements can be compared.
 
 The result contains the raw device-time samples, resolved registration, timing
 mode, and structured failure information. Suite-level comparison uses the

@@ -30,6 +30,7 @@
           }
         },
         "registration": "gluon_bmm_a16w16_gfx950",
+        "cold_cache": true,
         "seed": 42,
         "definition_version": 1
       },

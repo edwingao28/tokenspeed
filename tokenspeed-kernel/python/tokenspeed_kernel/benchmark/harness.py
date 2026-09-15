@@ -89,6 +89,7 @@ class BenchmarkRequest:
     parameters: dict[str, Any]
     solution: str | None
     registration: str | None
+    cold_cache: bool
     seed: int
     definition_version: int
 
@@ -177,6 +178,7 @@ class KernelBenchmarkResult:
     selection_mode: str
     requested_solution: str | None
     requested_registration: str | None
+    cold_cache: bool
     seed: int
     definition_version: int
     platform_vendor: str
@@ -347,7 +349,10 @@ class KernelBenchmarkHarness:
                 )
 
         try:
-            measurement = self._timer.measure(prepared.invocation)
+            measurement = self._timer.measure(
+                prepared.invocation,
+                cold_cache=request.cold_cache,
+            )
         except GraphBenchmarkError as exc:
             status = _GRAPH_STATUS_BY_PHASE.get(
                 exc.phase, BenchmarkStatus.EXECUTION_FAILURE
@@ -541,6 +546,7 @@ class KernelBenchmarkHarness:
             "selection_mode": request.selection_mode,
             "requested_solution": request.solution,
             "requested_registration": request.registration,
+            "cold_cache": request.cold_cache,
             "seed": request.seed,
             "definition_version": request.definition_version,
             "platform_vendor": platform.vendor if platform is not None else "",

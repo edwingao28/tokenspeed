@@ -151,12 +151,16 @@ def _parse_definition(
     raw: object, location: str
 ) -> tuple[dict[str, Any], BenchmarkRequest]:
     definition = _object(raw, location)
+    cold_cache = definition.get("cold_cache", True)
+    if not isinstance(cold_cache, bool):
+        raise SuiteConfigError(f"{location}.cold_cache must be a boolean")
     request = BenchmarkRequest(
         family=definition["family"],
         mode=definition["mode"],
         parameters=definition["parameters"],
         solution=definition.get("solution"),
         registration=definition.get("registration"),
+        cold_cache=cold_cache,
         seed=definition["seed"],
         definition_version=definition["definition_version"],
     )
@@ -167,6 +171,7 @@ def _parse_definition(
         "parameters": request.parameters,
         "solution": request.solution,
         "registration": request.registration,
+        "cold_cache": request.cold_cache,
         "seed": request.seed,
         "definition_version": request.definition_version,
     }
@@ -277,10 +282,13 @@ def _failure_payload(
     status: BenchmarkStatus,
     phase: str,
     error: BaseException,
+    *,
+    cold_cache: bool,
 ) -> dict[str, Any]:
     return {
         "status": status.value,
         "registration_name": None,
+        "cold_cache": cold_cache,
         "timing_mode": "graph_replay",
         "metric": "device_time_per_invocation",
         "unit": "us",
@@ -298,6 +306,7 @@ def _result_payload(result: KernelBenchmarkResult) -> dict[str, Any]:
     return {
         "status": result.status.value,
         "registration_name": result.registration_name,
+        "cold_cache": result.cold_cache,
         "timing_mode": result.timing_mode,
         "metric": result.metric,
         "unit": result.unit,
@@ -366,11 +375,17 @@ def run_suite(
     for case in suite.cases:
         if mismatch is not None:
             result_payload = _failure_payload(
-                BenchmarkStatus.ENVIRONMENT_INVALID, "environment", mismatch
+                BenchmarkStatus.ENVIRONMENT_INVALID,
+                "environment",
+                mismatch,
+                cold_cache=case.request.cold_cache,
             )
         elif harness_error is not None:
             result_payload = _failure_payload(
-                BenchmarkStatus.SETUP_FAILURE, "runner_setup", harness_error
+                BenchmarkStatus.SETUP_FAILURE,
+                "runner_setup",
+                harness_error,
+                cold_cache=case.request.cold_cache,
             )
         else:
             assert harness is not None
@@ -381,6 +396,7 @@ def run_suite(
                     suite.timer.eager_warmup_iterations,
                     suite.timer.replay_warmup_iterations,
                     suite.timer.measurement_blocks,
+                    case.request.cold_cache,
                     environment.get("vendor"),
                     environment.get("arch"),
                     environment.get("device_name"),
@@ -390,6 +406,7 @@ def run_suite(
                     result.eager_warmup_iterations,
                     result.replay_warmup_iterations,
                     result.measurement_blocks,
+                    result.cold_cache,
                     result.platform_vendor,
                     result.platform_arch,
                     result.device_name,
@@ -401,7 +418,10 @@ def run_suite(
                 result_payload = _result_payload(result)
             except Exception as error:  # noqa: BLE001 - benchmark failures are data
                 result_payload = _failure_payload(
-                    BenchmarkStatus.EXECUTION_FAILURE, "runner", error
+                    BenchmarkStatus.EXECUTION_FAILURE,
+                    "runner",
+                    error,
+                    cold_cache=case.request.cold_cache,
                 )
 
         case_payloads.append(

@@ -108,6 +108,7 @@ def _success_result(request) -> KernelBenchmarkResult:
         selection_mode=request.selection_mode,
         requested_solution=request.solution,
         requested_registration=request.registration,
+        cold_cache=request.cold_cache,
         seed=request.seed,
         definition_version=request.definition_version,
         platform_vendor="amd",
@@ -152,6 +153,7 @@ def test_starter_suite_selects_exact_gfx950_registration():
     }
     assert case.request.registration == "gluon_bmm_a16w16_gfx950"
     assert case.request.solution is None
+    assert case.request.cold_cache is True
     assert case.request.seed == 42
     assert case.request.definition_version == 1
     assert case.policy == _policy()
@@ -211,6 +213,7 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     assert payload["cases"][0]["result"] == {
         "status": "success",
         "registration_name": "gluon_bmm_a16w16_gfx950",
+        "cold_cache": True,
         "timing_mode": "graph_replay",
         "metric": "device_time_per_invocation",
         "unit": "us",
@@ -224,7 +227,15 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     assert payload["cases"][0].keys() == {"id", "definition", "policy", "result"}
 
 
-def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("calls_per_graph", 1), ("cold_cache", False)],
+)
+def test_run_suite_rejects_success_with_the_wrong_measurement_context(
+    tmp_path,
+    field,
+    value,
+):
     suite = load_suite(_write_suite(tmp_path, _suite_payload()))
 
     class Harness:
@@ -234,7 +245,7 @@ def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
                 **{
                     **result.to_dict(),
                     "status": BenchmarkStatus.SUCCESS,
-                    "calls_per_graph": 1,
+                    field: value,
                 }
             )
 
@@ -248,6 +259,18 @@ def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
     result = payload["cases"][0]["result"]
     assert result["status"] == "execution_failure"
     assert result["error_message"] == "successful benchmark reported the wrong context"
+
+
+def test_suite_defaults_to_cold_cache_and_can_disable_it(tmp_path):
+    default_suite = load_suite(_write_suite(tmp_path, _suite_payload()))
+    assert default_suite.cases[0].request.cold_cache is True
+    assert default_suite.cases[0].definition["cold_cache"] is True
+
+    payload = _suite_payload()
+    payload["cases"][0]["definition"]["cold_cache"] = False
+    hot_suite = load_suite(_write_suite(tmp_path, payload))
+    assert hot_suite.cases[0].request.cold_cache is False
+    assert hot_suite.cases[0].definition["cold_cache"] is False
 
 
 def test_benchmark_exception_is_result_data_and_later_cases_run(tmp_path):
@@ -339,6 +362,7 @@ def test_environment_mismatch_produces_complete_results_without_timing(tmp_path)
     assert factory_called is False
     result = payload["cases"][0]["result"]
     assert result["status"] == "environment_invalid"
+    assert result["cold_cache"] is True
     assert payload["environment"]["vendor"] == "nvidia"
     assert payload["environment"]["arch"] == "9.0"
     assert "required 'amd'" in result["error_message"]
@@ -377,6 +401,10 @@ def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypa
         (
             lambda payload: payload["cases"][0]["definition"].pop("seed"),
             "seed",
+        ),
+        (
+            lambda payload: payload["cases"][0]["definition"].update(cold_cache="yes"),
+            "cold_cache",
         ),
     ],
 )
