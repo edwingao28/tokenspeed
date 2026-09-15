@@ -118,7 +118,6 @@ def _request(family: str) -> BenchmarkRequest:
         registration=None,
         cold_cache=True,
         seed=7,
-        definition_version=2,
     )
 
 
@@ -150,7 +149,6 @@ def test_request_selection_modes_and_parameter_copy():
         registration=None,
         cold_cache=True,
         seed=42,
-        definition_version=1,
     )
     solution = BenchmarkRequest(
         family="gemm",
@@ -160,7 +158,6 @@ def test_request_selection_modes_and_parameter_copy():
         registration=None,
         cold_cache=True,
         seed=42,
-        definition_version=1,
     )
     exact = BenchmarkRequest(
         family="gemm",
@@ -170,7 +167,6 @@ def test_request_selection_modes_and_parameter_copy():
         registration="gluon_bmm",
         cold_cache=False,
         seed=42,
-        definition_version=1,
     )
     parameters["size"] = 16
 
@@ -192,7 +188,6 @@ def test_request_rejects_ambiguous_selection() -> None:
             registration="exact",
             cold_cache=True,
             seed=42,
-            definition_version=1,
         )
 
 
@@ -468,7 +463,6 @@ def test_dense_bmm_rejects_invalid_generator_parameters(parameters, match):
         registration=None,
         cold_cache=True,
         seed=42,
-        definition_version=1,
     )
 
     with pytest.raises(BenchmarkCaseError, match=match) as raised:
@@ -599,7 +593,6 @@ def test_dense_bmm_uses_registered_reference_for_local_correctness(
             registration=candidate_spec.name,
             cold_cache=True,
             seed=7,
-            definition_version=1,
         )
     )
 
@@ -691,7 +684,6 @@ def test_dense_bmm_validation_requires_a_compatible_registered_reference(
             registration=candidate_spec.name,
             cold_cache=True,
             seed=42,
-            definition_version=1,
         )
     )
 
@@ -737,7 +729,6 @@ def test_exact_dense_bmm_rejects_incompatible_shape(
             registration="unit_exact_bmm",
             cold_cache=True,
             seed=42,
-            definition_version=1,
         )
     )
 
@@ -777,7 +768,6 @@ def test_dense_bmm_solution_shape_miss_is_invalid_not_backend_unavailable(
             registration=None,
             cold_cache=True,
             seed=42,
-            definition_version=1,
         )
     )
 
@@ -803,7 +793,6 @@ def test_dense_bmm_missing_solution_reports_backend_unavailable(
             registration=None,
             cold_cache=True,
             seed=42,
-            definition_version=1,
         )
     )
 
@@ -851,7 +840,6 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
             },
             cold_cache=True,
             seed=42,
-            definition_version=1,
             **selection,
         )
     )

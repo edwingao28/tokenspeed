@@ -91,7 +91,6 @@ class BenchmarkRequest:
     registration: str | None
     cold_cache: bool
     seed: int
-    definition_version: int
 
     def __post_init__(self) -> None:
         if self.solution is not None and self.registration is not None:
@@ -180,7 +179,6 @@ class KernelBenchmarkResult:
     requested_registration: str | None
     cold_cache: bool
     seed: int
-    definition_version: int
     platform_vendor: str
     platform_arch: str
     device_name: str
@@ -548,7 +546,6 @@ class KernelBenchmarkHarness:
             "requested_registration": request.registration,
             "cold_cache": request.cold_cache,
             "seed": request.seed,
-            "definition_version": request.definition_version,
             "platform_vendor": platform.vendor if platform is not None else "",
             "platform_arch": platform.arch if platform is not None else "",
             "device_name": platform.device_name if platform is not None else "",

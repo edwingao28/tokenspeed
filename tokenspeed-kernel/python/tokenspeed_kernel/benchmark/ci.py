@@ -65,6 +65,7 @@ class SuiteCase:
     """One stable benchmark identity and its revision-local request."""
 
     id: str
+    comparison_epoch: int
     definition: dict[str, Any]
     policy: dict[str, float]
     request: BenchmarkRequest
@@ -162,7 +163,6 @@ def _parse_definition(
         registration=definition.get("registration"),
         cold_cache=cold_cache,
         seed=definition["seed"],
-        definition_version=definition["definition_version"],
     )
 
     normalized = {
@@ -173,7 +173,6 @@ def _parse_definition(
         "registration": request.registration,
         "cold_cache": request.cold_cache,
         "seed": request.seed,
-        "definition_version": request.definition_version,
     }
     return normalized, request
 
@@ -182,15 +181,30 @@ def _parse_case(raw: object, index: int) -> SuiteCase:
     location = f"cases[{index}]"
     case = _object(raw, location)
     case_id = _nonempty_string(case["id"], f"{location}.id")
+    comparison_epoch = case["comparison_epoch"]
+    if (
+        isinstance(comparison_epoch, bool)
+        or not isinstance(comparison_epoch, int)
+        or comparison_epoch <= 0
+    ):
+        raise SuiteConfigError(
+            f"{location}.comparison_epoch must be a positive integer"
+        )
     definition, request = _parse_definition(
         case["definition"], f"{location}.definition"
     )
     policy = _parse_policy(case["policy"], f"{location}.policy")
-    return SuiteCase(case_id, definition, policy, request)
+    return SuiteCase(
+        id=case_id,
+        comparison_epoch=comparison_epoch,
+        definition=definition,
+        policy=policy,
+        request=request,
+    )
 
 
 def load_suite(path: str | Path) -> BenchmarkSuite:
-    """Load the fields needed to execute a versioned benchmark suite."""
+    """Load the fields needed to execute a benchmark suite."""
 
     suite_path = Path(path)
     try:
@@ -427,6 +441,7 @@ def run_suite(
         case_payloads.append(
             {
                 "id": case.id,
+                "comparison_epoch": case.comparison_epoch,
                 "definition": case.definition,
                 "policy": case.policy,
                 "result": result_payload,
@@ -473,7 +488,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a revision-local kernel benchmark suite for CI"
     )
-    parser.add_argument("--suite", required=True, help="Versioned suite JSON path")
+    parser.add_argument("--suite", required=True, help="Benchmark suite JSON path")
     parser.add_argument(
         "--revision",
         required=True,
