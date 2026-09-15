@@ -23,8 +23,6 @@
 import dataclasses
 
 import torch
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
@@ -41,7 +39,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -61,6 +59,7 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutPlan,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = get_colorful_logger(__name__)
 
@@ -782,7 +781,7 @@ class LogitsProcessor(nn.Module):
                     dtype=logits.dtype,
                     device=logits.device,
                 )
-                all_gather_into_tensor(gathered_logits, logits, self.tp_group)
+                all_gather_single(gathered_logits, logits, self.tp_group)
                 logits = (
                     gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)
