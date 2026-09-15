@@ -133,6 +133,7 @@ if _IS_NVIDIA_BLACKWELL:
             }
         ),
         traits={
+            "is_decode": frozenset({True}),
             "head_dim": frozenset({_HEAD_DIM}),
             "value_head_dim": frozenset({_HEAD_DIM}),
             "num_q_heads": frozenset({6, 12, 24}),

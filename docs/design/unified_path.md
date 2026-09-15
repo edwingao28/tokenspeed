@@ -453,6 +453,15 @@ Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
+The QSA leaf preserves `decode_query_lengths` through the kernel API:
+a positive uniform width identifies decode (including compact verification
+and narrowed draft queries), while `None` identifies prefill or mixed/ragged
+queries. The kernel registry gates CuTe QSA on the decode trait; NVIDIA
+prefill uses FlashInfer FA2 even when its query has only one row. Both use
+the same cache writer and sparse-attention call. The kernel API retains
+this trait when it adapts ragged queries to independent one-token rows, so
+that adaptation cannot accidentally select the decode specialization.
+
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its
 workspace before model forward or graph capture. Draft and non-speculative

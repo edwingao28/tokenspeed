@@ -22,13 +22,19 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import replace
+from functools import partial
 
 import pytest
+import tokenspeed_kernel.ops.attention.qsa as qsa_module
 import torch
 from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import SelectionObjective, select_kernel
+from tokenspeed_kernel.selection import (
+    SelectedKernel,
+    SelectionObjective,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.flashinfer.qsa_sparse import (
     _FlashInferQSASparseRunner,
@@ -177,6 +183,57 @@ def test_qsa_sparse_attention_selects_cute_on_b200_and_b300(
         "flashinfer_fa2_fp8_qsa_sparse_attention"
         if cache_dtype is torch.float8_e4m3fn
         else "flashinfer_fa2_qsa_sparse_attention"
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_seqlen_q", "expected_kernel"),
+    [
+        (None, "flashinfer_fa2_qsa_sparse_attention"),
+        (1, "cute_dsl_blackwell_qsa_sparse_attention"),
+        (4, "cute_dsl_blackwell_qsa_sparse_attention"),
+    ],
+)
+def test_qsa_sparse_attention_routes_prefill_and_uniform_decode(
+    monkeypatch,
+    b200_platform,
+    max_seqlen_q,
+    expected_kernel,
+) -> None:
+    if not current_platform().is_blackwell:
+        pytest.skip("real CuTe QSA registration requires a Blackwell host")
+    rows = 1 if max_seqlen_q is None else max_seqlen_q
+    q = torch.empty((rows, 6, 256), dtype=torch.bfloat16, device="cpu")
+    cache = torch.empty((16, 1, 256), dtype=torch.bfloat16, device="cpu")
+    slots = torch.ones((rows, 2051), dtype=torch.int32, device="cpu")
+
+    def run(kernel, *args, **kwargs):
+        assert kernel.name == expected_kernel
+        return q
+
+    monkeypatch.setattr(
+        qsa_module,
+        "select_kernel",
+        partial(
+            select_kernel,
+            features=None,
+            platform=b200_platform,
+            objective=SelectionObjective.DEFAULT,
+        ),
+    )
+    monkeypatch.setattr(SelectedKernel, "__call__", run)
+    qsa_sparse_attention(
+        q,
+        cache,
+        cache,
+        slots,
+        scale=1 / 16,
+        max_seqlen_q=max_seqlen_q,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution=None,
     )
 
 
@@ -612,10 +669,12 @@ def test_qsa_sparse_attention_blackwell_cluster_capacity(
 
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("is_prefill", [False, True])
 def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
     device: str,
     rows: int,
     cache_dtype: torch.dtype,
+    is_prefill: bool,
 ) -> None:
     platform = current_platform()
     if not platform.is_nvidia or platform.arch_version < ArchVersion(8, 0):
@@ -668,12 +727,12 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         v_cache,
         selected,
         scale=scale,
-        max_seqlen_q=(4 if rows == 4 else 1),
+        max_seqlen_q=None if is_prefill else (4 if rows == 4 else 1),
         metadata_capacity_rows=None,
         k_scale=k_scale,
         v_scale=v_scale,
         override=None,
-        solution="flashinfer",
+        solution=None if is_prefill else "flashinfer",
     )
     selected[:, :256] = torch.randint(
         1, cache_slots, (rows, 256), dtype=torch.int32, device=device
@@ -686,12 +745,12 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         v_cache,
         selected,
         scale=scale,
-        max_seqlen_q=(4 if rows == 4 else 1),
+        max_seqlen_q=None if is_prefill else (4 if rows == 4 else 1),
         metadata_capacity_rows=None,
         k_scale=k_scale,
         v_scale=v_scale,
         override=None,
-        solution="flashinfer",
+        solution=None if is_prefill else "flashinfer",
     )
 
     assert (
