@@ -86,6 +86,34 @@ A fourth quantity lives outside the logical world entirely:
   KV-cache-based attention (as paged KV entries) and by state-based attention
   (as a state slot). The view is defined by the consumer, not by the block.
 
+`BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
+the free child-slot count for each cache group, and the ordered set of partially
+filled LCM blocks for that group. C++ group ids are dense scheduler indices, so
+the scheduler supplies the complete packing vector when it constructs each
+pool. The per-group placement records form a vector indexed by group id, and
+each `GroupPlacement` stores immutable slots-per-parent geometry. It updates its
+free-slot count, bound-parent count and partial-parent index together on every
+occupancy transition. A parent with zero occupants is unbound, so its capacity
+belongs to the global empty-parent FIFO rather than any group.
+
+The pool knows which child slots are occupied, never who holds them. Whether a
+child is pinned by a request table, published by a prefix-cache entry, or held
+by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
+the holders; the pool does not track it, and `CacheBlockRef` does not report
+it. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
+(`ParentIsFullyEvictable`), which is a scan and is therefore reserved for
+eviction policy and leak checks, not for per-step accounting.
+
+Admission first checks the indexed free-slot and empty-parent counts. If the
+request fits, it does not enumerate eviction candidates. Under memory pressure,
+it enumerates candidates and keeps shadow occupancy only for the parents whose
+children it tentatively evicts. This makes the common zero-eviction path scale
+with cache groups and request demand rather than total cache capacity.
+
+The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
+empty parents come from the pool, active parents from the live requests' block
+tables, and cache-only residency is the remainder `total - empty - active`.
+
 ## Who is allowed to see what
 
 ### C++ scheduler: schedules in logical units
@@ -414,7 +442,10 @@ Perception rules per directory:
   `CacheBlock` index, extracted from the old `GroupAllocator`. It owns
   register/lookup/evict/pin (`Register`, `RegisterFullBlocks`, `Contains`,
   `Find`, `Evict`, `AcquireMatched`, eviction metadata). Indices are
-  pool-scoped: one index serves both the Device and Host tiers of its group.
+  pool-scoped: one index serves both the Device and Host tiers of its group. A
+  cache entry is metadata plus an owning `CacheBlockRef` that publishes an
+  existing block for reuse; registration neither allocates nor copies physical
+  storage.
 * **`PrefixMatcher`** (`prefix_matcher.h`) — the per-attention-kind match
   policy, extracted from the old manager subclasses. `FullAttnMatcher` walks
   left-to-right until the first miss (prefix-closed); `SwaMatcher` scans
@@ -447,7 +478,12 @@ The conversion is `GroupGeometry` in the coordinator layer:
 
 Where reclaim needs to know whether a block is still cached, it takes the
 group's `PrefixCacheIndex` as an explicit read-only parameter — the
-dependency is visible in the signature, not hidden in shared state.
+dependency is visible in the signature, not hidden in shared state. The
+reverse direction is symmetric: publishing a table's completed blocks may
+replace one with the key's existing canonical block, and that write goes
+through a mutable window the allocator hands out
+(`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`.
+The index never sees a `BlockTable`; the allocator remains its only mutator.
 
 ## The coordinator layer (`csrc/cache/coordinator/`)
 
@@ -503,7 +539,11 @@ Its responsibilities:
   ranking retraction (preemption) victims.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
-  prefix event.
+  prefix event. Whether a scheduler-level boundary is fully, partially or not
+  resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
+  the group indexes), so the scheduler keeps no residency counters of its own
+  — only the token descriptor the event carries and whether that event is
+  currently out.
 
 `MakeCoordinator` is the factory: one `CacheGroup` per `CacheGroupSpec`
 (group_id = index), all sharing one scheduler-level `prefix_granularity`
@@ -515,12 +555,24 @@ The internal capacity planner behind `Admit`. It runs entirely on shadow
 occupancy — never mutating the real pool — and answers: *which cached blocks
 must be evicted for this admission to fit, while protecting the current
 prefix hits?* The algorithm: first check whether existing local holes plus
-empty parents fit with zero eviction; otherwise pop victims from a heap
-ordered by eviction policy (LRU access epoch, then tier: uncached
-request-only block → probationary boundary → established boundary → suffix of
-a closed prefix) until the plan fits; finally walk the victim list in reverse
-and restore every victim that is not strictly required, yielding a minimal
-eviction set.
+empty parents fit with zero eviction; otherwise select eviction candidates
+until the plan fits. Request-reclaimable candidates are collected and sorted
+once; each cache group loads and sorts one epoch of eligible candidates at a
+time, skipping epochs whose entries are all protected or already listed for
+request reclaim. Selection compares the next candidate from each group with
+the next request-reclaimable candidate using one policy: LRU access epoch,
+then tier (uncached request-only block → probationary boundary → established
+boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+reverse and restore every block that is not strictly required, yielding a
+minimal eviction set in `victims`.
+
+Each cache group uses a non-owning cursor over its tier's eviction index.
+It advances continuously, skips fully pinned epochs, and returns complete
+epochs for policy ordering. Cursors exist only during one read-only planning
+pass: their index and pool must remain alive, and entries must not be inserted,
+erased, or re-keyed during traversal. Commit-time index mutations happen after
+the planner is destroyed. A full traversal costs O(N), including pinned entries,
+without a separate tree lookup per epoch.
 
 ## The cache pipeline: layers → group → pack → bind
 
@@ -733,7 +785,9 @@ Enforced:
   between them (P divisibility, PD transfer policy, one-cache-block chunks for
   a recurrent-state group). The `Scheduler` runs it before constructing any
   member, because the pools and the coordinator assert on the same fields and
-  would otherwise preempt the diagnostic. Consequently `MakeSpecsFromConfig`
+  would otherwise preempt the diagnostic. Python callers must also pass
+  `Scheduler(config)` explicitly; the binding retains no module-lifetime
+  default configuration. Consequently `MakeSpecsFromConfig`
   is pure translation — it validates nothing;
 * the scheduler layer **transports** `cache_blocks_per_lcm_block` rather than
   reasoning with it. It appears in `csrc/scheduler/` only as a config field

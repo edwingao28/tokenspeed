@@ -83,6 +83,7 @@ from tokenspeed_kernel.ops.residual import (
     gated_residual_combine,
     gated_residual_mix,
     mhc_fused_hc,
+    mhc_mixes,
     mhc_post,
     mhc_pre,
 )
@@ -121,6 +122,7 @@ __all__ = [
     "gated_residual_combine_norm",
     "gated_residual_mix",
     "mhc_fused_hc",
+    "mhc_mixes",
     "mhc_post",
     "mhc_pre",
     # layernorm
