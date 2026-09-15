@@ -92,6 +92,11 @@ def _persistent_workspace(device: torch.device, projection_rows: int):
         with _WORKSPACE_LOCK:
             workspace = _WORKSPACES.get(key)
             if workspace is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "fused CuTe HC workspace is not initialized for CUDA graph "
+                        "capture; warm up on the capture stream before capture"
+                    )
                 # Opaque 16-bit storage allows ordered BF16/FP16 calls to reuse
                 # one stream workspace. The invocation supplies the typed view.
                 # Reducers overwrite every consumed post-SiLU activation.
@@ -199,7 +204,7 @@ if _AVAILABLE:
                 for value, leading in zip(values, leading_dims)
             )
             stream = CUstream(torch.cuda.current_stream(normalized.device).cuda_stream)
-            enable_pdl = pdl_enabled(None)
+            enable_pdl = pdl_enabled()
             key = (
                 normalized.device.index,
                 normalized.dtype,
@@ -215,6 +220,11 @@ if _AVAILABLE:
                 with _COMPILE_LOCK:
                     compiled = _COMPILED.get(key)
                     if compiled is None:
+                        if torch.cuda.is_current_stream_capturing():
+                            raise RuntimeError(
+                                "fused CuTe HC kernel is not compiled for CUDA graph "
+                                "capture; warm up this variant before capture"
+                            )
                         kernel = FusedGatedResidualKernel(
                             rows,
                             projection_rows,

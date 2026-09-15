@@ -149,9 +149,6 @@ cases from the merge base and candidate revision. See the
 contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
 for workflow behavior and runner requirements.
 
-See the [residual operator documentation](python/tokenspeed_kernel/ops/residual/README.md)
-for gated-residual dispatch contracts and validation.
-
 ### Plugins
 
 `python -m tokenspeed_kernel.plugins` lists discovered out-of-tree backends.

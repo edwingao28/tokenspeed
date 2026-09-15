@@ -49,7 +49,7 @@ WIDE = HC_COUNT * HIDDEN_SIZE
 
 @pytest.fixture(autouse=True)
 def restore_kernel_state():
-    previous_pdl = pdl_enabled(None)
+    previous_pdl = pdl_enabled()
     previous_deterministic = torch.are_deterministic_algorithms_enabled()
     previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     capture = ShapeCapture.get()
@@ -82,8 +82,8 @@ def _delayed_combine_projection(
     BLOCK: tl.constexpr,
     CYCLES: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_launch_dependents()
     tl.extra.cuda.gdc_wait()
+    tl.extra.cuda.gdc_launch_dependents()
     start = tl.inline_asm_elementwise(
         "mov.u64 $0, %clock64;",
         constraints="=l",
@@ -257,9 +257,14 @@ def test_fused_cute_mix_matches_fp64_and_graph(
 
     tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
     expected = _mix_reference(normalized, projection, up, projection_scale)
-    torch.testing.assert_close(mix(), expected, rtol=tolerance, atol=tolerance)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        eager = mix()
+    stream.synchronize()
+    torch.testing.assert_close(eager, expected, rtol=tolerance, atol=tolerance)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=stream):
         outputs = [mix() for _ in range(3)]
     for _ in range(5):
         graph.replay()
@@ -570,11 +575,14 @@ def test_hc_full_chain_cuda_graph_replays(
 
     assert pdl_enabled(enable_pdl) is enable_pdl
     # Compile every PDL variant and populate the stream-private workspace.
-    chain(residual)
-    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        chain(residual)
+    stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=stream):
         value = residual
         for _ in range(3):
             previous = value
@@ -701,13 +709,17 @@ def test_mix_prefetch_observes_pdl_producer_updates(
         projection_source = projection_source[:LOWRANK]
     projection_source.mul_(2.0)
     up_source.mul_(4.0)
-    normalized = torch.zeros_like(x_source)
+    normalized = torch.full_like(x_source, float("nan"))
     projection = (
         projection_source.clone()
         if weights_independent
-        else torch.zeros_like(projection_source)
+        else torch.full_like(projection_source, float("nan"))
     )
-    up = up_source.clone() if weights_independent else torch.zeros_like(up_source)
+    up = (
+        up_source.clone()
+        if weights_independent
+        else torch.full_like(up_source, float("nan"))
+    )
     sources = (projection_source, up_source, x_source)
     targets = (projection, up, normalized)
     sizes = tuple(
@@ -745,9 +757,13 @@ def test_mix_prefetch_observes_pdl_producer_updates(
         x_source.mul_(-0.875)
         projection_source.mul_(-1.125)
         up_source.mul_(-1.0)
+        normalized.fill_(float("nan"))
         if weights_independent:
             projection.copy_(projection_source)
             up.copy_(up_source)
+        else:
+            projection.fill_(float("nan"))
+            up.fill_(float("nan"))
         graph.replay()
         expected = _mix_reference(x_source, projection_source, up_source, scale)
         tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3

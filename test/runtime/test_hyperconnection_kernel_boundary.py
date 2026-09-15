@@ -158,7 +158,9 @@ def test_combine_norm_uses_consumers_norm(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-@pytest.mark.parametrize("communication", ["idle", "unchanged", "row_slice"])
+@pytest.mark.parametrize(
+    "communication", ["idle", "unchanged", "row_slice", "unrelated"]
+)
 def test_attention_to_mlp_fusion_after_communication(communication: str) -> None:
     config = HyperConnectionConfig(
         hc_count=4,
@@ -177,7 +179,18 @@ def test_attention_to_mlp_fusion_after_communication(communication: str) -> None
     row_slice = slice(2, 5) if communication == "row_slice" else slice(None)
     communicated_residual = residual[row_slice]
     communicated_output = output[row_slice]
-    aligned_residuals = attention.norm_for(communicated_residual, residuals)
+    if communication == "unrelated":
+        communicated_residual = communicated_residual.flip(0) * 3.0 + 1.0
+        # Recompute gates from the communicated rows without using norm_for;
+        # reusing old logits or projecting unnormalized rows changes the result.
+        fresh = attention._normalize(communicated_residual)
+        aligned_residuals = (
+            communicated_residual,
+            fresh,
+            attention._inject_logits(fresh),
+        )
+    else:
+        aligned_residuals = attention.norm_for(communicated_residual, residuals)
     combined = attention.combine(communicated_output, aligned_residuals)
     expected_mix, expected_residuals = mlp.mix(combined, normalized=None)
     post_attn_comm = mock.Mock(
@@ -194,7 +207,9 @@ def test_attention_to_mlp_fusion_after_communication(communication: str) -> None
 
     with mock.patch.object(
         attention, "combine", side_effect=AssertionError("unexpected separate combine")
-    ):
+    ), mock.patch.object(
+        attention, "_normalize", wraps=attention._normalize
+    ) as normalize:
         actual_mix, actual_residuals = _Qwen4ExpDecoderMixin._finish_attention(
             layer, output, residuals, ctx
         )
@@ -202,6 +217,7 @@ def test_attention_to_mlp_fusion_after_communication(communication: str) -> None
     torch.testing.assert_close(actual_mix, expected_mix, rtol=0, atol=0)
     torch.testing.assert_close(actual_residuals, expected_residuals, rtol=0, atol=0)
     assert post_attn_comm.call_count == (0 if communication == "idle" else 1)
+    assert normalize.call_count == (1 if communication == "unrelated" else 0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

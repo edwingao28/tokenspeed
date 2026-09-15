@@ -212,7 +212,7 @@ def grouped_gemma_rmsnorm(
     block = triton.next_power_of_2(group_size)
     if block > 65536:
         raise ValueError("group_size is too large for the Triton reduction")
-    enable_pdl = pdl_enabled(None)
+    enable_pdl = pdl_enabled()
     launch_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
@@ -335,7 +335,7 @@ def gated_residual_combine_norm(
     if block > 65536:
         raise ValueError("group_size is too large for the Triton reduction")
     rows = residual.numel() // width
-    enable_pdl = pdl_enabled(None)
+    enable_pdl = pdl_enabled()
     launch_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )

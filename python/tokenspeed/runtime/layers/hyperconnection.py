@@ -221,6 +221,8 @@ class GatedResidualSimple(nn.Module):
         hyper_input, normalized, inject_logits = residuals
         start = _matching_rows(hyper_input, value)
         if start is None:
+            # Injection logits depend on this norm even when combine_norm only
+            # consumes the residual and logits from the returned tuple.
             fresh = self._normalize(value)
             return value, fresh, self._inject_logits(fresh)
         if start == 0 and value.shape[0] == hyper_input.shape[0]:

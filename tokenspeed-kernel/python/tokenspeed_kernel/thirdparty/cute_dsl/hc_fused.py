@@ -517,6 +517,7 @@ class FusedGatedResidualKernel:
                 tcgen05.commit(down_done, None, self.group)
             cute.arch.mbarrier_wait(epi_done, 0)
             if cutlass.const_expr(self.pdl):
+                # Our wait ran; consumers wait for grid completion, including out.
                 cute.arch.griddepcontrol_launch_dependents()
             with cute.arch.elect_one():
                 _cluster_arrive(cluster_done)
