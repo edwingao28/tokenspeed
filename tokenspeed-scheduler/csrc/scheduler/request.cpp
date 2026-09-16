@@ -57,7 +57,10 @@ std::int32_t Request::MaterializedStateBoundaryTokens() const {
     // that frontier is not an exact recurrent-state endpoint.
     std::int32_t endpoint = 0;
     if (Is<fsm::Decoding>()) {
-        endpoint = TokenSize() - 1;
+        endpoint = accepted_state_endpoint_tokens_.value_or(TokenSize() - 1);
+        if (endpoint > TokenSize() - 1 || endpoint < PrefillSize()) {
+            endpoint = 0;
+        }
     } else if (Is<fsm::PrefillDone>()) {
         const PrefillInfo info = CurrentPrefillInfo();
         endpoint = info.already_scheduled_len + info.extend_len;

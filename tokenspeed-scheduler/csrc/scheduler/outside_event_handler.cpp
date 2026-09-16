@@ -20,6 +20,7 @@
 
 #include "scheduler/scheduler.h"
 
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -46,6 +47,7 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
+    clearLatestDecodeState(*request);
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
@@ -57,6 +59,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
+    clearLatestDecodeState(*request);
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -89,6 +92,7 @@ void Scheduler::handleEvent(const forward::Finish& event) {
                 pending_write_back_operations_.push_back(std::move(*store));
             }
         }
+        clearLatestDecodeState(*request);
         request->Apply(fsm::FinishEvent{&coordinator_});
     }
 }
@@ -109,17 +113,33 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
 
         std::vector<CacheKey> event_keys =
             registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
-        coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.prefix_hashes, progress.access_epoch,
-                                          first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint,
-                                          /*stream_completed_to_host=*/false,
-                                          request.MaterializedStateBoundaryTokens());
+        std::vector<GroupDemand> demands;
+        demands.reserve(request.BlockTablesRef().size());
+        for (BlockTable& table : request.BlockTablesRef()) {
+            demands.push_back(GroupDemand{
+                .table = &table,
+                .prefix_hashes = progress.prefix_hashes,
+                .new_prefix_hash_begin = first_new_prefix_page,
+                .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
+                .num_computed_tokens = request.TokenSize() - 1,
+                .stream_completed_to_host = false,
+                .materialized_state_boundary_tokens = request.MaterializedStateBoundaryTokens(),
+            });
+        }
+        coordinator_.CacheCompletedBlocks(demands, progress.access_epoch);
         discardUncachedKvEventPages(event_keys);
     }
+    // Finalization must retain the selected cache entry even if the last
+    // round added no hash. These identities hold no Device references.
+    std::optional<StateSnapshot> retained_snapshot =
+        coordinator_.RetainLatestStateSnapshot(progress.prefix_hashes, CacheBoundaryKind::kEndpoint);
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
     coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
-    coordinator_.QueueLatestSnapshotBlocksForStore(progress.prefix_hashes);
+    if (retained_snapshot) {
+        coordinator_.QueueStateSnapshotForStore(*retained_snapshot);
+    }
     // The request's pages are released right after this (FinishEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
@@ -131,10 +151,31 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
     }
 }
 
-void Scheduler::handleEvent(const forward::ExtendResult& event) {
+void Scheduler::handleEvent(const forward::ExtendResult& event, bool publish_state) {
     if (Request* request = findRequest(event.request_id)) {
+        const std::int32_t previous_size = request->TokenSize();
+        const bool is_decode_result = previous_size > request->PrefillSize();
+        if (event.num_accepted_tokens < -1) {
+            throw std::invalid_argument("accepted token count must be non-negative or unspecified");
+        }
+        const std::int32_t accepted =
+            event.num_accepted_tokens < 0 ? static_cast<std::int32_t>(event.tokens.size()) : event.num_accepted_tokens;
+        if (accepted < static_cast<std::int32_t>(event.tokens.size())) {
+            throw std::invalid_argument("accepted token count is smaller than returned tokens");
+        }
+        const std::int64_t endpoint =
+            is_decode_result ? static_cast<std::int64_t>(previous_size) - 1 + accepted : request->PrefillSize();
+        if (endpoint > std::numeric_limits<std::int32_t>::max()) {
+            throw std::invalid_argument("accepted state endpoint exceeds int32 range");
+        }
         request->NoteResultLanded();
         request->Apply(fsm::ExtendResultEvent{event.tokens});
+        if (!event.tokens.empty() && request->HoldsPages()) {
+            request->NoteAcceptedStateEndpoint(static_cast<std::int32_t>(endpoint));
+            if (is_decode_result && publish_state) {
+                updateDecodeStateSnapshot(*request, static_cast<std::int32_t>(endpoint));
+            }
+        }
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }
@@ -143,6 +184,7 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
+        clearLatestDecodeState(*request);
         request->Apply(fsm::AbortEvent{&coordinator_});
     }
 }

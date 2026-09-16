@@ -87,6 +87,24 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
     return demands;
 }
 
+void classifyCompletedStateBoundaries(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
+                                      std::int32_t prefill_size, std::int32_t prefix_granularity) {
+    _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
+    const std::int32_t final_prompt_boundary = prefill_size / prefix_granularity * prefix_granularity;
+    for (std::size_t i = 0; i < demands.size(); ++i) {
+        GroupDemand& demand = demands[i];
+        if (!cache_groups[i].IsSnapshotStateGroup() || demand.completed_boundary_kind != CacheBoundaryKind::kChunk) {
+            continue;
+        }
+        const std::int32_t boundary = demand.materialized_state_boundary_tokens;
+        if (final_prompt_boundary > 0 && boundary == final_prompt_boundary) {
+            // The following sub-granularity tail adds no hash. Retain this
+            // checkpoint now, while leaving the history groups' kind alone.
+            demand.completed_boundary_kind = CacheBoundaryKind::kEndpoint;
+        }
+    }
+}
+
 void makeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
                                     const CacheCoordinator& coordinator, std::int32_t before_tokens,
                                     std::int32_t after_tokens) {
@@ -179,7 +197,8 @@ bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::s
     for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
         const BlockTable& table = tables[static_cast<std::size_t>(i)];
         if (coordinator.GroupBlocksNeededFor(i, table, num_tokens) != 0 ||
-            coordinator.GroupHasReclaimableBlocksAt(i, table, num_computed_tokens)) {
+            coordinator.GroupHasReclaimableBlocksAt(i, table, num_computed_tokens) ||
+            coordinator.GroupProtectedStateNeedsReclaimAt(i, table, num_computed_tokens)) {
             return false;
         }
     }
@@ -488,6 +507,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      .stream_completed_to_host = config_.StreamsDeviceCacheToHost(),
                                      .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
                                  });
+    classifyCompletedStateBoundaries(demands, config_.cache_groups, request->PrefillSize(),
+                                     coordinator_.PrefixGranularity());
     reservePrefillDemands(demands, config_.cache_groups, reserve);
     makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos, after_tokens);
     if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page, demands)) {
@@ -531,6 +552,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                 .stream_completed_to_host = config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(),
                 .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
             });
+        classifyCompletedStateBoundaries(demands, config_.cache_groups, request->PrefillSize(),
+                                         coordinator_.PrefixGranularity());
         if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page,
                                       demands)) {
             return std::nullopt;
@@ -539,6 +562,44 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
 
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
+}
+
+void Scheduler::updateDecodeStateSnapshot(Request& request, std::int32_t endpoint_tokens) {
+    if (!coordinator_.HasMambaStateGroup() || endpoint_tokens <= request.PrefillSize() ||
+        endpoint_tokens > request.TokenSize() - 1 || endpoint_tokens % coordinator_.PrefixGranularity() != 0) {
+        return;
+    }
+
+    const fsm::CacheProgress progress = request.CacheProgress();
+    if (progress.latest_decode_state_boundary_tokens >= endpoint_tokens) {
+        return;
+    }
+    // State commits follow the exact accepted endpoint. The ordinary history
+    // publication frontier is deliberately conservative under speculation,
+    // so compute these keys without advancing that frontier or publishing MLA.
+    std::vector<std::string> state_hashes = progress.prefix_hashes;
+    const std::int32_t num_prefix_pages = endpoint_tokens / coordinator_.PrefixGranularity();
+    if (static_cast<std::int32_t>(state_hashes.size()) > num_prefix_pages) {
+        state_hashes.resize(static_cast<std::size_t>(num_prefix_pages));
+    }
+    const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(state_hashes.size());
+    appendCompletedPrefixHashes(state_hashes, request.FullPrefixPages(true), num_prefix_pages);
+    std::vector<CacheKey> event_keys = registerKvEventPrefixPages(request, state_hashes, first_new_prefix_page);
+    std::optional<StateSnapshot> snapshot = coordinator_.PublishAndProtectStateSnapshot(
+        request.BlockTablesRef(), state_hashes, endpoint_tokens, progress.access_epoch, CacheBoundaryKind::kChunk);
+    discardUncachedKvEventPages(event_keys);
+    if (!snapshot) {
+        return;
+    }
+    request.SetLatestDecodeStateBoundary(snapshot->boundary_tokens);
+}
+
+void Scheduler::clearLatestDecodeState(Request& request) {
+    if (!request.HoldsPages()) {
+        return;
+    }
+    request.SetLatestDecodeStateBoundary(0);
+    coordinator_.ClearProtectedStateSnapshot(request.BlockTablesRef());
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
@@ -661,13 +722,26 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         const CompletedPrefixPages completed =
             updateCompletedPrefixHashes(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
         if (completed.boundary_kind) {
-            coordinator_.CacheCompletedBlocks(
-                victim.BlockTablesRef(), cache_progress.prefix_hashes, cache_progress.access_epoch,
-                completed.first_new_prefix_page, num_computed_tokens, *completed.boundary_kind,
-                /*stream_completed_to_host=*/false, victim.MaterializedStateBoundaryTokens());
+            std::vector<GroupDemand> demands =
+                makeGroupDemands(victim.BlockTablesRef(),
+                                 GroupDemand{
+                                     .prefix_hashes = cache_progress.prefix_hashes,
+                                     .new_prefix_hash_begin = completed.first_new_prefix_page,
+                                     .completed_boundary_kind = completed.boundary_kind,
+                                     .num_computed_tokens = num_computed_tokens,
+                                     .stream_completed_to_host = false,
+                                     .materialized_state_boundary_tokens = victim.MaterializedStateBoundaryTokens(),
+                                 });
+            classifyCompletedStateBoundaries(demands, config_.cache_groups, victim.PrefillSize(),
+                                             coordinator_.PrefixGranularity());
+            coordinator_.CacheCompletedBlocks(demands, cache_progress.access_epoch);
         }
         coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
-        coordinator_.QueueLatestSnapshotBlocksForStore(cache_progress.prefix_hashes);
+        // Upgrade the complete recovery boundary before selecting L2 stores.
+        if (auto snapshot =
+                coordinator_.RetainLatestStateSnapshot(cache_progress.prefix_hashes, CacheBoundaryKind::kEndpoint)) {
+            coordinator_.QueueStateSnapshotForStore(*snapshot);
+        }
         // The victim's pages are granted away in this very round, so the
         // ticket cannot pin them: the runtime orders the copy on the forward
         // thread's stream ahead of the plan's page reuse instead.
@@ -675,6 +749,7 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
             write_back_operations.push_back(std::move(*write_back));
         }
     }
+    clearLatestDecodeState(victim);
     victim.Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, recovers_as_readmission,
                                    victim.HasGeneratedOutput()});
     spdlog::info("[Scheduler] retract: released request {} ({} tokens){}", victim.Id(), victim.TokenSize(),
