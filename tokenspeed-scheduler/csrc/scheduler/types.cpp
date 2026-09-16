@@ -20,6 +20,7 @@
 
 #include "scheduler/types.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -78,12 +79,37 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage) {
         throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
     }
+    std::int32_t max_replay_window_tokens = 0;
     for (const CacheGroupConfig& group : cache_groups) {
         validateGroup(*this, group);
         // A recurrent state advances one whole checkpoint at a time, so a chunk
         // must be able to cover one cache block.
         if (group.IsSnapshotStateGroup() && max_scheduled_tokens < prefix_granularity) {
             throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");
+        }
+        max_replay_window_tokens = std::max(max_replay_window_tokens, group.replay_window_tokens.value_or(0));
+    }
+    if (max_replay_window_tokens > 0) {
+        // Replayed groups are private to the fused engine: the PD destination
+        // layouts land cached pages, and a replayed group has none to land.
+        if (role != Role::kFused) {
+            throw std::invalid_argument("Scheduler: bounded-replay cache groups are only supported on the Fused role");
+        }
+        // A prefix hit re-feeds up to one replay window and must still advance:
+        // by every new token when fewer than a window remain, or by one prefix
+        // page when a promotion boundary aligns the chunk.
+        if (max_scheduled_tokens < max_replay_window_tokens + std::max(max_replay_window_tokens, prefix_granularity)) {
+            throw std::invalid_argument(
+                "Scheduler: max_scheduled_tokens must cover the largest replay_window_tokens plus max(replay "
+                "window, prefix_granularity)");
+        }
+        // The final-chunk window rule and the state-checkpoint chunk alignment
+        // would each reshape the other's chunk; no model needs both.
+        for (const CacheGroupConfig& group : cache_groups) {
+            if (group.IsSnapshotStateGroup()) {
+                throw std::invalid_argument(
+                    "Scheduler: bounded-replay cache groups cannot be combined with snapshot-state groups");
+            }
         }
     }
 }
