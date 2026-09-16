@@ -65,20 +65,6 @@ std::int32_t Request::NumComputedTokens() const {
         state_);
 }
 
-std::int32_t Request::MaterializedStateBoundaryTokens() const {
-    // Feedback contains accepted tokens plus one not-yet-computed token, so a
-    // decoding request's exact endpoint is NumComputedTokens(); prefill lands
-    // its scheduled window end. Either is a written state when aligned.
-    std::int32_t endpoint = 0;
-    if (Is<fsm::Decoding>() || Is<fsm::PrefillDone>()) {
-        endpoint = NumComputedTokens();
-    }
-    if (endpoint > 0 && endpoint % prefix_granularity_ == 0) {
-        return endpoint;
-    }
-    return forwardResources("MaterializedStateBoundaryTokens").cache_progress.materialized_state_boundary_tokens;
-}
-
 fsm::ForwardResources& Request::forwardResources(const char* operation) {
     fsm::ForwardResources* result = std::visit(
         []<typename State>(State& state) -> fsm::ForwardResources* {
