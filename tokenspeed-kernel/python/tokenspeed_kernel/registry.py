@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     import torch
 
     from tokenspeed_kernel.selection import SelectedKernel
+    from tokenspeed_kernel.warmup import WarmupConfig
 
 from tokenspeed_kernel.platform import CapabilityRequirement, PlatformInfo
 from tokenspeed_kernel.signature import FormatSignature
@@ -38,10 +39,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "KernelSpec",
+    "KernelApiSpec",
     "KernelRegistry",
     "Priority",
     "load_builtin_kernels",
     "register_kernel",
+    "register_kernel_api",
     "describe_kernel",
 ]
 
@@ -154,6 +157,20 @@ def _validate_priority(value: int | Priority) -> int:
 
 
 @dataclass(frozen=True)
+class KernelApiSpec:
+    """Public operation contract shared by registered implementations."""
+
+    family: str
+    mode: str
+    public_api: Callable[..., object]
+    warmup_config_type: type[WarmupConfig] | None
+
+    @property
+    def api(self) -> str:
+        return f"{self.family}.{self.mode}"
+
+
+@dataclass(frozen=True)
 class KernelSpec:
     """Complete specification of a registered kernel."""
 
@@ -255,6 +272,7 @@ class KernelRegistry:
         self._by_operator: dict[tuple[str, str], list[KernelSpec]] = defaultdict(list)
         self._by_name: dict[str, KernelSpec] = {}
         self._impls: dict[str, Callable] = {}  # name -> callable
+        self._apis: dict[tuple[str, str], KernelApiSpec] = {}
         self._selection_cache: dict[tuple, SelectedKernel] = {}
 
     @classmethod
@@ -284,6 +302,13 @@ class KernelRegistry:
         self._by_operator[key].sort(key=lambda s: s.priority, reverse=True)
         self._invalidate_cache(key)
 
+    def register_api(self, spec: KernelApiSpec) -> None:
+        """Register one public API contract."""
+        key = (spec.family, spec.mode)
+        if key in self._apis:
+            raise ValueError(f"Kernel API {spec.api!r} is already registered")
+        self._apis[key] = spec
+
     def _unregister(self, name: str) -> None:
         if name not in self._by_name:
             return
@@ -298,6 +323,14 @@ class KernelRegistry:
     def get_by_name(self, name: str) -> KernelSpec | None:
         """Get a specific kernel spec by name."""
         return self._by_name.get(name)
+
+    def get_api(self, family: str, mode: str) -> KernelApiSpec | None:
+        """Get a public API contract by family and mode."""
+        return self._apis.get((family, mode))
+
+    def list_apis(self) -> list[KernelApiSpec]:
+        """List public API contracts in stable API-name order."""
+        return sorted(self._apis.values(), key=lambda spec: spec.api)
 
     def get_impl(self, name: str) -> Callable | None:
         """Get a kernel's callable implementation by name."""
@@ -443,6 +476,23 @@ def register_kernel(
         return fn
 
     return decorator
+
+
+def register_kernel_api(
+    family: str,
+    mode: str,
+    public_api: Callable[..., object],
+    warmup_config_type: type[WarmupConfig] | None,
+) -> None:
+    """Register the public contract for an operation family and mode."""
+    KernelRegistry.get().register_api(
+        KernelApiSpec(
+            family=family,
+            mode=mode,
+            public_api=public_api,
+            warmup_config_type=warmup_config_type,
+        )
+    )
 
 
 def describe_kernel(name: str) -> str:

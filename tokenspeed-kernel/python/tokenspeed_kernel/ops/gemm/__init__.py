@@ -36,6 +36,9 @@ import tokenspeed_kernel.ops.gemm.routed_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.gemm.cute_dsl import (
+    nvfp4_gemm_swiglu_nvfp4_quant as _cute_dsl_nvfp4_gemm_swiglu_nvfp4_quant,
+)
 from tokenspeed_kernel.ops.gemm.deep_gemm import (
     _warmup_deep_gemm_fp8_linears,
     ceil_to_ue8m0,
@@ -70,7 +73,7 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, register_kernel_api
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
     SelectedKernel,
@@ -106,6 +109,7 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "nvfp4_gemm_swiglu_nvfp4_quant",
     "prepare_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
@@ -113,6 +117,96 @@ __all__ = [
 
 _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
+
+
+def nvfp4_gemm_swiglu_nvfp4_quant(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_global_scale: torch.Tensor,
+    out: torch.Tensor | None,
+    out_scale: torch.Tensor | None,
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
+    sf_vec_size: int,
+    use_prefetch: bool,
+    prefetch_dist: int,
+    vectorized_f32: bool,
+    enable_pdl: bool,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the registered fused NVFP4 GEMM, SwiGLU, and quantization API."""
+    scale_format = ScaleFormat(
+        storage_dtype=a_scale.dtype,
+        granularity="block",
+        block_shape=(sf_vec_size,),
+    )
+    kernel = select_kernel(
+        "gemm",
+        "nvfp4_swiglu_quant",
+        format_signature(
+            a=tensor_format("nvfp4", a.dtype, scale=scale_format),
+            b=tensor_format(
+                "nvfp4",
+                b.dtype,
+                scale=ScaleFormat(
+                    storage_dtype=b_scale.dtype,
+                    granularity="block",
+                    block_shape=(sf_vec_size,),
+                ),
+            ),
+        ),
+        traits={},
+        solution=solution,
+    )
+    shape_params = {
+        "M": int(a.shape[0]),
+        "N": int(b.shape[0] // 2),
+        "K": int(a.shape[1] * 2),
+    }
+    ShapeCapture.get().record(
+        "gemm",
+        "nvfp4_swiglu_quant",
+        kernel.name,
+        a.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "gemm",
+        "nvfp4_swiglu_quant",
+        a.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            a=a,
+            a_scale=a_scale,
+            b=b,
+            b_scale=b_scale,
+            alpha=alpha,
+            output_global_scale=output_global_scale,
+            out=out,
+            out_scale=out_scale,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
+            sf_vec_size=sf_vec_size,
+            use_prefetch=use_prefetch,
+            prefetch_dist=prefetch_dist,
+            vectorized_f32=vectorized_f32,
+            enable_pdl=enable_pdl,
+        )
+
+
+register_kernel_api(
+    family="gemm",
+    mode="nvfp4_swiglu_quant",
+    public_api=nvfp4_gemm_swiglu_nvfp4_quant,
+    warmup_config_type=None,
+)
 
 
 class _PreparedFp8Linear(torch.nn.Module):

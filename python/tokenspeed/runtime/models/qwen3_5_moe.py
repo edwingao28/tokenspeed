@@ -28,11 +28,9 @@ from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
 )
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
-    nvfp4_gemm_swiglu_nvfp4_quant,
-)
+from tokenspeed_kernel.ops.gemm import nvfp4_gemm_swiglu_nvfp4_quant
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
@@ -213,12 +211,23 @@ class Qwen3_5MoeMLP(nn.Module):
                 self.gate_up_proj.input_scale_inv,
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-                x_fc1_fp4,
-                x_fc1_scale,
-                self.gate_up_proj.weight_swiglu_interleaved,
-                self.gate_up_proj.weight_scale_swiglu_interleaved,
-                self.gate_up_proj.alpha,
-                self.down_proj.input_scale_inv,
+                a=x_fc1_fp4,
+                a_scale=x_fc1_scale,
+                b=self.gate_up_proj.weight_swiglu_interleaved,
+                b_scale=self.gate_up_proj.weight_scale_swiglu_interleaved,
+                alpha=self.gate_up_proj.alpha,
+                output_global_scale=self.down_proj.input_scale_inv,
+                out=None,
+                out_scale=None,
+                ab_dtype="float4_e2m1fn",
+                sf_dtype="float8_e4m3fn",
+                c_dtype="float4_e2m1fn",
+                sf_vec_size=16,
+                use_prefetch=False,
+                prefetch_dist=3,
+                vectorized_f32=True,
+                enable_pdl=pdl_enabled(),
+                solution="cute_dsl",
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x

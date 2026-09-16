@@ -31,7 +31,7 @@ import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, register_kernel_api
 from tokenspeed_kernel.selection import SelectedKernel, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -827,3 +827,11 @@ def moe_apply(
         **a2a_kwargs,
         **shared_kwargs,
     )
+
+
+register_kernel_api(
+    family="moe",
+    mode="apply",
+    public_api=moe_apply,
+    warmup_config_type=None,
+)

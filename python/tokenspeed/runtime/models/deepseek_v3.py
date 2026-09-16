@@ -38,16 +38,13 @@ from tokenspeed_kernel.ops.attention.mla import (
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.embedding import apply_rope_mla, apply_rope_mla_set_kv
-from tokenspeed_kernel.ops.gemm import bmm
+from tokenspeed_kernel.ops.gemm import bmm, nvfp4_gemm_swiglu_nvfp4_quant
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
-    nvfp4_gemm_swiglu_nvfp4_quant,
-)
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -224,12 +221,23 @@ class DeepseekV3MLP(nn.Module):
                 self.gate_up_proj.input_scale_inv,
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-                x_fc1_fp4,
-                x_fc1_scale,
-                self.gate_up_proj.weight_swiglu_interleaved,
-                self.gate_up_proj.weight_scale_swiglu_interleaved,
-                self.gate_up_proj.alpha,
-                self.down_proj.input_scale_inv,
+                a=x_fc1_fp4,
+                a_scale=x_fc1_scale,
+                b=self.gate_up_proj.weight_swiglu_interleaved,
+                b_scale=self.gate_up_proj.weight_scale_swiglu_interleaved,
+                alpha=self.gate_up_proj.alpha,
+                output_global_scale=self.down_proj.input_scale_inv,
+                out=None,
+                out_scale=None,
+                ab_dtype="float4_e2m1fn",
+                sf_dtype="float8_e4m3fn",
+                c_dtype="float4_e2m1fn",
+                sf_vec_size=16,
+                use_prefetch=False,
+                prefetch_dist=3,
+                vectorized_f32=True,
+                enable_pdl=pdl_enabled(),
+                solution="cute_dsl",
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x

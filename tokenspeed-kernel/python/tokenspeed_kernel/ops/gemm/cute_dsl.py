@@ -24,8 +24,15 @@ import functools
 import itertools
 from typing import Optional, Tuple
 
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
 
 platform = current_platform()
 
@@ -35,7 +42,6 @@ if platform.is_nvidia:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
-    import torch
     from flashinfer.autotuner import (
         AutoTuner,
         ConstraintSpec,
@@ -298,6 +304,41 @@ if platform.is_nvidia:
             use_cold_l2_cache=True,
         )
 
+    @register_kernel(
+        "gemm",
+        "nvfp4_swiglu_quant",
+        name="cute_dsl_nvfp4_swiglu_quant",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures={
+            format_signature(
+                a=tensor_format(
+                    "nvfp4",
+                    torch.uint8,
+                    scale=ScaleFormat(
+                        storage_dtype=torch.float8_e4m3fn,
+                        granularity="block",
+                        block_shape=(16,),
+                    ),
+                ),
+                b=tensor_format(
+                    "nvfp4",
+                    torch.uint8,
+                    scale=ScaleFormat(
+                        storage_dtype=torch.float8_e4m3fn,
+                        granularity="block",
+                        block_shape=(16,),
+                    ),
+                ),
+            )
+        },
+        traits={},
+        priority=Priority.SPECIALIZED + 2,
+    )
     def nvfp4_gemm_swiglu_nvfp4_quant(
         a: torch.Tensor,
         a_scale: torch.Tensor,
