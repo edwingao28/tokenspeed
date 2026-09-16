@@ -20,6 +20,7 @@ on:
         type: choice
         options:
           - all
+          - test/ci/ut/debug-kernel-warmup-api.yaml
           - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k-amd.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml

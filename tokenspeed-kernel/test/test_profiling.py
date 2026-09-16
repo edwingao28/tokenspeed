@@ -80,6 +80,7 @@ def _reset_state():
     capture.enabled = False
     capture.clear()
     profiling.ShapeCapture.reset()
+    profiling._DebugTrace.reset()
     profiling._BOOTSTRAPPED = False
     yield
     profiling.stop_profiling()
@@ -88,6 +89,7 @@ def _reset_state():
     capture.enabled = False
     capture.clear()
     profiling.ShapeCapture.reset()
+    profiling._DebugTrace.reset()
     profiling._BOOTSTRAPPED = False
 
 
@@ -264,6 +266,39 @@ def test_kernel_scope_filters_unsupported_proton_metrics(monkeypatch):
             },
         )
     ]
+
+
+def test_debug_trace_records_and_deduplicates_kernel_calls(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKENSPEED_KERNEL_DEBUG_TRACE_DIR", str(tmp_path))
+    profiling._DebugTrace.reset()
+
+    def kernel(x: torch.Tensor, *, enabled: bool) -> None:
+        del x, enabled
+
+    x = torch.empty(2, 3)
+    for _ in range(2):
+        profiling.debug_trace_kernel_call(
+            "unregistered_test_kernel",
+            kernel,
+            (x,),
+            {"enabled": True},
+        )
+
+    paths = list(tmp_path.glob("kernel-trace-*.jsonl"))
+    assert len(paths) == 1
+    records = [json.loads(line) for line in paths[0].read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["kind"] == "kernel_call"
+    assert records[0]["payload"]["arguments"] == {
+        "enabled": True,
+        "x": {
+            "device": "cpu",
+            "dtype": "float32",
+            "layout": "strided",
+            "shape": [2, 3],
+            "stride": [3, 1],
+        },
+    }
 
 
 def test_bootstrap_reads_env_and_only_runs_once(monkeypatch):

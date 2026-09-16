@@ -69,6 +69,24 @@ _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
 _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 
 
+def _trace_flashinfer_configs(configs: dict, source: str) -> None:
+    if not os.environ.get("TOKENSPEED_KERNEL_DEBUG_TRACE_DIR"):
+        return
+    from tokenspeed_kernel.profiling import debug_trace_record
+
+    for key, value in configs.items():
+        file_key = key if isinstance(key, str) else getattr(key, "file_key", str(key))
+        tactic = value[0] if isinstance(value, (list, tuple)) and value else value
+        debug_trace_record(
+            "flashinfer_cache",
+            {
+                "source": source,
+                "persisted_key": file_key,
+                "tactic": tactic,
+            },
+        )
+
+
 def flashinfer_tuning_cache_filename(
     model: str,
     ep_size: int,
@@ -142,8 +160,18 @@ def autotune() -> Generator[None]:
     except ImportError:
         yield
         return
+    tuner = flashinfer.autotuner.AutoTuner.get()
+    before = set(tuner.profiling_cache)
     with flashinfer.autotuner.autotune():
-        yield
+        try:
+            yield
+        finally:
+            new_configs = {
+                key: value
+                for key, value in tuner.profiling_cache.items()
+                if key not in before
+            }
+            _trace_flashinfer_configs(new_configs, "live")
 
 
 def set_autotune_process_group(process_group) -> None:
@@ -218,6 +246,7 @@ def load_flashinfer_tuning_cache(path: str) -> bool:
             "MoE tactic sweeper on this environment to regenerate it."
         )
         return False
+    _trace_flashinfer_configs(AutoTuner.get()._file_configs, "file")
     logger.info(f"flashinfer tuning cache loaded from {path}")
     return True
 

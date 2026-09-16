@@ -70,6 +70,10 @@ class SelectedKernel:
         self.impl = impl
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if os.environ.get("TOKENSPEED_KERNEL_DEBUG_TRACE_DIR"):
+            from tokenspeed_kernel.profiling import debug_trace_kernel_call
+
+            debug_trace_kernel_call(self.name, self.impl, args, kwargs)
         return self.impl(*args, **kwargs)
 
     def __repr__(self) -> str:

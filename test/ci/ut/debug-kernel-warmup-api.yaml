@@ -1,0 +1,23 @@
+api_version: ci.tokenspeed.io/v1
+name: debug-kernel-warmup-api
+type: ut
+workflow_stage: unit-test
+triggers:
+  - debug
+runner:
+  labels:
+    - b200-1gpu
+env:
+  CI: "true"
+  TOKENSPEED_KERNEL_DEBUG_TRACE_DIR: ".ci-artifacts/published/kernel-api-debug"
+  TOKENSPEED_KERNEL_DEBUG_TRACE_MAX_UNIQUE: "4096"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest tokenspeed-kernel/test/test_profiling.py -v
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/ops/test_nvfp4_gemm_swiglu_nvfp4_quant.py::test_nvfp4_gemm_swiglu_autotune_populates_cache -v -s
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/ops/moe/test_mxfp4_situ_flashinfer_trtllm.py::test_flashinfer_situ_kernel_routing_deferred_matches_finalized -v -s
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/ops/moe/test_nvfp4_situ_flashinfer_trtllm.py::test_nvfp4_situ_deferred_triple_matches_finalized -v -s
+report:
+  github_step_summary: true

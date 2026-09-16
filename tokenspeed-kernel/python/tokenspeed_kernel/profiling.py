@@ -21,7 +21,10 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
+import inspect
 import json
+import math
 import os
 import threading
 import time
@@ -42,6 +45,8 @@ __all__ = [
     "ProfilingState",
     "ShapeCapture",
     "bootstrap_profiling_from_env",
+    "debug_trace_kernel_call",
+    "debug_trace_record",
     "kernel_scope",
     "profile_config_from_env",
     "profiling",
@@ -80,6 +85,8 @@ _ENV_CAPTURE_SHAPES = "TOKENSPEED_KERNEL_CAPTURE_SHAPES"
 # Shape capture output JSON path.
 # Default: "shapes.json".
 _ENV_CAPTURE_SHAPES_OUTPUT = "TOKENSPEED_KERNEL_CAPTURE_SHAPES_OUTPUT"
+_ENV_DEBUG_TRACE_DIR = "TOKENSPEED_KERNEL_DEBUG_TRACE_DIR"
+_ENV_DEBUG_TRACE_MAX_UNIQUE = "TOKENSPEED_KERNEL_DEBUG_TRACE_MAX_UNIQUE"
 
 
 @dataclass
@@ -176,6 +183,155 @@ class ShapeCapture:
     def clear(self) -> None:
         with self._lock:
             self._records.clear()
+
+
+class _DebugTrace:
+    _instance: "_DebugTrace | None" = None
+
+    def __init__(self) -> None:
+        output_dir = os.environ.get(_ENV_DEBUG_TRACE_DIR)
+        self.enabled = bool(output_dir)
+        self._lock = threading.Lock()
+        self._fingerprints: set[str] = set()
+        self._max_unique = int(os.environ.get(_ENV_DEBUG_TRACE_MAX_UNIQUE, "16384"))
+        self._path: Path | None = None
+        if output_dir:
+            rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+            self._path = Path(output_dir) / (
+                f"kernel-trace-rank-{rank}-pid-{os.getpid()}.jsonl"
+            )
+
+    @classmethod
+    def get(cls) -> "_DebugTrace":
+        if cls._instance is None:
+            cls._instance = _DebugTrace()
+        return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._instance = None
+
+    def record(self, kind: str, payload: dict[str, object]) -> None:
+        if not self.enabled or self._path is None:
+            return
+        normalized = _debug_trace_value(payload)
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        with self._lock:
+            if fingerprint in self._fingerprints:
+                return
+            if len(self._fingerprints) >= self._max_unique:
+                raise RuntimeError(
+                    "kernel debug trace exceeded "
+                    f"TOKENSPEED_KERNEL_DEBUG_TRACE_MAX_UNIQUE={self._max_unique}"
+                )
+            self._fingerprints.add(fingerprint)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "schema": "tokenspeed-kernel-debug-trace/v1",
+                "kind": kind,
+                "fingerprint": fingerprint,
+                "payload": normalized,
+            }
+            with self._path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _debug_trace_tensor(tensor: Any) -> dict[str, object]:
+    result: dict[str, object] = {
+        "shape": [int(value) for value in tensor.shape],
+        "dtype": str(tensor.dtype).removeprefix("torch."),
+        "device": str(tensor.device),
+        "layout": str(tensor.layout).removeprefix("torch."),
+    }
+    try:
+        result["stride"] = [int(value) for value in tensor.stride()]
+    except RuntimeError:
+        result["stride"] = None
+    return result
+
+
+def _debug_trace_value(value: Any) -> Any:
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None and isinstance(value, torch.Tensor):
+        return _debug_trace_tensor(value)
+    if torch is not None and isinstance(value, torch.nn.Module):
+        tensors = {
+            name: _debug_trace_tensor(tensor)
+            for name, tensor in (
+                *value.named_parameters(recurse=False),
+                *value.named_buffers(recurse=False),
+            )
+        }
+        return {"type": type(value).__qualname__, "tensors": tensors}
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _debug_trace_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if not callable(item)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_debug_trace_value(item) for item in value[:64]]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_debug_trace_value(item) for item in value), key=str)
+    return {"type": type(value).__qualname__}
+
+
+def debug_trace_record(kind: str, payload: dict[str, object]) -> None:
+    """Write one deduplicated debug-only JSONL record when tracing is enabled."""
+    _DebugTrace.get().record(kind, payload)
+
+
+def debug_trace_kernel_call(
+    kernel_name: str,
+    implementation: Any,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> None:
+    """Record a selected kernel call without reading tensor contents."""
+    trace = _DebugTrace.get()
+    if not trace.enabled:
+        return
+    try:
+        bound = inspect.signature(implementation).bind_partial(*args, **kwargs)
+        arguments = dict(bound.arguments)
+    except (TypeError, ValueError):
+        arguments = {f"arg{index}": value for index, value in enumerate(args)}
+        arguments.update(kwargs)
+
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    spec_payload: dict[str, object] = {"name": kernel_name}
+    if spec is not None:
+        spec_payload.update(
+            {
+                "family": spec.family,
+                "mode": spec.mode,
+                "solution": spec.solution,
+                "features": spec.features,
+                "traits": spec.traits,
+                "priority": spec.priority,
+                "tags": spec.tags,
+                "format_signatures": [
+                    str(item) for item in sorted(spec.format_signatures, key=str)
+                ],
+            }
+        )
+    trace.record(
+        "kernel_call",
+        {
+            "kernel": spec_payload,
+            "arguments": arguments,
+        },
+    )
 
 
 class _NoopScope:
