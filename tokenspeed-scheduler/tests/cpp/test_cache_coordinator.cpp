@@ -353,7 +353,8 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
         std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/2, /*group_id=*/0, /*shard_count=*/1),
         std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_shards), /*prefix_granularity=*/128, sharded_pool,
-                                  /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false),
+                                  /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                  /*stream_device_cache_to_host=*/false),
                  std::runtime_error);
 }
 
