@@ -59,6 +59,14 @@ def _config(al, bs, width, device):
     )
 
 
+def test_config_requires_explicit_synthetic_acceptance():
+    with pytest.raises(TypeError, match="synthetic_acceptance_length"):
+        SamplingBackendConfig()
+    for length in (None, 2.6):
+        config = SamplingBackendConfig(synthetic_acceptance_length=length)
+        assert config.synthetic_acceptance_length == length
+
+
 @pytest.mark.parametrize("al", [float("nan"), float("inf"), 0.99, 4.01])
 def test_reject_invalid_final_width(al):
     with pytest.raises(ValueError, match="verify width"):
