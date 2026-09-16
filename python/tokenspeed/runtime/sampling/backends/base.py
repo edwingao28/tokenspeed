@@ -45,7 +45,7 @@ SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 @dataclass
 class SamplingBackendConfig:
 
-    synthetic_acceptance_length: float | None = None
+    synthetic_acceptance_length: float | None
 
     enable_nan_detection: bool = False
 
