@@ -156,9 +156,19 @@ and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
 
 GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
-reading inputs and signal after computation; FlashInfer adapters preserve the
-upstream CuTe body and isolate PDL compilation caches. Graphs retain their
-capture-time PDL setting and must be recaptured to change it.
+reading producer-owned inputs or state, then signal launch readiness before
+computation so successors can overlap setup and independent weight loading.
+A launch signal never publishes outputs: the successor must still wait before
+reading them. FlashInfer adapters preserve the upstream CuTe body and isolate
+PDL compilation caches. Gated RMSNorm may preload weights only with the explicit
+`weights_independent` contract; a required contiguous weight copy disables that
+preload. Collective kernels on the gated-residual chain must not trigger early:
+at an RSAG-to-AR switch, `post_attn_comm` all-gathers the residual immediately
+before the next combine-norm, which preloads that residual before its PDL wait.
+An early collective trigger would therefore allow the combine-norm to read stale
+residual data. Graphs retain their capture-time PDL setting and must be
+recaptured to change it. QSA and gated residual kernels follow the same
+wait-before-read and wait-before-trigger ordering.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
@@ -442,6 +452,15 @@ writes the full KV cache; the dense fallback honors the caller's flag.
 Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
+
+The QSA leaf preserves `decode_query_lengths` through the kernel API:
+a positive uniform width identifies decode (including compact verification
+and narrowed draft queries), while `None` identifies prefill or mixed/ragged
+queries. The kernel registry gates CuTe QSA on the decode trait; NVIDIA
+prefill uses FlashInfer FA2 even when its query has only one row. Both use
+the same cache writer and sparse-attention call. The kernel API retains
+this trait when it adapts ragged queries to independent one-token rows, so
+that adaptation cannot accidentally select the decode specialization.
 
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its
