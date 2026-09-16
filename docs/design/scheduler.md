@@ -264,8 +264,18 @@ computed chunks survive as a prefix for the retry — largest first, freeing the
 most at once; then decode work by most newly releasable LCM blocks and fewest
 tokens — the most capacity for the least lost work. Exempt in both tiers: a
 request whose reserve already covers its whole generation
-(`Request::ReserveCoversGeneration`) — retracting it frees exactly what its
-readmission must take back, pure thrash.
+(`Request::ReserveCoversGeneration`) — normally retracting it only frees what
+its readmission must take back.
+
+**Covered history is not a guarantee of state progress.** Sparse recovery
+prefill and later rolling-state checkpoints can still require fresh parents.
+If no prefill or decode can run and every resident is exempt, retraction may
+select a covered request other than the capacity blocker. The blocker stays
+resident and retries its admission in the same round. This preserves its
+computed chunks instead of repeatedly retracting and restarting its first
+chunk. The usual in-flight forward, transfer and store guards still apply.
+As long as a decode can run or a forward/PD transfer is still in flight, the
+ordinary reserve exemption remains in force.
 
 The P role never retracts: `buildPrefillWorkerPlan` simply does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
@@ -417,7 +427,8 @@ prepays one window (see `schedulePrefillFirstChunk`), so for prompts with
 retraction never touches them. Capped by the generation budget the request
 could ever use, so after a couple of retractions it holds enough room to run
 to completion — at which point `ReserveCoversGeneration` exempts it from the
-victim policy and it **cannot be retracted again**. This is a per-request
+ordinary victim policy. The no-progress state-capacity exception in §2 may
+still reclaim it to unblock another resident. This is a per-request
 adaptive backoff: it penalises only the request whose admission proved
 over-optimistic, and never makes anyone else wait.
 
@@ -463,8 +474,9 @@ no victim and nothing could free that page.
 - At most one readmission is in progress per role, by phase construction; a
   readmission that fails admission waits and never triggers retraction (4).
 - A request whose admission prepaid the generation budget open at that
-  admission is never a victim (2); with the fresh-admission prepay this bounds
-  retraction to requests whose `max_new_tokens` exceeds one safe-step window
+  admission is exempt while another forward can progress (2); with the
+  fresh-admission prepay this bounds ordinary retraction to requests whose
+  `max_new_tokens` exceeds one safe-step window
   (or is undeclared). Spending a partial reserve never makes it qualify: the
   exemption is judged against the budget open at admission, not the current
   remainder (4).

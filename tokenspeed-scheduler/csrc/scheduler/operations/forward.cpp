@@ -601,16 +601,21 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // least lost work. (On the D role the first rule reaches only a local
 // recovery chunk mid-prompt; everything else resident is decoding.)
 //
-// Exempt: a request whose reserve already covers its whole generation --
-// retracting it frees exactly what its readmission must take back, pure
-// thrash. Transient obstacles (a forward still out, a PD transfer pin) do
+// Normally exempt: a request whose reserve covers its whole generation.
+// The caller may relax this when every resident is stalled, protecting the
+// blocker so the released capacity advances it. Transient obstacles do
 // NOT redirect the choice; the caller waits for the chosen victim to
 // quiesce rather than sacrificing a worse-ranked request.
-Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
+Request* Scheduler::chooseVictim(std::span<Request* const> candidates, const Request* protected_request,
+                                 bool allow_reserved) const {
+    const auto eligible = [&](const Request* request) {
+        return request != protected_request &&
+               (allow_reserved || !request->ReserveCoversGeneration(kRetractionSafeSteps));
+    };
     Request* victim = nullptr;
     for (Request* request : candidates) {
         const auto* prefilling = request->GetIf<fsm::Prefilling>();
-        if (prefilling != nullptr && !request->ReserveCoversGeneration(kRetractionSafeSteps) &&
+        if (prefilling != nullptr && eligible(request) &&
             (victim == nullptr || request->TokenSize() > victim->TokenSize())) {
             victim = request;
         }
@@ -621,8 +626,7 @@ Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
 
     std::optional<std::tuple<std::int32_t, std::int32_t, std::string>> victim_rank;
     for (Request* request : candidates) {
-        if ((!request->Is<fsm::Decoding>() && !request->Is<fsm::PrefillDone>()) ||
-            request->ReserveCoversGeneration(kRetractionSafeSteps)) {
+        if ((!request->Is<fsm::Decoding>() && !request->Is<fsm::PrefillDone>()) || !eligible(request)) {
             continue;
         }
         auto rank = std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
@@ -724,9 +728,22 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     }
 
     while (true) {
-        Request* victim = chooseVictim(candidates);
+        Request* victim = chooseVictim(candidates, nullptr, false);
+        if (victim == nullptr && !build.pushed_decode) {
+            if (std::ranges::any_of(candidates, [this](const Request* request) {
+                    return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
+                })) {
+                return;  // pending work can still unblock a reserved resident
+            }
+            // History headroom does not prepay every rolling-state checkpoint
+            // or sparse recovery output. If even the reserved residents cannot
+            // run, waiting for a completion cannot release capacity. Keep the
+            // blocker resident and reclaim from another request so this grant
+            // advances it rather than repeatedly restarting its first chunk.
+            victim = chooseVictim(candidates, blocker, true);
+        }
         if (victim == nullptr) {
-            return;  // everything resident is exempt; only a completion can free capacity
+            return;
         }
         if (victim->ResultsInFlight() > 0 || pdTransferInFlight(*victim)) {
             // The victim is chosen but not quiescent: a forward's KV write or

@@ -259,7 +259,8 @@ private:
     // free page waiting for whoever asks first next round.
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
-    Request* chooseVictim(std::span<Request* const> candidates) const;
+    Request* chooseVictim(std::span<Request* const> candidates, const Request* protected_request,
+                          bool allow_reserved) const;
     void retractVictim(Request& victim, std::vector<WriteBackOperation>& write_back_operations);
 
     // One plan-building grammar per engine role: the roles share the

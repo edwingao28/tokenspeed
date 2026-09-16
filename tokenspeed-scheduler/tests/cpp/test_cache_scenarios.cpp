@@ -604,6 +604,71 @@ TEST_F(MambaOverlapRollingStateSuite, FinalPrefillUsesInputAndOutputAndBanksGrow
     EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 3u);
 }
 
+class ReservedStateProgressSuite : public SchedulerTestSuite, public ::testing::WithParamInterface<bool> {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = GetParam() ? 64 : 4;
+        cfg.device_allocator.total_pages = GetParam() ? 20 : 41;
+        cfg.max_scheduled_tokens = 128;
+        cfg.max_batch_size = 2;
+        cfg.decode_input_tokens = 4;
+        cfg.overlap_schedule_depth = 1;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.cache_groups.push_back(MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                                             CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History));
+        for (int i = 0; i < 3; ++i) {
+            cfg.cache_groups.push_back(MakeGroup("state" + std::to_string(i), GetParam() ? 64 : 1,
+                                                 cfg.device_allocator.total_pages,
+                                                 CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State));
+        }
+        return cfg;
+    }
+};
+
+TEST_P(ReservedStateProgressSuite, CoveredGenerationDoesNotStrandStateGrowth) {
+    RequestSpec first = MakeRequestSpec("first", 1);
+    RequestSpec second = MakeRequestSpec("second", GetParam() ? 4 : 1, 101);
+    const int generation_budget = GetParam() ? 128 : 8;
+    first.max_new_tokens = second.max_new_tokens = generation_budget;
+    Submit({first, second});
+
+    // Both admissions cover the entire generation budget and are ordinarily
+    // retraction-exempt. The longer prompt stalls in its second prefill chunk;
+    // with narrower state pages, two short prompts instead stall in decode.
+    // Neither has room for the next state working set, despite prepaid history.
+    std::array<int, 2> generated{};
+    std::array<bool, 2> finished{};
+    for (int round = 0; round < 256 && !(finished[0] && finished[1]); ++round) {
+        ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr) {
+            continue;
+        }
+        for (std::size_t row = 0; row < batch->request_ids.size(); ++row) {
+            const std::string& id = batch->request_ids[row];
+            const std::size_t index = id == "first" ? 0 : 1;
+            ASSERT_FALSE(finished[index]);
+            const bool prefill = row < batch->NumExtends();
+            const bool produces_token =
+                !prefill || batch->extend_prefix_lens[row] + batch->input_lengths[row] == batch->prefill_lengths[row];
+            const int count = produces_token ? (prefill ? 1 : 4) : 0;
+            SendForwardDone(id, std::vector<std::int32_t>(count, 42));
+            generated[index] += count;
+            if (generated[index] >= generation_budget) {
+                SendFinish(id);
+                finished[index] = true;
+            }
+        }
+    }
+    EXPECT_TRUE(finished[0]);
+    EXPECT_TRUE(finished[1]);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), Config().device_allocator.NumUsableBlocks());
+}
+
+INSTANTIATE_TEST_SUITE_P(PrefillAndDecode, ReservedStateProgressSuite, ::testing::Bool());
+
 class MambaMixedBudgetSuite : public MambaChunkAlignmentSuite {
 protected:
     SchedulerConfig MakeConfig() override {
