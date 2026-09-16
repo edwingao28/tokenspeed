@@ -469,8 +469,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         accept_length += 1
 
         # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
-        # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results.
+        # Ordinary fused top-k + top-p verification can skip the broadcast.
+        # Synthetic verification conservatively keeps rank-0 committed outputs
+        # until target sampling at forced cutoffs is validated without TP sync.
         if (
             self.config.synthetic_acceptance_length is not None
             or not _FUSED_TOPK_TOPP_AVAILABLE

@@ -569,8 +569,9 @@ class FlashInferSamplingBackend(SamplingBackend):
         # knob and produces non-bit-identical results across ranks (sub-ulp
         # FP accumulation order).
         # PDL still uses rank-0 outputs to keep ranks aligned. Without PDL,
-        # fused top-k + top-p is bit-identical across ranks and does not need
-        # a broadcast.
+        # ordinary fused top-k + top-p verification can skip the broadcast.
+        # Synthetic verification conservatively keeps rank-0 committed outputs
+        # until target sampling at forced cutoffs is validated without TP sync.
         elif (
             self.config.synthetic_acceptance_length is not None
             or pdl_enabled()
