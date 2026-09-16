@@ -505,13 +505,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    std::int32_t num_computed_tokens = 0;
-    if (request->Is<fsm::PrefillDone>()) {
-        const PrefillInfo previous = request->CurrentPrefillInfo();
-        num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
-    } else {
-        num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
-    }
+    const std::int32_t num_computed_tokens = request->NumComputedTokens();
 
     const CompletedPrefixPages completed =
         updateCompletedPrefixHashes(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
@@ -647,17 +641,11 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
     const bool recovers_as_readmission = store_snapshot || config_.role == Role::kD;
     if (store_snapshot) {
         fsm::CacheProgress cache_progress = victim.CacheProgress();
-        // Only what has actually been computed may be published as a prefix.
-        // A decoding request has its whole prompt plus generated tokens bar
-        // the one it is about to write; an incomplete prefill has only the
-        // chunks it has been through -- taking TokenSize() there would
-        // publish pages that were never computed.
-        const std::int32_t num_computed_tokens = [&] {
-            if (const auto* prefilling = victim.GetIf<fsm::Prefilling>()) {
-                return prefilling->window.begin + prefilling->window.size;
-            }
-            return victim.TokenSize() - config_.decode_input_tokens;
-        }();
+        // Only what has actually been computed may be published as a prefix:
+        // an incomplete prefill has only the chunks it has been through --
+        // taking TokenSize() there would publish pages that were never
+        // computed.
+        const std::int32_t num_computed_tokens = victim.NumComputedTokens();
         const CompletedPrefixPages completed =
             updateCompletedPrefixHashes(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
         if (completed.boundary_kind) {

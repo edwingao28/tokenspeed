@@ -170,6 +170,12 @@ public:
     std::vector<std::int32_t> TakeSpecCandidates() { return std::exchange(spec_candidate_ids_, {}); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
     PrefillInfo CurrentPrefillInfo() const;
+    // Tokens whose KV and state the ordered forward stream has written, or
+    // is writing, ahead of any later plan: the end of a scheduled prefill
+    // window, or -- once decoding -- every token but the last, which is the
+    // sampled input the next forward computes. Exact for any verify width;
+    // the frontier for prefix publication and retention.
+    std::int32_t NumComputedTokens() const;
 
     std::int32_t UnscheduledPrefillSize() const {
         return std::visit(Overloaded{

@@ -113,8 +113,10 @@ decode preserves the record rather than claiming every crossed token boundary.
 The coordinator checks this exact boundary on admission, finish and retraction;
 an aligned accepted endpoint remains publishable without an internal snapshot.
 `Request::MaterializedStateBoundaryTokens()` resolves that endpoint from
-accepted feedback, not the conservative admission frontier. Capacity and
-retention continue to use their existing conservative token progress.
+accepted feedback, and it is the same `Request::NumComputedTokens()` that
+drives prefix hashing and retention (§5): the frontier is exact under any
+verify width, so the page holding an aligned accepted endpoint is hashed —
+and its checkpoint published — at the very next admission.
 
 One forward means one model dispatch, not one kernel launch. The state backend
 handles checkpoint outputs within it: the example's recurrent scan evaluates
@@ -458,8 +460,15 @@ no victim and nothing could free that page.
   sources are granted away in the same round — and only such an op may be
   fenced ahead of the plan's page reuse by the runtime. A new store site
   chooses its guard explicitly (`StartPendingStores` has no default).
-- Only computed tokens are published as a prefix — `retractVictim` reads the
-  window of an incomplete prefill rather than its whole token count.
+- Only computed tokens are published as a prefix, and exactly those.
+  `Request::NumComputedTokens()` is the one frontier for prefix hashing and
+  retention on admission and retraction: the scheduled window end while
+  prefilling (an incomplete prefill's whole token count would publish pages
+  never computed), and every token but the last while decoding — feedback
+  ends with the sampled token the next forward computes. It does not subtract
+  the verify width: a decode result lands its accepted tokens, not a fixed
+  number, so any margin is an estimate that lags the real endpoint and
+  delays publication and reclaim behind it.
 - At most one readmission is in progress per role, by phase construction; a
   readmission that fails admission waits and never triggers retraction (4).
 - A request whose admission prepaid the generation budget open at that

@@ -210,10 +210,12 @@ progress. Decode does not advance that record: verification commits only the
 accepted endpoint and may skip an aligned boundary. Admission, finish and
 retraction pass this provenance to the coordinator. A snapshot is publishable
 only when the exact accepted endpoint equals the hashed boundary, or that exact
-boundary has prefill materialization provenance. The conservative admission
-frontier (which subtracts the verify width) is not an exact state endpoint.
-Remote endpoint-only landings
-do not claim an internal prefill checkpoint.
+boundary has prefill materialization provenance. The hashed boundary comes
+from `Request::NumComputedTokens()`, which is exact under any verify width
+([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)), so an
+aligned accepted endpoint is hashed by the very next admission rather than
+after a lag of up to the verify width. Remote endpoint-only landings do not
+claim an internal prefill checkpoint.
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at

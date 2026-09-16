@@ -243,6 +243,132 @@ TEST_F(MambaStateCheckpointSuite, BatchesFinalExtentInOneForward) {
     }
 }
 
+TEST(MambaStateCheckpointTest, PublishesAlignedDecodeEndpointUnderWideVerify) {
+    for (const std::int32_t depth : {0, 1}) {
+        for (const bool lands_on_boundary : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "depth=" << depth << " aligned=" << lands_on_boundary);
+            SchedulerConfig cfg{};
+            cfg.prefix_granularity = 128;
+            cfg.max_scheduled_tokens = 256;
+            cfg.max_batch_size = 1;
+            cfg.decode_input_tokens = 4;
+            cfg.overlap_schedule_depth = depth;
+            cfg.disable_l2_cache = true;
+            cfg.disable_prefix_cache = false;
+            cfg.device_allocator.total_pages = 64;
+            cfg.cache_groups = {
+                MakeGroup("full", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
+                MakeGroup("state", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0)};
+            Scheduler scheduler{cfg};
+            std::vector<std::int32_t> tokens(124, 1);
+            scheduler.SubmitRequests({RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 64}});
+            auto feedback = [&](std::vector<std::int32_t> output, bool decode) {
+                tokens.insert(tokens.end(), output.begin(), output.end());
+                ExecutionEvent done;
+                done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
+                if (decode) {
+                    done.With(forward::UpdateReserveNumTokens{
+                        .request_id = "parent",
+                        .reserve_num_tokens_in_next_schedule_event = static_cast<std::int32_t>(output.size())});
+                }
+                scheduler.Advance(std::move(done));
+            };
+            ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+            feedback({2}, false);
+            // Both routes end at 133 tokens, but only one forward stops
+            // exactly at 128 and writes S_128.
+            for (const auto count : {lands_on_boundary ? 4 : 3, lands_on_boundary ? 1 : 2, 4}) {
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback(std::vector<std::int32_t>(count, 3), true);
+            }
+            ExecutionEvent finish;
+            finish.With(forward::Finish{.request_id = "parent"});
+            scheduler.Advance(std::move(finish));
+            scheduler.NextExecutionPlan();
+            tokens.insert(tokens.end(), 11, 4);
+            scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
+            const ExecutionPlan resumed = scheduler.NextExecutionPlan();
+            const ForwardBatch* batch = FindForwardBatch(resumed);
+            ASSERT_NE(batch, nullptr);
+            EXPECT_EQ(batch->extend_prefix_lens.at(0), lands_on_boundary ? 128 : 0);
+        }
+    }
+}
+
+TEST(MambaStateCheckpointTest, PublishesEveryAlignedDecodeEndpoint) {
+    struct Case {
+        std::int32_t width;
+        std::vector<std::int32_t> accepted_counts;
+        std::int32_t shared_tokens;
+        std::int32_t expected_hit;
+    };
+    // P=4. Each accepted endpoint that lands on a boundary wrote that state;
+    // a boundary merely crossed by a wide verify window did not.
+    const std::vector<Case> cases{
+        {4, {1, 4, 1}, 4, 4},        {3, {1, 1, 3, 1}, 4, 4}, {12, {1, 4, 4, 12}, 4, 4}, {12, {1, 4, 4, 12}, 8, 8},
+        {12, {1, 4, 4, 12}, 12, 12}, {12, {2, 3, 12}, 4, 0},  // crossed S_4, but never wrote it
+    };
+    for (const std::int32_t depth : {0, 1}) {
+        for (const bool finish_parent : {false, true}) {
+            for (const Case& test : cases) {
+                SCOPED_TRACE(::testing::Message()
+                             << "depth=" << depth << " finish=" << finish_parent << " width=" << test.width
+                             << " shared=" << test.shared_tokens << " expected=" << test.expected_hit);
+                SchedulerConfig cfg{};
+                cfg.prefix_granularity = 4;
+                cfg.max_scheduled_tokens = 256;
+                cfg.max_batch_size = 2;
+                cfg.decode_input_tokens = test.width;
+                cfg.overlap_schedule_depth = depth;
+                cfg.disable_l2_cache = true;
+                cfg.disable_prefix_cache = false;
+                cfg.device_allocator.total_pages = 128;
+                cfg.cache_groups = {
+                    MakeGroup("full", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
+                    MakeGroup("state", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0)};
+                Scheduler scheduler{cfg};
+                std::vector<std::int32_t> tokens(3, 1);
+                scheduler.SubmitRequests(
+                    {RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 128}});
+                auto feedback = [&](std::int32_t count, bool decode) {
+                    const std::vector<std::int32_t> output(count, 2);
+                    tokens.insert(tokens.end(), output.begin(), output.end());
+                    ExecutionEvent done;
+                    done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
+                    if (decode) {
+                        done.With(forward::UpdateReserveNumTokens{.request_id = "parent",
+                                                                  .reserve_num_tokens_in_next_schedule_event = count});
+                    }
+                    scheduler.Advance(std::move(done));
+                };
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback(1, false);
+                for (const std::int32_t count : test.accepted_counts) {
+                    ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                    feedback(count, true);
+                }
+                if (finish_parent) {
+                    ExecutionEvent finish;
+                    finish.With(forward::Finish{.request_id = "parent"});
+                    scheduler.Advance(std::move(finish));
+                }
+                scheduler.NextExecutionPlan();
+                // Diverge immediately after the boundary under test: reusing
+                // the whole prefix could hide its loss behind a newer hit.
+                tokens.resize(test.shared_tokens);
+                tokens.insert(tokens.end(), 4, 99);
+                scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
+                const ExecutionPlan resumed = scheduler.NextExecutionPlan();
+                const ForwardBatch* batch = FindForwardBatch(resumed);
+                ASSERT_NE(batch, nullptr);
+                const auto it = std::ranges::find(batch->request_ids, "resume");
+                ASSERT_NE(it, batch->request_ids.end());
+                EXPECT_EQ(batch->extend_prefix_lens.at(it - batch->request_ids.begin()), test.expected_hit);
+            }
+        }
+    }
+}
+
 TEST(MambaStateCheckpointCapacityTest, CountsInternalCheckpointEvenWithoutPrefixCaching) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 4;
