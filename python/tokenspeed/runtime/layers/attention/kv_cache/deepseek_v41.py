@@ -95,6 +95,10 @@ class DeepseekV41CachePool(CachePool):
         """
         return self._field(owner, "compressor_tail")
 
+    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
+        """Clear freshly admitted local pages of every group before reuse."""
+        self.arena.zero_blocks(new_page_ids)
+
     @override
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa(layer_id)

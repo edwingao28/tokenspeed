@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
     CacheGroupSpec,
+    apply_pd_transfer_policies,
 )
 
 
@@ -86,10 +87,6 @@ class DeepseekV41Recipe(CacheRecipe):
             )
         if self.decode_input_tokens < 1:
             raise ValueError("DeepSeek V4.1 verify width must be positive")
-        if self.pd_disaggregation_enabled:
-            raise NotImplementedError(
-                "DeepSeek V4.1 PD cache transfer is not validated"
-            )
         if int(self.server_args.pipeline_parallel_size) != 1:
             raise NotImplementedError("DeepSeek V4.1 shared-owner FlatKV requires PP=1")
         hf = self.model_config.hf_config
@@ -161,31 +158,34 @@ class DeepseekV41Recipe(CacheRecipe):
         # Admission can be ahead of the completed forward. Retain its input
         # window as well as the unfinished pair; the allocator also reserves
         # in-flight pages through the shared scheduler_limits demand formula.
-        protection = (1 + self.overlap_schedule_depth) * self.decode_input_tokens
+        # The window is part of the PD peer contract, so size it for the
+        # deepest schedule (depth 1) on every role: a prefill node runs without
+        # overlap, and its pages must land in a decode node's retention.
+        protection = 2 * self.decode_input_tokens
         windows = {
             V41_SWA_GROUP_ID: V41_WINDOW_SIZE + protection,
             V41_GLOBAL_R2_GROUP_ID: None,
             V41_GLOBAL_R1_GROUP_ID: None,
             V41_COMPRESSOR_TAIL_GROUP_ID: 2 + protection,
         }
-        return tuple(
-            (
-                CacheGroupSpec(
-                    group_id=gid,
-                    retention=(
-                        "full_history" if windows[gid] is None else "sliding_window"
-                    ),
-                    rows_per_page=rows,
-                    entry_stride_tokens=stride,
-                    sliding_window_tokens=windows[gid],
-                    family="history",
-                    transfer_policy=None,
-                    checkpoint_granularity=None,
+        specs = [
+            CacheGroupSpec(
+                group_id=gid,
+                retention=(
+                    "full_history" if windows[gid] is None else "sliding_window"
                 ),
-                tuple(fields[gid]),
+                rows_per_page=rows,
+                entry_stride_tokens=stride,
+                sliding_window_tokens=windows[gid],
+                family="history",
+                transfer_policy=None,
+                checkpoint_granularity=None,
             )
             for gid, (rows, stride) in V41_GROUP_GEOMETRY.items()
-        )
+        ]
+        if self.pd_disaggregation_enabled:
+            specs = apply_pd_transfer_policies(specs)
+        return tuple((spec, tuple(fields[spec.group_id])) for spec in specs)
 
     @override
     def packing(self, groups: Sequence[CacheGroupDeclaration]) -> Mapping[str, int]:
