@@ -28,8 +28,6 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <string_view>
-#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -203,15 +201,14 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             // With request TokenSize T, Decode reclaims below
             // floor((T - decode_width - 1) / block_granularity), while its
             // next verify reservation can reach T + decode_width - 1.
-            // Overlap retains one additional reservation. A latest checkpoint
-            // may remain as one older table slot outside this working window.
+            // Overlap retains one additional reservation.
             const std::int64_t decode_window_pages =
                 ceilDiv(2 * decode_width + protected_tokens + block_granularity - 1, block_granularity);
             // A short request cannot occupy more slots than its absolute
             // table extent, including the final verify window's overshoot.
             const std::int64_t decode_dense_pages = ceilDiv(
                 static_cast<std::int64_t>(token_limit) + decode_width + protected_tokens - 1, block_granularity);
-            child_pages = std::max(child_pages, std::min(decode_dense_pages, decode_window_pages + 1));
+            child_pages = std::max(child_pages, std::min(decode_dense_pages, decode_window_pages));
         }
         group_pages[static_cast<std::size_t>(i)] = child_pages;
     }
@@ -486,24 +483,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
-    // NaN feedback acknowledges its forward before Abort in the same packet.
-    // Do not publish that forward's state, but preserve its result accounting.
-    std::unordered_set<std::string_view> aborted_requests;
     for (const auto& item : event.Events()) {
-        if (const auto* aborted = std::get_if<forward::Abort>(&item)) {
-            aborted_requests.insert(aborted->request_id);
-        }
-    }
-    for (const auto& item : event.Events()) {
-        std::visit(
-            [this, &aborted_requests](const auto& inner) {
-                if constexpr (std::is_same_v<std::decay_t<decltype(inner)>, forward::ExtendResult>) {
-                    handleEvent(inner, !aborted_requests.contains(inner.request_id));
-                } else {
-                    handleEvent(inner);
-                }
-            },
-            item);
+        std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }
 }
 

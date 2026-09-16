@@ -122,9 +122,8 @@ struct GroupDemand {
     // endpoints to Host. Ordinary state chunks never stream. Decode leaves
     // this false; finish/retract explicitly persist retained endpoints.
     bool stream_completed_to_host{false};
-    // Exact snapshot provenance (internal prefill boundary or accepted aligned
-    // endpoint). Allocation and conservative token progress are not proof.
-    // Zero means no known materialized boundary.
+    // Exact prefill checkpoint provenance. Allocation and conservative token
+    // progress are not proof. Zero disables state publication for this demand.
     std::int32_t materialized_state_boundary_tokens{0};
 };
 

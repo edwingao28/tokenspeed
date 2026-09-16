@@ -48,10 +48,8 @@ struct CacheProgress {
     std::int32_t promotion_boundary_tokens{0};
     // Last aligned state boundary produced by scheduled local prefill. The
     // ordered forward stream materializes it before subsequent publication.
-    // Decode must not advance this: verify commits only its accepted endpoint.
+    // Decode does not publish state checkpoints.
     std::int32_t materialized_state_boundary_tokens{0};
-    // Latest protected Decode checkpoint boundary; zero when absent.
-    std::int32_t latest_decode_state_boundary_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,

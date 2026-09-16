@@ -57,19 +57,6 @@ struct CacheCoordinatorTestAccess {
                                     CacheBoundaryKind boundary_kind) {
         return coordinator.RetainStateSnapshot(snapshot, boundary_kind);
     }
-
-    static std::optional<StateSnapshot> PublishStateSnapshot(CacheCoordinator& coordinator,
-                                                             std::span<BlockTable> tables,
-                                                             std::span<const std::string> prefix_hashes,
-                                                             std::int32_t boundary_tokens, std::uint64_t access_epoch,
-                                                             CacheBoundaryKind boundary_kind) {
-        return coordinator.PublishStateSnapshot(tables, prefix_hashes, boundary_tokens, access_epoch, boundary_kind);
-    }
-
-    static bool ProtectStateSnapshot(CacheCoordinator& coordinator, std::span<BlockTable> tables,
-                                     const StateSnapshot& snapshot) {
-        return coordinator.ProtectStateSnapshot(tables, snapshot);
-    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
@@ -104,6 +91,18 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
         });
     }
     coordinator.CacheCompletedBlocks(demands, access_epoch);
+}
+
+inline std::optional<StateSnapshot> CacheStateBoundaryForTest(CacheCoordinator& coordinator,
+                                                              std::span<BlockTable> tables,
+                                                              std::span<const std::string> prefix_hashes,
+                                                              std::int32_t boundary_tokens, std::uint64_t access_epoch,
+                                                              CacheBoundaryKind boundary_kind) {
+    const std::int32_t prefix_pages = boundary_tokens / coordinator.PrefixGranularity();
+    const auto completed_hashes = prefix_hashes.first(static_cast<std::size_t>(prefix_pages));
+    CacheCompletedBlocksForTest(coordinator, tables, completed_hashes, access_epoch, prefix_pages - 1, boundary_tokens,
+                                boundary_kind, false, boundary_tokens);
+    return CacheCoordinatorTestAccess::CaptureStateSnapshot(coordinator, prefix_hashes, boundary_tokens);
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
