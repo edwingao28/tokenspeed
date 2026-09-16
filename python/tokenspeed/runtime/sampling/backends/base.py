@@ -135,9 +135,9 @@ class SamplingBackend(ABC):
                 )
             tp_size = len(config.tp_group) if config.tp_group is not None else 1
             max_bs = (config.max_bs + tp_size - 1) // tp_size * tp_size
-            self._synthetic_generator = torch.Generator(device="cpu").manual_seed(
-                config.random_seed
-            )
+            self._synthetic_generator = torch.Generator(
+                device=config.device
+            ).manual_seed(config.random_seed)
             self._synthetic_lengths = torch.full(
                 (max_bs,), math.floor(al), dtype=torch.int32, device=config.device
             )
@@ -295,9 +295,11 @@ class SamplingBackend(ABC):
             self._synthetic_lengths.fill_(int(al))
             return
         # Refill outside capture, like the rejection sampler's coin buffers.
-        # A private CPU generator keeps TP ranks independent of device RNG use.
+        # A private device generator avoids host copies and global RNG state.
         coins = torch.rand(
-            self._synthetic_lengths.shape, generator=self._synthetic_generator
+            self._synthetic_lengths.shape,
+            generator=self._synthetic_generator,
+            device=self._synthetic_lengths.device,
         )
         self._synthetic_lengths.copy_((coins < al % 1).to(torch.int32) + math.floor(al))
 

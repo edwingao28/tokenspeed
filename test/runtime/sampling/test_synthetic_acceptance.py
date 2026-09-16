@@ -65,13 +65,32 @@ def test_reject_invalid_final_width(al):
         _BufferBackend(_config(al, 4, 4, "cpu"))
 
 
-def test_fractional_lengths_and_rng_isolation():
-    backend = _BufferBackend(_config(3.77, 20000, 5, "cpu"))
-    repeat = _BufferBackend(_config(3.77, 20000, 5, "cpu"))
-    backend.prepare_step([], [], [], 5)
-    torch.manual_seed(991)
-    torch.rand(100)
-    repeat.prepare_step([], [], [], 5)
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+def test_fractional_lengths_and_rng_isolation(device):
+    backend = _BufferBackend(_config(3.77, 20000, 5, device))
+    repeat = _BufferBackend(_config(3.77, 20000, 5, device))
+    sync_mode = torch.cuda.get_sync_debug_mode() if device == "cuda" else None
+    try:
+        if sync_mode is not None:
+            torch.cuda.set_sync_debug_mode("error")
+        backend.prepare_step([], [], [], 5)
+        torch.manual_seed(991)
+        torch.rand(100, device=device)
+        repeat.prepare_step([], [], [], 5)
+    finally:
+        if sync_mode is not None:
+            torch.cuda.set_sync_debug_mode(sync_mode)
     torch.testing.assert_close(backend._synthetic_lengths, repeat._synthetic_lengths)
     assert set(backend._synthetic_lengths.tolist()) == {3, 4}
     assert abs(backend._synthetic_lengths.float().mean().item() - 3.77) < 0.015

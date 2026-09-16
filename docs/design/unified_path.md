@@ -397,6 +397,11 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
+Synthetic acceptance length is a static configuration of the same verify
+route. Its persistent device buffer is refreshed in `prepare_step` or
+`prepare_capture`, outside graph capture, using a private device generator.
+Preparation must remain asynchronous so it does not stall forward launches.
+
 ### Non-speculative serving is the N == 1 case, not a second path
 
 One sampling rule for every batch: **prefill requests sample, decode
