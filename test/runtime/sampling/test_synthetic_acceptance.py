@@ -142,21 +142,29 @@ def test_bootstrap_limit_is_refreshed_for_next_step(al):
 )
 @pytest.mark.parametrize("al", [None, 1.0, 2.6, 4.0])
 def test_backend_verify_and_cuda_graph_replay(name, al):
-    import importlib
-
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends.flashinfer import (
+        FlashInferSamplingBackend,
+    )
+    from tokenspeed.runtime.sampling.backends.flashinfer_full import (
+        FlashInferFullSamplingBackend,
+    )
+    from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
+    from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
+    from tokenspeed.runtime.sampling.backends.triton_full import (
+        TritonFullSamplingBackend,
+    )
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
     classes = {
-        "greedy": "GreedySamplingBackend",
-        "triton": "TritonSamplingBackend",
-        "triton_full": "TritonFullSamplingBackend",
-        "flashinfer": "FlashInferSamplingBackend",
-        "flashinfer_full": "FlashInferFullSamplingBackend",
+        "greedy": GreedySamplingBackend,
+        "triton": TritonSamplingBackend,
+        "triton_full": TritonFullSamplingBackend,
+        "flashinfer": FlashInferSamplingBackend,
+        "flashinfer_full": FlashInferFullSamplingBackend,
     }
-    module = importlib.import_module("tokenspeed.runtime.sampling.backends." + name)
-    backend = getattr(module, classes[name])(_config(al, 5, 4, "cuda"))
+    backend = classes[name](_config(al, 5, 4, "cuda"))
     params = []
     rids = [f"synthetic-{i}" for i in range(5)]
     for rid in rids:
