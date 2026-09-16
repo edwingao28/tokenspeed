@@ -107,8 +107,8 @@ class SamplingBackend(ABC):
     Both methods return (output_tokens, accept_lengths). For sample(),
     accept_lengths is all-ones so the downstream contract matches verify().
 
-    Backends that need random state override prepare() to refill per-request
-    buffers outside of any CUDA graph capture.
+    prepare_step() and prepare_capture() refill RNG-backed buffers outside
+    CUDA graph capture so replay reads fresh state from persistent storage.
 
     Requests asking for params a backend doesn't implement are NOT rejected;
     the backend silently applies only what it supports, so all requests go
@@ -117,9 +117,8 @@ class SamplingBackend(ABC):
 
     # Subclasses that hold per-pool-idx state (scalars like temperature /
     # top_k, plus large rows like _counts / _logit_bias) flip this to True
-    # so prepare_step() performs flip detection + _reset_slot. Stateless
-    # backends (greedy) leave it False and the whole prepare_step call is
-    # a no-op.
+    # so prepare_step() performs flip detection + _reset_slot. False skips
+    # pool-state work only; shared synthetic lengths still need refreshing.
     _HAS_POOL_STATE: bool = False
     _SUPPORTS_DP_VERIFY: bool = False
 
@@ -233,7 +232,10 @@ class SamplingBackend(ABC):
         sampling_params_list: list[SamplingParams],
         num_tokens_per_req: int = 1,
     ) -> None:
-        """Called once per step, outside the CUDA graph. Two jobs:
+        """Called once per step, outside the CUDA graph.
+
+        Synthetic lengths refresh even for backends without pool state so
+        graph replay sees fresh lengths. Pool-state backends also perform:
 
         1. Flip detection: a slot's owning rid changed since last step
            (first-use and rid-recycling look the same). Delegates to
@@ -242,7 +244,7 @@ class SamplingBackend(ABC):
         2. Per-step dynamic refill: coin buffers, etc. Delegated to the
            subclass via _prepare_step_hook.
 
-        Stateless backends (greedy) short-circuit both phases.
+        Stateless backends (greedy) skip these two pool-state phases.
         """
 
         self._prepare_synthetic_acceptance()
@@ -275,10 +277,10 @@ class SamplingBackend(ABC):
         )
 
     def prepare_capture(self, bs: int, num_tokens_per_req: int = 1) -> None:
-        """Per-step refill for the capture/warm-up path. No flip detection;
-        the backend uses its stub generator for any RNG-fed buffers so the
-        captured graph sees a fully-written state.
-        Default: no-op.
+        """Refill buffers before capture/warm-up without slot ownership changes.
+
+        Synthetic lengths and backend RNG buffers must be written before
+        capture so captured operations read initialized persistent storage.
         """
         self._prepare_synthetic_acceptance()
         self._prepare_step_hook(
