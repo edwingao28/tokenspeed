@@ -48,7 +48,7 @@ struct CacheProgress {
     std::int32_t promotion_boundary_tokens{0};
     // Last aligned state boundary produced by scheduled local prefill. The
     // ordered forward stream materializes it before subsequent publication.
-    // Decode does not publish state checkpoints.
+    // Decode must not advance this: verify commits only its accepted endpoint.
     std::int32_t materialized_state_boundary_tokens{0};
 };
 

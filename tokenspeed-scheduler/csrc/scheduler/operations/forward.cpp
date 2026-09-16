@@ -88,18 +88,18 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
 }
 
 void classifyCompletedStateBoundaries(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
-                                      std::int32_t prefill_size, std::int32_t prefix_granularity) {
+                                      std::int32_t endpoint_tokens, std::int32_t prefix_granularity) {
     _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
-    const std::int32_t final_prompt_boundary = prefill_size / prefix_granularity * prefix_granularity;
+    const std::int32_t endpoint_boundary = endpoint_tokens / prefix_granularity * prefix_granularity;
     for (std::size_t i = 0; i < demands.size(); ++i) {
         GroupDemand& demand = demands[i];
         if (!cache_groups[i].IsSnapshotStateGroup() || demand.completed_boundary_kind != CacheBoundaryKind::kChunk) {
             continue;
         }
         const std::int32_t boundary = demand.materialized_state_boundary_tokens;
-        if (final_prompt_boundary > 0 && boundary == final_prompt_boundary) {
-            // The following sub-granularity tail adds no hash. Retain this
-            // checkpoint now, while leaving the history groups' kind alone.
+        if (endpoint_boundary > 0 && boundary == endpoint_boundary) {
+            // Prefill ends here, at its prompt endpoint or a retraction.
+            // Publish the last reusable checkpoint before any short tail.
             demand.completed_boundary_kind = CacheBoundaryKind::kEndpoint;
         }
     }
@@ -675,8 +675,9 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         // chunks it has been through -- taking TokenSize() there would
         // publish pages that were never computed.
         const std::int32_t num_computed_tokens = [&] {
-            if (const auto* prefilling = victim.GetIf<fsm::Prefilling>()) {
-                return prefilling->window.begin + prefilling->window.size;
+            if (victim.Is<fsm::Prefilling>() || victim.Is<fsm::PrefillDone>()) {
+                const PrefillInfo previous = victim.CurrentPrefillInfo();
+                return previous.already_scheduled_len + previous.extend_len;
             }
             return victim.TokenSize() - config_.decode_input_tokens;
         }();
@@ -693,7 +694,7 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
                                      .stream_completed_to_host = false,
                                      .materialized_state_boundary_tokens = victim.MaterializedStateBoundaryTokens(),
                                  });
-            classifyCompletedStateBoundaries(demands, config_.cache_groups, victim.PrefillSize(),
+            classifyCompletedStateBoundaries(demands, config_.cache_groups, num_computed_tokens,
                                              coordinator_.PrefixGranularity());
             coordinator_.CacheCompletedBlocks(demands, cache_progress.access_epoch);
         }
@@ -702,9 +703,7 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         const auto prefill_hashes = std::span<const std::string>{cache_progress.prefix_hashes}.first(
             std::min(cache_progress.prefix_hashes.size(),
                      static_cast<std::size_t>(victim.PrefillSize() / coordinator_.PrefixGranularity())));
-        if (auto snapshot = coordinator_.RetainLatestStateSnapshot(prefill_hashes, CacheBoundaryKind::kEndpoint)) {
-            coordinator_.QueueStateSnapshotForStore(*snapshot);
-        }
+        coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
         // The victim's pages are granted away in this very round, so the
         // ticket cannot pin them: the runtime orders the copy on the forward
         // thread's stream ahead of the plan's page reuse instead.

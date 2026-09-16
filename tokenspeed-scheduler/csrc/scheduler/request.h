@@ -193,7 +193,6 @@ public:
     // tables the same admission fills: resources and progress land at
     // admission time, and a state transition only moves them on.
     fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
-    // Reusable prefill state boundary; zero during decode.
     std::int32_t MaterializedStateBoundaryTokens() const;
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {

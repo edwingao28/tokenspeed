@@ -21,7 +21,6 @@
 #include "cache/coordinator/cache_coordinator.h"
 
 #include <algorithm>
-#include <array>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -503,110 +502,29 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
     }
 }
 
-std::optional<StateSnapshot> CacheCoordinator::CaptureStateSnapshot(std::span<const std::string> prefix_hashes,
-                                                                    std::int32_t boundary_tokens) const {
-    if (boundary_tokens <= 0 || boundary_tokens % prefix_granularity_ != 0 ||
-        static_cast<std::size_t>(boundary_tokens / prefix_granularity_) > prefix_hashes.size()) {
-        return std::nullopt;
+void CacheCoordinator::QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes) {
+    if (host_pool_ == nullptr) {
+        return;
     }
-    StateSnapshot snapshot{.boundary_tokens = boundary_tokens};
-    const std::string& hash = prefix_hashes[static_cast<std::size_t>(boundary_tokens / prefix_granularity_ - 1)];
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const CacheGroup& group = groups_[i];
+    for (const CacheGroup& group : groups_) {
         if (group.Spec().kind != AttnKind::kMambaState) {
             continue;
         }
-        const std::int32_t blocks_per_prefix = prefix_granularity_ / geometry_[i].BlockGranularity();
-        const CacheKey key{.group_id = group.Id(), .content_hash = hash, .page_offset = blocks_per_prefix - 1};
-        const auto metadata = group.Index().MetadataFor(pool_, key);
-        if (!metadata || metadata->logical_block_index != boundary_tokens / geometry_[i].BlockGranularity() - 1) {
-            return std::nullopt;
-        }
-        snapshot.blocks.push_back(CachedStateBlock{.key = key, .generation = metadata->generation});
-    }
-    return snapshot.blocks.empty() ? std::nullopt : std::optional{std::move(snapshot)};
-}
-
-std::optional<StateSnapshot> CacheCoordinator::RetainLatestStateSnapshot(std::span<const std::string> prefix_hashes,
-                                                                         CacheBoundaryKind boundary_kind) {
-    _assert(prefix_hashes.size() <=
-                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / prefix_granularity_),
-            "prefix length exceeds int32 token range");
-    if (!HasMambaStateGroup()) {
-        return std::nullopt;
-    }
-    for (std::size_t count = prefix_hashes.size(); count > 0; --count) {
-        if (auto snapshot =
-                CaptureStateSnapshot(prefix_hashes, static_cast<std::int32_t>(count) * prefix_granularity_)) {
-            if (!RetainStateSnapshot(*snapshot, boundary_kind)) {
-                return std::nullopt;
+        std::vector<CacheKey> keys = keysForGroup(prefix_hashes, group.Id());
+        for (auto key = keys.rbegin(); key != keys.rend(); ++key) {
+            if (group.Index().Contains(pool_, *key)) {
+                pending_stores_.push_back(StoreCandidate{.key = std::move(*key)});
+                break;
             }
-            return snapshot;
         }
-    }
-    return std::nullopt;
-}
-
-bool CacheCoordinator::StateSnapshotIsCurrent(const StateSnapshot& snapshot) const {
-    if (snapshot.boundary_tokens <= 0 || snapshot.boundary_tokens % prefix_granularity_ != 0 ||
-        snapshot.blocks.empty()) {
-        return false;
-    }
-    std::size_t state_index = 0;
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const CacheGroup& group = groups_[i];
-        if (group.Spec().kind != AttnKind::kMambaState) {
-            continue;
-        }
-        if (state_index == snapshot.blocks.size()) {
-            return false;
-        }
-        const CachedStateBlock& block = snapshot.blocks[state_index++];
-        if (block.key.group_id != group.Id() ||
-            block.key.page_offset != prefix_granularity_ / geometry_[i].BlockGranularity() - 1 ||
-            block.key.namespace_id != snapshot.blocks.front().key.namespace_id ||
-            block.key.content_hash != snapshot.blocks.front().key.content_hash) {
-            return false;
-        }
-        const auto metadata = group.Index().MetadataFor(pool_, block.key);
-        if (!metadata || metadata->generation != block.generation ||
-            metadata->logical_block_index != snapshot.boundary_tokens / geometry_[i].BlockGranularity() - 1) {
-            return false;
-        }
-    }
-    return state_index == snapshot.blocks.size();
-}
-
-bool CacheCoordinator::RetainStateSnapshot(const StateSnapshot& snapshot, CacheBoundaryKind boundary_kind) {
-    if ((boundary_kind != CacheBoundaryKind::kEndpoint && boundary_kind != CacheBoundaryKind::kPromoted) ||
-        !StateSnapshotIsCurrent(snapshot)) {
-        return false;
-    }
-    for (const CachedStateBlock& block : snapshot.blocks) {
-        _assert(groups_[block.key.group_id].Index().Retain(pool_, block, boundary_kind),
-                "validated state snapshot changed during retention");
-    }
-    return true;
-}
-
-void CacheCoordinator::QueueStateSnapshotForStore(const StateSnapshot& snapshot) {
-    if (host_pool_ == nullptr || !StateSnapshotIsCurrent(snapshot)) {
-        return;
-    }
-    if (std::ranges::any_of(snapshot.blocks,
-                            [this](const CachedStateBlock& block) { return !CanStoreDeviceCachedBlock(block.key); })) {
-        return;
-    }
-    for (const CachedStateBlock& block : snapshot.blocks) {
-        pending_stores_.push_back(StoreCandidate{.key = block.key});
     }
 }
 
 void CacheCoordinator::CacheCompletedBlocks(std::span<const GroupDemand> demands, std::uint64_t access_epoch) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (const GroupDemand& demand : demands) {
-        _assert(demand.table != nullptr && demand.completed_boundary_kind.has_value(),
-                "publication requires a table and boundary kind");
+        _assert(demand.table != nullptr, "completed publication requires a block table");
+        _assert(demand.completed_boundary_kind.has_value(), "completed publication requires a boundary kind");
         _assert(demand.new_prefix_hash_begin >= 0 &&
                     static_cast<std::size_t>(demand.new_prefix_hash_begin) < demand.prefix_hashes.size(),
                 "completed page range must be non-empty");
@@ -642,7 +560,7 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
         }
-        if (!automatically_streams_to_host || !CanStoreDeviceCachedBlock(key)) {
+        if (!automatically_streams_to_host) {
             continue;
         }
         pending_stores_.push_back(StoreCandidate{
@@ -656,16 +574,6 @@ CacheBlockRef CacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) co
         return {};
     }
     return groups_[key.group_id].Index().Find(pool_, key);
-}
-
-bool CacheCoordinator::CanStoreDeviceCachedBlock(const CacheKey& key) const {
-    if (key.group_id >= groups_.size()) {
-        return false;
-    }
-    const CacheGroup& group = groups_[key.group_id];
-    const auto metadata = group.Index().MetadataFor(pool_, key);
-    return metadata &&
-           (group.Spec().kind != AttnKind::kMambaState || metadata->boundary_kind != CacheBoundaryKind::kChunk);
 }
 
 CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::span<const std::uint32_t> group_ids) {
@@ -826,56 +734,6 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     return true;
 }
 
-std::vector<CacheCoordinator::CompletedStatePublication> CacheCoordinator::completedStatePublicationsForGroup(
-    std::size_t group_index, const GroupDemand& demand) const {
-    const CacheGroup& group = groups_[group_index];
-    if (group.Spec().kind != AttnKind::kMambaState || !demand.completed_boundary_kind ||
-        demand.num_computed_tokens < 0) {
-        return {};
-    }
-    _assert(demand.table != nullptr, "state publication requires a table");
-    _assert(demand.prefix_hashes.size() <=
-                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / prefix_granularity_),
-            "prefix length exceeds int32 token range");
-    const std::int32_t boundary_tokens = static_cast<std::int32_t>(demand.prefix_hashes.size()) * prefix_granularity_;
-    // Allocation or a new hash does not prove the kernel wrote state here.
-    if (boundary_tokens == 0 || demand.materialized_state_boundary_tokens != boundary_tokens) {
-        return {};
-    }
-    const std::int32_t pages_per_prefix = prefix_granularity_ / geometry_[group_index].BlockGranularity();
-    const std::int32_t boundary_block = boundary_tokens / geometry_[group_index].BlockGranularity();
-    const std::int32_t lookback = std::min(group.Matcher().BoundaryLookbackPages(), boundary_block);
-    _assert(boundary_block <= demand.table->NumBlocks(), "state publication exceeds the request table");
-    std::vector<CompletedStatePublication> publications;
-    for (std::int32_t slot = boundary_block - lookback; slot < boundary_block; ++slot) {
-        const CacheBlockRef& block = demand.table->Blocks()[static_cast<std::size_t>(slot)];
-        if (!block) {
-            continue;
-        }
-        publications.push_back(CompletedStatePublication{
-            .key = CacheKey{.group_id = group.Id(),
-                            .content_hash = demand.prefix_hashes[static_cast<std::size_t>(slot / pages_per_prefix)],
-                            .page_offset = slot % pages_per_prefix},
-            .location = block->Location(),
-            .logical_block_index = slot,
-            .boundary_kind = *demand.completed_boundary_kind,
-        });
-    }
-    return publications;
-}
-
-std::vector<CacheCoordinator::CompletedStatePublication> CacheCoordinator::CompletedStatePublications(
-    std::span<const GroupDemand> demands) const {
-    _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
-    std::vector<CompletedStatePublication> publications;
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        auto group_publications = completedStatePublicationsForGroup(i, demands[i]);
-        publications.insert(publications.end(), std::make_move_iterator(group_publications.begin()),
-                            std::make_move_iterator(group_publications.end()));
-    }
-    return publications;
-}
-
 template <CacheTier Tier>
 void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
                                                     std::uint64_t access_epoch) {
@@ -889,17 +747,18 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
                                       *demand.completed_boundary_kind, demand.stream_completed_to_host);
         return;
     }
-    if (groups_[group_index].Spec().kind == AttnKind::kMambaState) {
-        for (const CompletedStatePublication& publication : completedStatePublicationsForGroup(group_index, demand)) {
-            const std::array keys{publication.key};
-            cacheFullBlocksForGroup<Tier>(group_index, *demand.table, keys, publication.logical_block_index,
-                                          access_epoch, publication.boundary_kind, demand.stream_completed_to_host);
-        }
-        return;
-    }
     if (demand.num_computed_tokens < 0) {
         return;
     }
+    // Ordinary state chunks remain request-owned. Retained boundaries must
+    // have a materialized checkpoint; allocated slots and hashes are not proof.
+    const std::int32_t boundary_tokens = static_cast<std::int32_t>(demand.prefix_hashes.size()) * prefix_granularity_;
+    if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
+        (demand.completed_boundary_kind == CacheBoundaryKind::kChunk ||
+         demand.materialized_state_boundary_tokens != boundary_tokens)) {
+        return;
+    }
+
     const std::int32_t boundary_cache_block =
         static_cast<std::int32_t>(demand.prefix_hashes.size()) * pages_per_prefix_hash;
     const std::int32_t lookback =
@@ -922,68 +781,10 @@ void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_inde
 
 void CacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    std::vector<CachedStateBlock> candidates;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        reclaimExpiredForGroup(i, tables[i], num_computed_tokens, candidates);
+        groups_[i].Allocator().ReclaimExpired(pool_, tables[i],
+                                              groupExpiredBlocksAt(static_cast<std::int32_t>(i), num_computed_tokens));
     }
-    cleanupStateChunks(candidates);
-}
-
-void CacheCoordinator::collectStateBlocks(std::size_t group_index, std::span<const CacheBlockRef> blocks,
-                                          std::vector<CachedStateBlock>& candidates) const {
-    const CacheGroup& group = groups_[group_index];
-    if (group.Spec().kind != AttnKind::kMambaState) {
-        return;
-    }
-    for (const CacheBlockRef& block_ref : blocks) {
-        if (!block_ref) {
-            continue;
-        }
-        if (const auto identity = group.Index().IdentityFor(pool_, block_ref->Location())) {
-            candidates.push_back(*identity);
-        }
-    }
-}
-
-void CacheCoordinator::reclaimExpiredForGroup(std::size_t group_index, BlockTable& table,
-                                              std::int32_t num_computed_tokens,
-                                              std::vector<CachedStateBlock>& candidates) {
-    const std::int32_t expired =
-        std::min(groupExpiredBlocksAt(static_cast<std::int32_t>(group_index), num_computed_tokens), table.NumBlocks());
-    const std::int32_t begin = std::min(table.ReclaimedPrefixBlocks(), expired);
-    collectStateBlocks(
-        group_index, table.Blocks().subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(expired - begin)),
-        candidates);
-    groups_[group_index].Allocator().ReclaimExpired(pool_, table, expired);
-}
-
-void CacheCoordinator::cleanupStateChunks(std::span<const CachedStateBlock> candidates) {
-    for (const CachedStateBlock& block : candidates) {
-        if (block.key.group_id >= groups_.size() || groups_[block.key.group_id].Spec().kind != AttnKind::kMambaState) {
-            continue;
-        }
-        PrefixCacheIndex& index = groups_[block.key.group_id].Index();
-        const auto removed = index.Evict(pool_, block, CacheBoundaryKind::kChunk);
-        if (removed && cache_mutation_sink_) {
-            cache_mutation_sink_(*removed, CacheMutation::kRemoved);
-        }
-    }
-}
-
-void CacheCoordinator::ReleaseDeviceBlockRefs(std::span<CacheBlockRef* const> block_refs) {
-    std::vector<CachedStateBlock> candidates;
-    for (CacheBlockRef* block_ref : block_refs) {
-        _assert(block_ref != nullptr, "Device release requires a reference");
-        if (!*block_ref) {
-            continue;
-        }
-        _assert(block_ref->IsOwnedBy(pool_), "Device release requires a Device block");
-        const auto group_id = pool_.BoundGroup((*block_ref)->Location().lcm_block_id);
-        _assert(group_id.has_value(), "Device block has no bound cache group");
-        collectStateBlocks(*group_id, std::span<const CacheBlockRef>{block_ref, 1}, candidates);
-        block_ref->reset();
-    }
-    cleanupStateChunks(candidates);
 }
 
 void CacheCoordinator::ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens) {
@@ -995,12 +796,9 @@ void CacheCoordinator::ConsumeReservedTokens(std::span<BlockTable> tables, std::
 
 void CacheCoordinator::Free(std::span<BlockTable> tables) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    std::vector<CachedStateBlock> candidates;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        collectStateBlocks(i, tables[i].Blocks(), candidates);
         groups_[i].Allocator().Free(tables[i]);
     }
-    cleanupStateChunks(candidates);
 }
 
 bool CacheCoordinator::ContainsHostCachedBlock(const CacheKey& key) const {

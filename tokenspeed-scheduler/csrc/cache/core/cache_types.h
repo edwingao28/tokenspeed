@@ -69,20 +69,6 @@ struct CacheKeyHash {
     }
 };
 
-// Non-owning identity: reusing a key or physical slot after eviction must not
-// make an old request's snapshot refer to the replacement entry.
-struct CachedStateBlock {
-    CacheKey key;
-    std::uint64_t generation{0};
-};
-
-// One complete aligned checkpoint across every snapshot-state group. Keeping
-// this handle does not pin Device memory or prevent capacity eviction.
-struct StateSnapshot {
-    std::int32_t boundary_tokens{0};
-    std::vector<CachedStateBlock> blocks;
-};
-
 struct CacheGroupSpec {
     AttnKind kind{AttnKind::kFull};
     // Only kSlidingWindow uses this value. Mamba's one-checkpoint lookback is
@@ -118,12 +104,11 @@ struct GroupDemand {
     // Snapshot-state local prefill uses an absolute endpoint here; Decode-side
     // PD also uses it for latest snapshots and retained sliding tails.
     std::int32_t materialized_suffix_start{-1};
-    // Prefill publication streams newly completed history and retained state
-    // endpoints to Host. Ordinary state chunks never stream. Decode leaves
-    // this false; finish/retract explicitly persist retained endpoints.
+    // Prefill streams newly published history and retained state to Host.
+    // Decode leaves this false; only sliding windows keep streaming.
     bool stream_completed_to_host{false};
-    // Exact prefill checkpoint provenance. Allocation and conservative token
-    // progress are not proof. Zero disables state publication for this demand.
+    // Exact prefill checkpoint provenance. Zero disables state publication;
+    // allocation and conservative token progress are not proof.
     std::int32_t materialized_state_boundary_tokens{0};
 };
 
