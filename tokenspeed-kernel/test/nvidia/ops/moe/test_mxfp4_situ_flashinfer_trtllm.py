@@ -193,9 +193,7 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
 
 @requires_flashinfer_situ
 def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-        flashinfer_trtllm_mxfp4_situ_moe_apply,
-    )
+    import tokenspeed_kernel
 
     num_tokens = 16
     raw, hidden_states, router_logits, bias, _, _ = _kernel_routing_case(
@@ -204,12 +202,21 @@ def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
     hidden_states = hidden_states.cuda()
     router_logits = router_logits.cuda()
     w = _prepare_kernel_routing_weights(raw, bias)
-
-    finalized = flashinfer_trtllm_mxfp4_situ_moe_apply(
-        {}, hidden_states, w, router_logits
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        requires_deferred_finalize=True,
+        routing_mode="kernel_routing",
+        ep_size=1,
+        ispp=ISPP,
+        internal_activation_dtype="fp8",
+        solution="flashinfer_trtllm",
     )
-    gemm2_out, expert_weights, expanded_idx = flashinfer_trtllm_mxfp4_situ_moe_apply(
-        {}, hidden_states, w, router_logits, do_finalize=False
+
+    finalized = tokenspeed_kernel.moe_apply(plan, hidden_states, w, router_logits)
+    gemm2_out, expert_weights, expanded_idx = tokenspeed_kernel.moe_apply(
+        plan, hidden_states, w, router_logits, do_finalize=False
     )
     torch.cuda.synchronize()
 

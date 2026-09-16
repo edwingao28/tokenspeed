@@ -353,8 +353,9 @@ def test_nvfp4_gemm_swiglu_tactics_agree_with_heuristic(m: int, k: int, i: int) 
 @pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
 def test_nvfp4_gemm_swiglu_autotune_populates_cache() -> None:
     """One call inside a tuning window fills every smaller shape bucket."""
-    from flashinfer.autotuner import AutoTuner, autotune
+    from flashinfer.autotuner import AutoTuner
     from tokenspeed_kernel.ops.gemm.cute_dsl import nvfp4_gemm_swiglu_nvfp4_quant
+    from tokenspeed_kernel.ops.tuning import autotune
 
     m, k, i = 256, 7168, 512
     a, a_scale, b, b_scale, alpha, global_scale, _, _ = _autotune_operands(m, k, i)

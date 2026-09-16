@@ -418,9 +418,9 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     expert weights, expanded_idx) triple with the latent tail's recipe
     (fp32 ascending-k accumulate, single bf16 round) reproduces the
     do_finalize=True output."""
+    import tokenspeed_kernel
     from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
         flashinfer_trtllm_nvfp4_situ_moe_weights,
-        flashinfer_trtllm_nvfp4_situ_routed_moe_apply,
     )
 
     generator = torch.Generator().manual_seed(20260818)
@@ -447,25 +447,37 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     )
     w = _MoEWeights({k: v.clone() for k, v in raw.items()}).cuda()
     flashinfer_trtllm_nvfp4_situ_moe_weights({}, w)
+    plan = tokenspeed_kernel.moe_plan(
+        "nvfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        requires_deferred_finalize=True,
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=ISPP,
+        internal_activation_dtype="input",
+        solution="flashinfer_trtllm",
+    )
+    router_logits = torch.empty(
+        num_tokens, NUM_EXPERTS, dtype=torch.float32, device="cuda"
+    )
 
-    finalized = flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
-        {},
+    finalized = tokenspeed_kernel.moe_apply(
+        plan,
         hidden_states,
         w,
-        router_logits=None,
+        router_logits,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    gemm2_out, expert_weights, expanded_idx = (
-        flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
-            {},
-            hidden_states,
-            w,
-            router_logits=None,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            do_finalize=False,
-        )
+    gemm2_out, expert_weights, expanded_idx = tokenspeed_kernel.moe_apply(
+        plan,
+        hidden_states,
+        w,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        do_finalize=False,
     )
     torch.cuda.synchronize()
 
