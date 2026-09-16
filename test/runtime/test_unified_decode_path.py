@@ -467,6 +467,10 @@ class RunnerSignatureConformanceTest(_TorchCase):
             "DeepseekV4AttentionBackend",
         ),
         (
+            "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41",
+            "DeepseekV41AttentionBackend",
+        ),
+        (
             "tokenspeed.runtime.layers.attention.backends.state.mamba",
             "MambaAttnBackend",
         ),
@@ -495,7 +499,7 @@ class RunnerSignatureConformanceTest(_TorchCase):
 
     def test_init_forward_metadata_binds_the_runner_call_shape(self):
         """The runner's extend call: five positionals, then block_tables with
-        its CPU mirror and the five extend fields as required keywords (no
+        its CPU mirror and the seven extend fields as required keywords (no
         defaults anywhere), plus the model-side extras a node may ignore."""
         import importlib
         import inspect
@@ -522,6 +526,8 @@ class RunnerSignatureConformanceTest(_TorchCase):
                         extend_seq_lens_cpu=None,
                         extend_prefix_lens=None,
                         extend_prefix_lens_cpu=None,
+                        extend_replay_lens_cpu=None,
+                        extend_prompt_lens_cpu=None,
                         extend_with_prefix=False,
                         positions=None,
                         global_num_tokens=None,
@@ -536,6 +542,8 @@ class RunnerSignatureConformanceTest(_TorchCase):
                     "extend_seq_lens_cpu",
                     "extend_prefix_lens",
                     "extend_prefix_lens_cpu",
+                    "extend_replay_lens_cpu",
+                    "extend_prompt_lens_cpu",
                     "extend_with_prefix",
                 ):
                     param = sig.parameters.get(name)
