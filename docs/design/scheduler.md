@@ -260,7 +260,7 @@ a D node — is not counted here; those are fenced by the PD transfer ack.
 
 **Victim choice** (`chooseVictim`, shared by D and fused): an incomplete
 prefill first — it has produced no output a client is reading, and its
-computed chunks survive as a prefix for the retry — largest first, freeing the
+computed chunks can survive in the cache for the retry — largest first, freeing the
 most at once; then decode work by most newly releasable LCM blocks and fewest
 tokens — the most capacity for the least lost work. Exempt in both tiers: a
 request whose reserve already covers its whole generation
@@ -269,11 +269,13 @@ its readmission must take back.
 
 **Covered history is not a guarantee of state progress.** Sparse recovery
 prefill and later rolling-state checkpoints can still require fresh parents.
-If no prefill or decode can run and every resident is exempt, retraction may
+If no prefill or decode was admitted and every resident is exempt, retraction may
 select a covered request other than the capacity blocker. The blocker stays
 resident and retries its admission in the same round. This preserves its
 computed chunks instead of repeatedly retracting and restarting its first
-chunk. The usual in-flight forward, transfer and store guards still apply.
+chunk. If a new prompt recorded the first capacity failure, the exception
+instead grants capacity to an already blocked decoder. The usual in-flight
+forward, transfer and store guards still apply.
 As long as a decode can run or a forward/PD transfer is still in flight, the
 ordinary reserve exemption remains in force.
 
@@ -424,7 +426,7 @@ Request::AdmissionHeadroom(safe_steps)
 with `safe_steps = 4096` — note the `1 +`: a *fresh* admission already
 prepays one window (see `schedulePrefillFirstChunk`), so for prompts with
 `max_new_tokens <= 4096` the reserve covers the whole generation up front and
-retraction never touches them. Capped by the generation budget the request
+ordinary retraction never touches them. Capped by the generation budget the request
 could ever use, so after a couple of retractions it holds enough room to run
 to completion — at which point `ReserveCoversGeneration` exempts it from the
 ordinary victim policy. The no-progress state-capacity exception in §2 may

@@ -595,7 +595,7 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 }
 
 // Who gives way. An incomplete prefill first -- it has produced no output a
-// client is reading, and its computed chunks survive as a prefix for the
+// client is reading, and caching can preserve its computed chunks for the
 // retry -- largest first, freeing the most at once. Then decode work, by
 // most newly releasable blocks and fewest tokens: the most capacity for the
 // least lost work. (On the D role the first rule reaches only a local
@@ -734,6 +734,21 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                     return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
                 })) {
                 return;  // pending work can still unblock a reserved resident
+            }
+            if (admitsLikeNewPrompt(*blocker)) {
+                // A new prompt may fail before the decode phase records its
+                // own capacity failures. Give this exception's capacity to a
+                // resident that already tried to decode, not to the newcomer.
+                if (build.token_budget < build.state_prefill_reserve + config_.decode_input_tokens) {
+                    return;
+                }
+                const auto resident = std::ranges::find_if(candidates, [](const Request* request) {
+                    return request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>();
+                });
+                if (resident == candidates.end()) {
+                    return;
+                }
+                blocker = *resident;
             }
             // History headroom does not prepay every rolling-state checkpoint
             // or sparse recovery output. If even the reserved residents cannot

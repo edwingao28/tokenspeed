@@ -611,7 +611,7 @@ protected:
         cfg.prefix_granularity = GetParam() ? 64 : 4;
         cfg.device_allocator.total_pages = GetParam() ? 20 : 41;
         cfg.max_scheduled_tokens = 128;
-        cfg.max_batch_size = 2;
+        cfg.max_batch_size = 3;
         cfg.decode_input_tokens = 4;
         cfg.overlap_schedule_depth = 1;
         cfg.disable_l2_cache = true;
@@ -640,6 +640,7 @@ TEST_P(ReservedStateProgressSuite, CoveredGenerationDoesNotStrandStateGrowth) {
     // Neither has room for the next state working set, despite prepaid history.
     std::array<int, 2> generated{};
     std::array<bool, 2> finished{};
+    int second_prefill_starts = 0;
     for (int round = 0; round < 256 && !(finished[0] && finished[1]); ++round) {
         ExecutionPlan plan = PlanOnce();
         const ForwardBatch* batch = FindForwardBatch(plan);
@@ -648,9 +649,13 @@ TEST_P(ReservedStateProgressSuite, CoveredGenerationDoesNotStrandStateGrowth) {
         }
         for (std::size_t row = 0; row < batch->request_ids.size(); ++row) {
             const std::string& id = batch->request_ids[row];
+            ASSERT_TRUE(id == "first" || id == "second");
             const std::size_t index = id == "first" ? 0 : 1;
             ASSERT_FALSE(finished[index]);
             const bool prefill = row < batch->NumExtends();
+            if (id == "second" && prefill && batch->extend_prefix_lens[row] == 0) {
+                ++second_prefill_starts;
+            }
             const bool produces_token =
                 !prefill || batch->extend_prefix_lens[row] + batch->input_lengths[row] == batch->prefill_lengths[row];
             const int count = produces_token ? (prefill ? 1 : 4) : 0;
@@ -664,7 +669,70 @@ TEST_P(ReservedStateProgressSuite, CoveredGenerationDoesNotStrandStateGrowth) {
     }
     EXPECT_TRUE(finished[0]);
     EXPECT_TRUE(finished[1]);
+    if (GetParam()) {
+        EXPECT_EQ(second_prefill_starts, 1) << "the blocked resident must keep its computed prefill chunks";
+    }
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), Config().device_allocator.NumUsableBlocks());
+}
+
+TEST_P(ReservedStateProgressSuite, CoveredResidentsWaitForOutstandingForward) {
+    if (GetParam()) {
+        GTEST_SKIP() << "This case uses narrow state pages to stall two decoders.";
+    }
+    RequestSpec first = MakeRequestSpec("first", 1);
+    RequestSpec second = MakeRequestSpec("second", 1, 101);
+    first.max_new_tokens = second.max_new_tokens = 8;
+    Submit({first, second});
+    PlanOnce();
+    SendForwardDone("first", {42});
+    SendForwardDone("second", {42});
+    PlanOnce();
+    SendForwardDone("second", {42, 42, 42, 42});
+
+    // One result is still outstanding. The other covered resident must
+    // not be retracted while this forward could release state capacity.
+    ExecutionPlan pending = PlanOnce();
+    const ForwardBatch* pending_batch = FindForwardBatch(pending);
+    ASSERT_NE(pending_batch, nullptr);
+    EXPECT_TRUE(pending_batch->request_ids.empty());
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 2u);
+    SendForwardDone("first", {42, 42, 42, 42});
+
+    ExecutionPlan resumed = PlanOnce();
+    const ForwardBatch* resumed_batch = FindForwardBatch(resumed);
+    ASSERT_NE(resumed_batch, nullptr);
+    ASSERT_EQ(resumed_batch->request_ids, std::vector<std::string>{"first"});
+    ASSERT_EQ(resumed_batch->NumExtends(), 0u);
+    SendForwardDone("first", {42, 42, 42, 42});
+    SendFinish("first");
+    SendAbortEvent("second");
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), Config().device_allocator.NumUsableBlocks());
+}
+
+TEST_P(ReservedStateProgressSuite, NewPromptDoesNotDisplaceStalledCoveredDecoders) {
+    if (GetParam()) {
+        GTEST_SKIP() << "This case uses narrow state pages to stall two decoders.";
+    }
+    RequestSpec first = MakeRequestSpec("first", 1);
+    RequestSpec second = MakeRequestSpec("second", 1, 101);
+    first.max_new_tokens = second.max_new_tokens = 8;
+    Submit({first, second});
+    PlanOnce();
+    SendForwardDone("first", {42});
+    SendForwardDone("second", {42});
+    PlanOnce();
+    SendForwardDone("first", {42, 42, 42, 42});
+    SendForwardDone("second", {42, 42, 42, 42});
+
+    RequestSpec newcomer = MakeRequestSpec("newcomer", 1, 201);
+    newcomer.max_new_tokens = 8;
+    Submit(newcomer);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->NumExtends(), 0u);
 }
 
 INSTANTIATE_TEST_SUITE_P(PrefillAndDecode, ReservedStateProgressSuite, ::testing::Bool());
