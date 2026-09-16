@@ -98,8 +98,7 @@ void classifyCompletedStateBoundaries(std::span<GroupDemand> demands, std::span<
         }
         const std::int32_t boundary = demand.materialized_state_boundary_tokens;
         if (endpoint_boundary > 0 && boundary == endpoint_boundary) {
-            // Prefill ends here, at its prompt endpoint or a retraction.
-            // Publish the last reusable checkpoint before any short tail.
+            // Classify the last aligned prompt or recovery checkpoint before publication.
             demand.completed_boundary_kind = CacheBoundaryKind::kEndpoint;
         }
     }
@@ -669,11 +668,8 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
     const bool recovers_as_readmission = store_snapshot || config_.role == Role::kD;
     if (store_snapshot) {
         fsm::CacheProgress cache_progress = victim.CacheProgress();
-        // Only what has actually been computed may be published as a prefix.
-        // A decoding request has its whole prompt plus generated tokens bar
-        // the one it is about to write; an incomplete prefill has only the
-        // chunks it has been through -- taking TokenSize() there would
-        // publish pages that were never computed.
+        // Use the actual prefill end, including PrefillDone. Decode keeps
+        // the conservative frontier used by admission.
         const std::int32_t num_computed_tokens = [&] {
             if (victim.Is<fsm::Prefilling>() || victim.Is<fsm::PrefillDone>()) {
                 const PrefillInfo previous = victim.CurrentPrefillInfo();
