@@ -221,11 +221,9 @@ class GreedySamplingBackend(SamplingBackend):
 
         if self.config.synthetic_acceptance_length is not None:
             lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
-            target_tokens = (
-                target_predict.reshape(bs, num_tokens_per_req)
-                .gather(1, (lengths - 1).long()[:, None])
-                .squeeze(1)
-            )
+            target_tokens = target_predict.gather(
+                1, (lengths - 1).long()[:, None]
+            ).squeeze(1)
             self.write_synthetic_outputs(
                 candidates, target_tokens, lengths, predict, accept_index, accept_length
             )

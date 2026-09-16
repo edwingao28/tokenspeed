@@ -286,7 +286,6 @@ class SamplingBackend(ABC):
         bs, n = candidates.shape
         positions = torch.arange(n, device=candidates.device).expand(bs, n)
         output = predict.view(bs, n)
-        output.zero_()
         output[:, : n - 1].copy_(candidates[:, 1:])
         output.masked_fill_(positions >= lengths[:, None] - 1, 0)
         output.scatter_(
