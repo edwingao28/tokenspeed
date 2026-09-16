@@ -78,12 +78,28 @@ def test_resolve_dspark_prefix_replay_input_space(overrides, expected) -> None:
     assert _resolve_replay(**overrides) == expected
 
 
-@pytest.mark.parametrize("value", [0, -1, 1 << 31])
+@pytest.mark.parametrize("value", [-1, 1 << 31])
 def test_resolve_dspark_prefix_replay_rejects_invalid_capability(value: int) -> None:
-    with pytest.raises(ValueError, match="positive int32"):
+    with pytest.raises(ValueError, match="non-negative int32"):
         _resolve_replay(
             draft_model_config=SimpleNamespace(dspark_prefix_replay_tokens=value)
         )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{}, {"enable_kvstore": True}, {"disaggregation_mode": "prefill"}],
+)
+def test_resolve_dspark_cache_resident_windows_need_no_replay(overrides) -> None:
+    # A draft whose windows live in the KV cache (V4.1) advertises zero and is
+    # free to combine with KVStore and disaggregation.
+    assert (
+        _resolve_replay(
+            draft_model_config=SimpleNamespace(dspark_prefix_replay_tokens=0),
+            **overrides,
+        )
+        == 0
+    )
 
 
 def test_resolve_dspark_prefix_replay_rejects_missing_draft_config() -> None:

@@ -328,10 +328,10 @@ def resolve_dspark_prefix_replay_tokens(
     """Resolve the prompt tail needed to rebuild DSpark runtime state.
 
     DeepSeek V4 DSpark advertises the requirement through its draft
-    ``ModelConfig``. Same-checkpoint DSpark configurations without that
-    capability remain fail-closed. External generic DSpark configurations keep
-    their existing scheduler behavior until they advertise an equivalent
-    contract.
+    ``ModelConfig``; V4.1 advertises zero because its windows are cache
+    resident. Same-checkpoint DSpark configurations without that capability
+    remain fail-closed. External generic DSpark configurations keep their
+    existing scheduler behavior until they advertise an equivalent contract.
     """
 
     if not enable_prefix_caching or speculative_algorithm != "DSPARK":
@@ -351,11 +351,14 @@ def resolve_dspark_prefix_replay_tokens(
         return 0
 
     replay_tokens = int(replay_tokens)
-    if not 0 < replay_tokens <= (1 << 31) - 1:
+    if not 0 <= replay_tokens <= (1 << 31) - 1:
         raise ValueError(
-            "DSPARK captured-context replay requirement must fit a positive int32; "
-            f"got {replay_tokens}."
+            "DSPARK captured-context replay requirement must fit a non-negative "
+            f"int32; got {replay_tokens}."
         )
+    if replay_tokens == 0:
+        # The draft's context lives in the KV cache and follows the prefix.
+        return 0
     if enable_kvstore:
         raise ValueError(
             "DSPARK captured-context replay does not support KVStore; "

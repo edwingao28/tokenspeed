@@ -33,6 +33,7 @@ from typing_extensions import override
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_COMPRESSOR_TAIL_GROUP_ID,
+    V41_DSPARK_PAGE_BYTES,
     V41_GLOBAL_R1_GROUP_ID,
     V41_GLOBAL_R2_GROUP_ID,
     V41_GLOBAL_ROW_BYTES,
@@ -41,10 +42,12 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_HEAD_DIM,
     V41_INDEX_HEAD_DIM,
     V41_INDEX_ROW_BYTES,
+    V41_LCM_BLOCK_BYTES,
     V41_PREFILL_QUERY_TILE,
     V41_SWA_GROUP_ID,
     V41_SWA_ROW_BYTES,
     V41_WINDOW_SIZE,
+    v41_dspark_field_name,
     v41_layer_mapping,
     v41_table_widths,
 )
@@ -61,10 +64,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 
 
 class DeepseekV41Recipe(CacheRecipe):
-    """Target Flash FlatKV for decode/verify, without LCM-backed draft fields.
+    """Target Flash FlatKV for decode/verify, plus checkpoint-local DSpark windows.
 
     Verify width changes retention and workspace, never the target field layout.
-    Checkpoint-local DSpark windows remain owned by the drafter.
+    A same-checkpoint DSpark draft keeps its per-stage context window as extra
+    fields of the SWA group on the last target layer: one row per position,
+    addressed by the target's SWA slots, so prefix reuse, PD transfer and L2
+    cover it without a drafter-private ring.
     """
 
     family = "deepseek_v41"
@@ -79,11 +85,27 @@ class DeepseekV41Recipe(CacheRecipe):
     def max_padding_fraction(self) -> float:
         return 0.05
 
+    def dspark_stages(self) -> int:
+        """Number of same-checkpoint DSpark draft stages, 0 without DSpark."""
+        if (
+            getattr(self.server_args, "speculative_algorithm", None) != "DSPARK"
+            or self.draft_model_config is None
+            or self.draft_attn_config is not None
+        ):
+            return 0
+        hf = self.draft_model_config.hf_config
+        hf = getattr(hf, "text_config", hf)
+        stages = int(getattr(hf, "dspark_num_stages", 0))
+        if stages < 1:
+            raise ValueError("DeepSeek V4.1 DSpark requires a positive stage count")
+        return stages
+
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         if self.num_draft_layers:
             raise NotImplementedError(
-                "DeepSeek V4.1 FlatKV stores target layers only; draft windows are external"
+                "DeepSeek V4.1 FlatKV stores target layers only; draft attention "
+                "layers are not supported"
             )
         if self.decode_input_tokens < 1:
             raise ValueError("DeepSeek V4.1 verify width must be positive")
@@ -140,6 +162,17 @@ class DeepseekV41Recipe(CacheRecipe):
 
         for layer in range(self.num_target_layers):
             add(V41_SWA_GROUP_ID, layer, "swa", (64, V41_SWA_ROW_BYTES), "uint8")
+        # The draft reads each stage's window with the target's SWA slots, so
+        # the rows live in the SWA group; the last target layer owns the field
+        # ids so PD and L2 treat them as target state.
+        for stage in range(self.dspark_stages()):
+            add(
+                V41_SWA_GROUP_ID,
+                self.num_target_layers - 1,
+                v41_dspark_field_name(stage),
+                (64, V41_HEAD_DIM),
+                "bfloat16",
+            )
         for owner in owners:
             gid = (
                 V41_GLOBAL_R2_GROUP_ID if ratios[owner] == 2 else V41_GLOBAL_R1_GROUP_ID
@@ -193,8 +226,11 @@ class DeepseekV41Recipe(CacheRecipe):
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
-        if layout.lcm_block_bytes != 1_382_400 or len(layout.plane_bytes) != 1:
-            raise ValueError("DeepSeek V4.1 Flash requires one 1,382,400-byte plane")
+        expected = V41_LCM_BLOCK_BYTES + self.dspark_stages() * V41_DSPARK_PAGE_BYTES
+        if layout.lcm_block_bytes != expected or len(layout.plane_bytes) != 1:
+            raise ValueError(
+                f"DeepSeek V4.1 Flash requires one {expected:,}-byte plane"
+            )
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:

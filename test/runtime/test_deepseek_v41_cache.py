@@ -881,6 +881,46 @@ def test_pool_zeroes_fresh_pages_per_group():
     assert pool.global_kv(8)[1].count_nonzero() > 0
 
 
+def test_dspark_windows_join_the_swa_group():
+    recipe = _recipe("cpu")
+    recipe.server_args.speculative_algorithm = "DSPARK"
+    recipe.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(dspark_num_stages=3)
+    )
+    assert recipe.dspark_stages() == 3
+    groups = dict(recipe.groups())
+    spec = next(s for s in groups if s.group_id == SWA)
+    swa_fields = {f.field_id: f for f in groups[spec]}
+    for stage in range(3):
+        field = swa_fields[f"layer.39.dspark_kv{stage}"]
+        assert field.shape == (64, 512) and field.dtype == "bfloat16"
+    assert len(swa_fields) == 43
+    layout = _layout(recipe)
+    assert layout.lcm_block_bytes == 1_382_400 + 3 * 64 * 512 * 2
+    recipe.check_layout(layout)
+    # The pool addresses each stage on the last target layer, PD ships it as
+    # target state, and without DSpark the layout is byte-identical to before.
+    pool = _pool(recipe, "cpu")
+    assert pool.dspark_kv(2).shape[1:] == (64, 512)
+    assert pool.dspark_kv(2).dtype == torch.bfloat16
+    recipe.attn_config = replace(recipe.attn_config, pd_disaggregation_enabled=True)
+    from tokenspeed.runtime.pd.cache_protocol import (
+        build_arena_cache_transfer_contract,
+    )
+
+    contract, _ = build_arena_cache_transfer_contract(_pool(recipe, "cpu").arena)
+    assert {f.field_id for f in contract.fields_for_group(SWA)} >= {
+        f"layer.39.dspark_kv{stage}" for stage in range(3)
+    }
+    recipe.server_args.speculative_algorithm = None
+    assert recipe.dspark_stages() == 0
+    assert _layout(recipe).lcm_block_bytes == 1_382_400
+    recipe.server_args.speculative_algorithm = "DSPARK"
+    recipe.draft_model_config.hf_config.dspark_num_stages = 0
+    with pytest.raises(ValueError, match="positive stage count"):
+        recipe.groups()
+
+
 def test_pd_contract_plan_and_manifest():
     import numpy as np
 

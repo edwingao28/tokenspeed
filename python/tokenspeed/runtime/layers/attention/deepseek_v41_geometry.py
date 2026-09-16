@@ -44,6 +44,10 @@ V41_WINDOW_SIZE = 128
 # Shared caller/recipe bound for native prefill query and output scratch.
 V41_PREFILL_QUERY_TILE = 2048
 V41_TAIL_ROWS = 2
+# One LCM parent of the four target groups packed together.
+V41_LCM_BLOCK_BYTES = 1_382_400
+# One DSpark stage's window page: 64 BF16 rows of head_dim in the SWA group.
+V41_DSPARK_PAGE_BYTES = DEEPSEEK_V41_SWA_PAGE_SIZE * V41_HEAD_DIM * 2
 
 # (physical rows per page, raw tokens per row). Table columns remain absolute
 # even when the scheduler releases expired SWA/tail blocks into null holes.
@@ -59,6 +63,13 @@ V41_GROUP_PACKING = {
     V41_GLOBAL_R1_GROUP_ID: 60,
     V41_COMPRESSOR_TAIL_GROUP_ID: 54,
 }
+
+
+def v41_dspark_field_name(stage: int) -> str:
+    """Return the SWA-group field name holding one DSpark stage's window rows."""
+    if stage < 0:
+        raise ValueError("DSpark stage must be non-negative")
+    return f"dspark_kv{stage}"
 
 
 def v41_layer_mapping(
