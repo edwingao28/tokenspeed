@@ -760,10 +760,9 @@ class ServerArgs:
                     "(the speculative verify width including the target token)"
                 )
             logger.warning(
-                "Synthetic acceptance length %.4f enabled for benchmarking. "
+                f"Synthetic acceptance length {length:.4f} enabled for benchmarking. "
                 "Generated text is synthetic and must not be used for correctness "
-                "or accuracy evaluation.",
-                length,
+                "or accuracy evaluation."
             )
 
         # Keep drafter backend consistent with the main model unless explicitly set.

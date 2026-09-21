@@ -126,6 +126,8 @@ class SamplingBackend(ABC):
 
         self.config = config
 
+        self._synthetic_generator: torch.Generator | None = None
+        self._synthetic_lengths: torch.Tensor | None = None
         if config.synthetic_acceptance_length is not None:
             al = config.synthetic_acceptance_length
             if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
