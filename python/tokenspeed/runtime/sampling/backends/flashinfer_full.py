@@ -432,6 +432,21 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
         coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
 
+        chain_speculative_sampling_target_only(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates.to(torch.int32),
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=None,
+            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+            deterministic=True,
+        )
+
+        # Retain normal verification cost before forcing benchmark acceptance.
         if self.config.synthetic_acceptance_length is not None:
             lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
             self.verify_synthetic_probs(
@@ -443,20 +458,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 accept_index,
                 accept_length,
                 True,
-            )
-        else:
-            chain_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates.to(torch.int32),
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=None,
-                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=True,
             )
 
         accept_length += 1

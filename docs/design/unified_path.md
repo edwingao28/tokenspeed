@@ -399,11 +399,13 @@ pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
 Synthetic acceptance length shares executor scheduling, logit processing,
 persistent output buffers and downstream state updates with ordinary
-verification. Each backend deliberately branches at the verification call
-for this benchmark-only policy: normal acceptance is replaced by a forced
-draft prefix and a target token at the selected cutoff. Keeping that choice
-in the backend accommodates its target representation (sampled token IDs
-or probabilities) without a second executor path. The persistent length
+verification. Each backend runs its ordinary full-width verification kernel
+before overriding the result with a forced draft prefix and a target token
+at the selected cutoff. This retains verification cost in the benchmark;
+synchronization and downstream state updates consume only the final synthetic
+outputs. Keeping the override in the backend accommodates its target
+representation (sampled token IDs or probabilities) without a second executor
+path. The persistent length
 buffer is refreshed in `prepare_step` or `prepare_capture`, outside graph
 capture, using a private device generator. Preparation must remain
 asynchronous so it does not stall forward launches.

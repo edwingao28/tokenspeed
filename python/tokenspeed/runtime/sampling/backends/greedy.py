@@ -204,6 +204,17 @@ class GreedySamplingBackend(SamplingBackend):
             )
         target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
 
+        _verify_chain_greedy(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates.to(torch.int32),
+            target_predict=target_predict,
+            batch_size=bs,
+            num_draft_tokens=num_tokens_per_req,
+        )
+
+        # Retain normal verification cost before forcing benchmark acceptance.
         if self.config.synthetic_acceptance_length is not None:
             lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
             target_tokens = target_predict.gather(
@@ -211,16 +222,6 @@ class GreedySamplingBackend(SamplingBackend):
             ).squeeze(1)
             self.write_synthetic_outputs(
                 candidates, target_tokens, lengths, predict, accept_index, accept_length
-            )
-        else:
-            _verify_chain_greedy(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates.to(torch.int32),
-                target_predict=target_predict,
-                batch_size=bs,
-                num_draft_tokens=num_tokens_per_req,
             )
 
         accept_length += 1

@@ -229,7 +229,11 @@ fractional AL emits either `floor(L)` or `ceil(L)` tokens per verification,
 with probability `L - floor(L)` of the larger length. For example, AL `2.6`
 accepts one draft token on 40% of steps and two on 60%, plus a target token.
 
-The draft and target models still execute, but acceptance is synthetic.
+The draft and target models and the normal verification kernel still execute.
+The verification result is then overridden with synthetic acceptance before
+committing tokens and updating request state, preserving verification overhead.
+The override itself adds work, including target-token sampling at the forced
+cutoff for probability-based backends.
 **Do not use generated text for correctness or accuracy evaluation.** Request
 termination can truncate the last verification's output.
 

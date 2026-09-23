@@ -485,6 +485,21 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
         target_probs = target_probs.reshape(bs, n, -1)
 
+        chain_speculative_sampling_target_only(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates,
+            uniform_samples=coins[:bs, :n],
+            uniform_samples_for_final_sampling=final_coins[:bs],
+            target_probs=target_probs,
+            draft_probs=None,
+            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+            deterministic=not dp_sampling,
+        )
+
+        # Retain normal verification cost before forcing benchmark acceptance.
         if self.config.synthetic_acceptance_length is not None:
             row_offset = rank * bs if dp_sampling else sampling_info.batch_row_offset
             lengths = self.synthetic_lengths(candidates, row_offset)
@@ -497,20 +512,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 accept_index,
                 accept_length,
                 not dp_sampling,
-            )
-        else:
-            chain_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                uniform_samples=coins[:bs, :n],
-                uniform_samples_for_final_sampling=final_coins[:bs],
-                target_probs=target_probs,
-                draft_probs=None,
-                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=not dp_sampling,
             )
 
         accept_length += 1

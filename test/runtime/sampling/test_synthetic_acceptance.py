@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -149,16 +150,24 @@ def test_bootstrap_limit_is_refreshed_for_next_step(al):
     "name", ["greedy", "triton", "triton_full", "flashinfer", "flashinfer_full"]
 )
 @pytest.mark.parametrize("al", [None, 1.0, 2.6, 4.0])
-def test_backend_verify_and_cuda_graph_replay(name, al):
+@pytest.mark.parametrize("natural_length", [1, 4])
+def test_backend_verify_and_cuda_graph_replay(name, al, natural_length):
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.flashinfer import (
         FlashInferSamplingBackend,
+        chain_speculative_sampling_target_only,
     )
     from tokenspeed.runtime.sampling.backends.flashinfer_full import (
         FlashInferFullSamplingBackend,
     )
-    from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
-    from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
+    from tokenspeed.runtime.sampling.backends.greedy import (
+        GreedySamplingBackend,
+        _verify_chain_greedy,
+    )
+    from tokenspeed.runtime.sampling.backends.triton import (
+        TritonSamplingBackend,
+        verify_chain_target_sampled,
+    )
     from tokenspeed.runtime.sampling.backends.triton_full import (
         TritonFullSamplingBackend,
     )
@@ -198,6 +207,8 @@ def test_backend_verify_and_cuda_graph_replay(name, al):
     candidates = torch.arange(16, dtype=torch.int32, device="cuda").reshape(4, 4) + 10
     logits = torch.full((16, 512), -100.0, device="cuda")
     target_ids = torch.arange(16, device="cuda") + 80
+    if natural_length == 4:
+        candidates[:, 1:].copy_(target_ids.reshape(4, 4)[:, :3])
     logits.scatter_(1, target_ids[:, None], 100.0)
 
     def verify():
@@ -207,7 +218,7 @@ def test_backend_verify_and_cuda_graph_replay(name, al):
 
     def check(tokens, lengths):
         expected = (
-            torch.ones(4, dtype=torch.int32, device="cuda")
+            torch.full((4,), natural_length, dtype=torch.int32, device="cuda")
             if al is None
             else backend._synthetic_lengths[1:5]
         )
@@ -216,9 +227,39 @@ def test_backend_verify_and_cuda_graph_replay(name, al):
             assert tokens.reshape(4, 4)[row, :length].tolist() == candidates[
                 row, 1:length
             ].tolist() + [target_ids.reshape(4, 4)[row, length - 1].item()]
+            assert backend._accept_index_buf.view(5, 4)[row].tolist() == list(
+                range(row * 4, row * 4 + length)
+            ) + [-1] * (4 - length)
+
+    if name == "greedy":
+        kernel_name, verify_kernel = "_verify_chain_greedy", _verify_chain_greedy
+    elif name in ("triton", "triton_full"):
+        kernel_name, verify_kernel = (
+            "verify_chain_target_sampled",
+            verify_chain_target_sampled,
+        )
+    else:
+        kernel_name, verify_kernel = (
+            "chain_speculative_sampling_target_only",
+            chain_speculative_sampling_target_only,
+        )
 
     prepare()
-    check(*verify())
+    with patch(
+        f"{classes[name].__module__}.{kernel_name}", wraps=verify_kernel
+    ) as normal_verify:
+        write_outputs = backend.write_synthetic_outputs
+
+        def override(*args, **kwargs):
+            # The full-width kernel must run before its outputs are replaced.
+            normal_verify.assert_called_once()
+            return write_outputs(*args, **kwargs)
+
+        with patch.object(backend, "write_synthetic_outputs", side_effect=override):
+            check(*verify())
+        normal_verify.assert_called_once()
+        assert normal_verify.call_args.kwargs["candidates"].shape == candidates.shape
+
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
