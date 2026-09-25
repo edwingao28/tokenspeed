@@ -142,6 +142,8 @@ def dsa_decode(
 
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
+        Partials come back in the query dtype (each context shard is rounded
+        before aggregation); only the LSE stays FP32 for the cross-shard merge.
     """
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
@@ -152,17 +154,17 @@ def dsa_decode(
         batch_size = tokens // q_len
 
     traits = {
-        "page_size": int(page_size),
-        "q_len_per_req": int(q_len_per_req),
+        "q_len": int(q_len_per_req),
         "qk_nope_head_dim": int(qk_nope_head_dim),
         "kv_lora_rank": int(kv_lora_rank),
         "qk_rope_head_dim": int(qk_rope_head_dim),
+        "page_size": int(page_size),
         "topk": int(topk_slots.shape[-1]),
-        "kv_cache_available": kv_cache is not None,
-        "sparse_kv_cache_available": sparse_kv_cache is not None,
-        "topk_layout": "global_slots",
-        "support_logit_cap": logit_cap != 0.0,
+        "has_kv_cache": kv_cache is not None,
+        "has_sparse_kv_cache": sparse_kv_cache is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "topk_layout": "global_slots",
     }
     signature = _attention_format_signature(q=q)
     kernel = select_kernel(
@@ -270,17 +272,17 @@ def dsa_prefill(
         batch_size = tokens
 
     traits = {
-        "page_size": int(page_size),
-        "q_len_per_req": 1,
+        "q_len": 1,
         "qk_nope_head_dim": int(qk_nope_head_dim),
         "kv_lora_rank": int(kv_lora_rank),
         "qk_rope_head_dim": int(qk_rope_head_dim),
+        "page_size": int(page_size),
         "topk": int(topk_slots.shape[-1]),
-        "kv_cache_available": kv_cache is not None,
-        "sparse_kv_cache_available": sparse_kv_cache is not None,
-        "topk_layout": "global_slots",
-        "support_logit_cap": logit_cap != 0.0,
+        "has_kv_cache": kv_cache is not None,
+        "has_sparse_kv_cache": sparse_kv_cache is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "topk_layout": "global_slots",
     }
     signature = _attention_format_signature(q=q)
     kernel = select_kernel(
@@ -326,6 +328,85 @@ def dsa_prefill(
             return_lse=return_lse,
             out=out,
             enable_pdl=pdl_enabled(),
+        )
+
+
+def dsa_index_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    initial_tokens: int,
+    local_tokens: int,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score a query tile against owned Index-K pages and select local candidates.
+
+    Query rows carry request IDs and global causal lengths. Page-table columns
+    retain global request order; absent pages are -1. Windows are measured in
+    global token positions. Returns global logical offsets and FP32 scores;
+    invalid candidates use (-1, -inf), mandatory candidates use +inf scores.
+    ``solution=None`` selects the best supported kernel, or force a solution.
+    """
+    if topk <= 0 or topk & (topk - 1):
+        raise ValueError("Index candidate topk must be a positive power of two")
+    if q.ndim != 3 or weights.shape != q.shape[:2]:
+        raise ValueError("Index queries and per-head weights must match")
+    query_requests = query_requests.contiguous()
+    causal_lens = causal_lens.contiguous()
+    if index_k_cache.dtype != torch.uint8:
+        raise TypeError("DSA index candidates require packed FP8 Index-K storage")
+    if initial_tokens < 0 or local_tokens < 0 or initial_tokens + local_tokens > topk:
+        raise ValueError("Forced windows must fit in topk")
+    if query_requests.shape != (q.shape[0],) or causal_lens.shape != (q.shape[0],):
+        raise ValueError("Index candidate rows must match queries")
+    if not local_page_table.shape[0] or not local_page_table.shape[1]:
+        raise ValueError("Index candidates require a nonempty page table")
+    if not q.shape[0]:
+        return (
+            torch.empty((0, topk), device=q.device, dtype=torch.int32),
+            torch.empty((0, topk), device=q.device, dtype=torch.float32),
+        )
+    kernel = select_kernel(
+        "attention",
+        "dsa_index_candidates",
+        _attention_format_signature(q=q, weights=weights),
+        traits={
+            "index_heads": q.shape[1],
+            "head_dim": q.shape[2],
+            "page_size": page_size,
+            "index_k_layout": (
+                "packed"
+                if (
+                    index_k_cache.ndim == 2
+                    and index_k_cache.shape[1] == q.shape[-1] + q.shape[-1] // 128 * 4
+                )
+                else "page_planar"
+            ),
+        },
+        solution=solution,
+    )
+    with kernel_scope(
+        "attention", "dsa_index_candidates", q.dtype, kernel_name=kernel.name
+    ):
+        return kernel(
+            q,
+            weights,
+            index_k_cache,
+            local_page_table,
+            query_requests,
+            causal_lens,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            initial_tokens=initial_tokens,
+            local_tokens=local_tokens,
         )
 
 
@@ -418,8 +499,8 @@ def dsa_prefill_topk(
     traits = {
         "index_heads": q.shape[1],
         "head_dim": q.shape[-1],
-        "topk": int(topk),
         "page_size": None if page_size is None else int(page_size),
+        "topk": int(topk),
     }
     has_workspace_rows = index_k_fp8 is not None and index_k_scale is not None
     if (index_k_fp8 is None) != (index_k_scale is None):
@@ -596,11 +677,11 @@ def dsa_decode_topk(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
     traits = {
+        "q_len": int(q_len_per_req),
         "index_heads": q.shape[1],
         "head_dim": q.shape[-1],
-        "topk": int(topk),
         "page_size": int(page_size),
-        "q_len_per_req": int(q_len_per_req),
+        "topk": int(topk),
     }
     if index_k_cache is not None:
         traits["index_k_format"] = "fp8_scaled"

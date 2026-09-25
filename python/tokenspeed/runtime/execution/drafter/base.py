@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 import torch
@@ -74,13 +75,18 @@ class BaseDrafter:
         self.token_to_kv_pool = token_to_kv_pool
         self.vocab_size = vocab_size
 
+    def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
+        """Take a replacement pool; a drafter that caches views rebuilds them."""
+        self.token_to_kv_pool = token_to_kv_pool
+
     def wire_target(self, target_model: torch.nn.Module) -> None:
         """Wire this drafter to the loaded target model.
 
         Called once by ``ModelExecutor`` right after the drafter is
-        constructed. Subclasses that read target weights or install capture
-        hooks on the target override this; the default drafter needs nothing
-        from the target.
+        constructed. Subclasses bind execution resources such as target weights
+        and output heads here. Capture configuration belongs to model setup
+        before drafter construction; this method must not change it. The
+        default drafter needs nothing from the target.
 
         Args:
             target_model: The target ``torch.nn.Module`` the drafter
@@ -108,7 +114,17 @@ class BaseDrafter:
         derived target weights and therefore need no action.
         """
 
-    def capture_prefill_graph(self, stream: torch.cuda.Stream) -> None:
+    @property
+    def captures_prefill_graph(self) -> bool:
+        """Whether ``capture_prefill_graph`` records one, for the projection."""
+        return False
+
+    def release_prefill_graph(self) -> None:
+        """Drop a captured draft prefill graph. Drafters without one need no action."""
+
+    def capture_prefill_graph(
+        self, stream: torch.cuda.Stream, observer: AbstractContextManager[None]
+    ) -> None:
         """Capture draft prefill work after target capture, when prefill graphs
         are enabled. Drafters without a separate prefill graph need no action.
         """

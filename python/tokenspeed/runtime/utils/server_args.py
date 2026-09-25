@@ -23,6 +23,7 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 import socket
@@ -212,9 +213,15 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     enable_eplb: bool = False
 
+    # Dense GEMM selection is independent of routed-expert kernels.
+    dense_gemm_backend: str = "auto"
+
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
+    # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
+    moe_mxfp4_fp8_activation: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -224,6 +231,9 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # Optional L3 storage beneath the compact Host cache.
+    kvstore_storage_backend: str | None = None
+    kvstore_storage_backend_extra_config: str | None = None
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -280,6 +290,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    synthetic_acceptance_length: float | None = None
     enable_replay_ssm: bool = False
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
@@ -304,16 +315,20 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
+    disable_kda_prefill_graph: bool = False
     # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    # Request capacities for inline attention; unset keeps the minimum per bucket.
+    prefill_graph_capture_batch_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
     weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
+    disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
 
     # parallel strategy
@@ -420,6 +435,27 @@ class ServerArgs:
             if not isinstance(config, dict):
                 raise ValueError("--speculative-config must be a JSON object")
 
+            if "synthetic_acceptance_length" in config:
+                length = config["synthetic_acceptance_length"]
+                if (
+                    isinstance(length, bool)
+                    or not isinstance(length, (int, float))
+                    or not math.isfinite(length)
+                ):
+                    raise ValueError(
+                        "synthetic_acceptance_length must be a finite number"
+                    )
+                if (
+                    self.synthetic_acceptance_length is not None
+                    and self.synthetic_acceptance_length != length
+                ):
+                    raise ValueError(
+                        "--synthetic-acceptance-length conflicts with "
+                        "synthetic_acceptance_length in --speculative-config"
+                    )
+                if self.synthetic_acceptance_length is None:
+                    self.synthetic_acceptance_length = length
+
             method = config.get("method")
             if method is not None and self.speculative_algorithm is None:
                 self.speculative_algorithm = str(method).upper()
@@ -507,6 +543,8 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
+        if self.dense_gemm_backend not in {"auto", "trtllm_cutedsl"}:
+            raise ValueError("--dense-gemm-backend must be auto or trtllm_cutedsl")
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -582,15 +620,12 @@ class ServerArgs:
             if attn_dp_size is not None:
                 world_size *= attn_dp_size
             logger.info(
-                "Inferred world_size (%s) from attn_tp_size (%s) x attn_cp_size (%s) x attn_dp_size (%s) x pp_size (%s)",
-                world_size,
-                attn_tp_size,
-                attn_cp_size,
-                attn_dp_size,
-                pp_size,
+                f"Inferred world_size ({world_size!s}) from attn_tp_size ("
+                f"{attn_tp_size!s}) x attn_cp_size ({attn_cp_size!s}) x attn_dp_size ("
+                f"{attn_dp_size!s}) x pp_size ({pp_size!s})",
             )
         else:
-            logger.info("Specified world_size (%s)", world_size)
+            logger.info(f"Specified world_size ({world_size!s})")
 
         # Pipeline stages are the outermost split: every per-layer-type
         # parallelism resolves inside one stage's world.
@@ -621,7 +656,7 @@ class ServerArgs:
         if self.enable_expert_parallel and self.ep_size == 1:
             self.ep_size = stage_world_size
             logger.info(
-                "--enable-expert-parallel: auto-setting ep_size=%s", stage_world_size
+                f"--enable-expert-parallel: auto-setting ep_size={stage_world_size!s}",
             )
 
         # MoE parallel sizes default to consuming the full stage world unless
@@ -691,7 +726,7 @@ class ServerArgs:
                     "attention context parallelism"
                 )
 
-        logger.info("Parallelism configuration:\n%s", self.mapping)
+        logger.info(f"Parallelism configuration:\n{self.mapping!s}")
 
     def resolve_cache(self):
         # Handle KVStore settings.
@@ -699,6 +734,38 @@ class ServerArgs:
         self.validate_cache_options()
 
     def resolve_speculative_decoding(self):
+        if self.synthetic_acceptance_length is not None:
+            length = self.synthetic_acceptance_length
+            if (
+                isinstance(length, bool)
+                or not isinstance(length, (int, float))
+                or not math.isfinite(length)
+            ):
+                raise ValueError("synthetic_acceptance_length must be a finite number")
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--synthetic-acceptance-length requires speculative decoding"
+                )
+            # Block checkpoints may replace the default width in ModelConfig.
+            # SamplingBackend checks the final width before allocating buffers.
+            checkpoint_sets_width = (
+                self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS
+                and not self._speculative_widths_explicit
+            )
+            if length < 1 or (
+                not checkpoint_sets_width and length > self.speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    "synthetic_acceptance_length must be in "
+                    f"[1, {self.speculative_num_draft_tokens}] "
+                    "(the speculative verify width including the target token)"
+                )
+            logger.warning(
+                f"Synthetic acceptance length {length:.4f} enabled for benchmarking. "
+                "Generated text is synthetic and must not be used for correctness "
+                "or accuracy evaluation."
+            )
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -765,15 +832,15 @@ class ServerArgs:
             self.comm_fusion_max_num_tokens = -1
             self.enable_allreduce_fusion = False
             logger.info(
-                "allreduce is forbidden due to different attn_tp_size: %s and dense_tp_size: %s!",
-                self.mapping.attn.tp_size,
-                self.mapping.dense.tp_size,
+                "allreduce is forbidden due to different attn_tp_size: "
+                f"{self.mapping.attn.tp_size!s} and dense_tp_size: "
+                f"{self.mapping.dense.tp_size!s}!",
             )
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
         # pipeline needs the P role's structural guarantees (no decode token
-        # feedback, eager execution, non-overlap loop).
+        # feedback, non-overlap loop).
         if self.pipeline_parallel_size > 1:
             # Debug escape hatch: run PP without PD to validate the stage
             # pipeline numerically (prefill + first token only — decode
@@ -791,17 +858,36 @@ class ServerArgs:
                     "for pipeline validation; only prefill/first-token output "
                     "is meaningful"
                 )
-                self.enforce_eager = True
+            # A pipeline stage threads its boundary state through an eager
+            # stage forward (ModelExecutor._run_target_forward); no graph
+            # subsystem captures that, so every stage runs eager.
+            self.enforce_eager = True
+            logger.info("CUDA graph is disabled under pipeline parallelism")
             if self.mapping.has_attn_dp:
                 raise ValueError(
                     "--pipeline-parallel-size > 1 with attention DP is not "
                     "supported yet"
                 )
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "--pipeline-parallel-size > 1 does not support "
-                    "speculative decoding"
-                )
+                if (
+                    self.speculative_algorithm != "DSPARK"
+                    or self.disaggregation_mode != "prefill"
+                ):
+                    raise ValueError(
+                        "--pipeline-parallel-size > 1 supports speculation only "
+                        "as DSPARK context production on a prefill server"
+                    )
+                # Current CachePD / draft layout limits rather than PP limits:
+                # CachePD has no CP partition contract, and the draft reduces
+                # its attention-TP embedding partials over the dense TP group.
+                if (
+                    self.mapping.attn.cp_size != 1
+                    or self.mapping.dense.tp_group != self.mapping.attn.tp_group
+                ):
+                    raise ValueError(
+                        "Pipeline DSPARK requires attention CP=1 and matching "
+                        "dense/attention TP groups"
+                    )
             if (
                 self.pp_layer_partition is not None
                 and len(self.pp_layer_partition) != self.pipeline_parallel_size
@@ -815,15 +901,15 @@ class ServerArgs:
             raise ValueError(
                 "--pp-layer-partition requires --pipeline-parallel-size > 1"
             )
-        # PD disaggregation
-        if self.disaggregation_mode == "prefill":
-            self.enforce_eager = True
-            logger.warning("CUDA graph is disabled for prefill server")
-        elif self.disaggregation_mode == "decode":
+        # PD disaggregation. The prefill role keeps the ordinary graph flags:
+        # it never runs a decode step, so the decode graph has nothing to
+        # capture (ModelExecutorConfig.prefill_only), while its extend
+        # forwards replay the prefill graph like any server's.
+        if self.disaggregation_mode == "decode":
             # Prefix caching stays configurable for decode servers.
             logger.info(
-                "enable_prefix_caching=%r for decode server",
-                self.enable_prefix_caching,
+                f"enable_prefix_caching={self.enable_prefix_caching!r} for decode "
+                "server",
             )
         elif self.disaggregation_mode == "encode":
             # Encode server: vision tower only, no LM / KV pool / prefix cache.
@@ -851,11 +937,17 @@ class ServerArgs:
         if self.disaggregation_mode == "encode":
             self.enable_kvstore = False
             logger.info(
-                "%s instance has set enable_kvstore to False!",
-                self.disaggregation_mode,
+                f"{self.disaggregation_mode!s} instance has set enable_kvstore to "
+                "False!",
             )
         elif not self.disable_kvstore:
             self.enable_kvstore = True
+
+        if self.kvstore_storage_backend is not None and not self.enable_kvstore:
+            raise ValueError(
+                "L3 storage (--kvstore-storage-backend) requires Host L2; "
+                "unset --disable-kvstore"
+            )
 
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
@@ -865,24 +957,9 @@ class ServerArgs:
                 "DCP cache transfer does not yet support KVStore; "
                 "use --disable-kvstore."
             )
-        speculative_algorithm = getattr(self, "speculative_algorithm", None)
-        draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
-        speculative_draft_model_path = getattr(
-            self, "speculative_draft_model_path", None
-        )
-        if (
-            self.enable_kvstore
-            and speculative_algorithm == "DSPARK"
-            and (
-                draft_model_path_use_base
-                or speculative_draft_model_path is None
-                or speculative_draft_model_path == self.model
-            )
-        ):
-            raise ValueError(
-                "DSPARK same-checkpoint decoding does not support KVStore; "
-                "use --disable-kvstore."
-            )
+        # Same-checkpoint DSpark's KVStore support depends on where the draft
+        # keeps its context; the engine decides once the draft config resolves
+        # (resolve_dspark_prefix_replay_tokens).
         if (
             self.enable_kvstore
             and not self.enable_prefix_caching
@@ -894,6 +971,8 @@ class ServerArgs:
             )
 
     def validate(self):
+        if self.low_latency_max_num_tokens_per_gpu <= 0:
+            raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -1221,6 +1300,24 @@ class ServerArgs:
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
         )
+        parser.add_argument(
+            "--kvstore-storage-backend",
+            type=str,
+            choices=["mooncake", "memory"],
+            default=ServerArgs.kvstore_storage_backend,
+            help="L3 store under compact Host (flat) KV. "
+            "'mooncake' is Mooncake Store (SGLang/vLLM HiCache equivalent). "
+            "'memory' is an in-process dict for tests. Requires Host L2 "
+            "(do not pass --disable-kvstore).",
+        )
+        parser.add_argument(
+            "--kvstore-storage-backend-extra-config",
+            type=str,
+            default=ServerArgs.kvstore_storage_backend_extra_config,
+            help="JSON object of extra L3 backend settings. For mooncake: "
+            "master_server_address, local_hostname, metadata_server, "
+            "global_segment_size, protocol, device_name, tenant_id.",
+        )
         # Mamba Cache
         parser.add_argument(
             "--mamba-ssm-dtype",
@@ -1454,11 +1551,32 @@ class ServerArgs:
             help="Enable EPLB algorithm",
         )
         parser.add_argument(
+            "--dense-gemm-backend",
+            type=str,
+            default=ServerArgs.dense_gemm_backend,
+            choices=["auto", "trtllm_cutedsl"],
+            help="Backend for standard 128x128 block-FP8 dense linears. "
+            "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
+            "weights and FP32 scales without requantization. "
+            "Other quantization formats and routed experts are unchanged.",
+        )
+        parser.add_argument(
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
             "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+        )
+        parser.add_argument(
+            "--moe-mxfp4-fp8-activation",
+            action="store_true",
+            help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
+            "FlashInfer cutlass W4A8 Humming MoE: about 1.8x faster than the "
+            "default W4A16 path, a few percent of relative error on the expert "
+            "outputs; validate the served model before relying on it). Applies to "
+            "every MXFP4 expert layer, target and draft; the MoE plan fails at "
+            "startup where the selected backend has no FP8-activation kernel for "
+            "the layer.",
         )
         parser.add_argument(
             "--draft-moe-backend",
@@ -1771,7 +1889,7 @@ class ServerArgs:
             "--speculative_config",
             type=str,
             default=ServerArgs.speculative_config,
-            help="JSON speculative decoding configuration. Supported keys are method, model, and num_speculative_tokens.",
+            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, and synthetic_acceptance_length.",
         )
         parser.add_argument(
             "--speculative-algorithm",
@@ -1808,6 +1926,15 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--synthetic-acceptance-length",
+            type=float,
+            default=ServerArgs.synthetic_acceptance_length,
+            help="Benchmark-only mean accepted length including the guaranteed "
+            "target token, in [1, speculative_num_draft_tokens]. Forces a "
+            "floor/ceil acceptance distribution; generated text is not valid "
+            "for correctness evaluation. Unset disables synthetic acceptance.",
         )
         parser.add_argument(
             "--enable-replay-ssm",
@@ -1911,6 +2038,13 @@ class ServerArgs:
             help="Disable cuda graph for prefill.",
         )
         parser.add_argument(
+            "--disable-kda-prefill-graph",
+            action="store_true",
+            help="Disable KDA prefill CUDA graphs while retaining ordinary "
+            "prefill and decode graph settings. Supported cutedsl_kda prefill "
+            "attention is included in prefill graphs by default.",
+        )
+        parser.add_argument(
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
@@ -1918,15 +2052,41 @@ class ServerArgs:
             "graph. Default (unset) = min(2048, chunked-prefill size); "
             "0 disables.",
         )
-        parser.add_argument(
-            "--prefill-graph-capture-sizes",
-            metavar="PREFILL_GRAPH_CAPTURE_SIZE",
+        prefill_token_sizes = parser.add_mutually_exclusive_group()
+        prefill_token_sizes.add_argument(
+            "--prefill-graph-capture-token-sizes",
+            dest="prefill_graph_capture_sizes",
+            metavar="TOKENS",
             type=int,
             nargs="+",
-            help="Explicit list of token-bucket sizes to capture for the "
-            "breakable prefill graph (like --cudagraph-capture-sizes for "
-            "decode). Unset: a relative-stride ladder bounding padded compute "
-            "at ~12.5%% of any size.",
+            help="Total input-token capacities per forward, summed across the "
+            "batch; not per-request sequence lengths. Shorter inputs are padded. "
+            "For pure prefill, count newly computed tokens, excluding cached "
+            "prefixes. Unset: a relative-stride ladder with ~12.5%% spacing, "
+            "subject to a 16-token minimum step and a 512-token maximum step.",
+        )
+        prefill_token_sizes.add_argument(
+            "--prefill-graph-capture-sizes",
+            dest="prefill_graph_capture_sizes",
+            metavar="TOKENS",
+            type=int,
+            nargs="+",
+            help="Compatibility alias for --prefill-graph-capture-token-sizes. "
+            "Specify only one spelling.",
+        )
+        parser.add_argument(
+            "--prefill-graph-capture-batch-sizes",
+            metavar="BS",
+            type=int,
+            nargs="+",
+            help="Request capacities for inline prefill attention capture; "
+            "replay rounds up to the smallest fitting captured batch size. "
+            "Unset: the minimum request count that fits each token bucket within "
+            "the model context. KDA uses fixed checkpoint slots, so each token "
+            "bucket needs one inline variant per configured request count. "
+            "Adding request counts increases capture time and memory. "
+            "This does not replace the scheduler's --max-num-seqs limit. "
+            "Batches without a fitting capacity retain the ordinary attention breaks.",
         )
         parser.add_argument(
             "--enable-nan-detection",
@@ -1969,6 +2129,11 @@ class ServerArgs:
             "--enable-memory-saver",
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
+        )
+        parser.add_argument(
+            "--disable-cudagraph-memory-reserve",
+            action="store_true",
+            help="Do not reserve the projected CUDA-graph pool memory in the KV cache budget.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -2039,7 +2204,8 @@ class ServerArgs:
             "--low-latency-max-num-tokens-per-gpu",
             type=int,
             default=ServerArgs.low_latency_max_num_tokens_per_gpu,
-            help="Low latency max num tokens per gpu",
+            help="DeepEP low-latency send capacity per rank. Defaults to 256; "
+            "set explicitly to cover the largest batch sent through low latency.",
         )
 
         parser.add_argument(

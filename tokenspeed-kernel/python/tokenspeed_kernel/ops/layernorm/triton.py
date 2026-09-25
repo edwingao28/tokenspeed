@@ -37,6 +37,81 @@ def _rmsnorm_kernel(
 
 
 @triton.jit
+def reference_rmsnorm_row(x, weight, eps: tl.constexpr, N: tl.constexpr):
+    """RMSNorm one FP32 row in the eager reference's arithmetic order.
+
+    ``x`` and ``weight`` are FP32 vectors of ``N`` elements. The mean scales
+    the sum by the FP32 reciprocal of ``N`` exactly as ``torch.mean`` does,
+    the row is scaled before the weight multiplies it, and nothing is
+    rounded in between; the caller casts the result once. Only the
+    summation order can differ from the sequential reference.
+    """
+    scale = tl.rsqrt(tl.sum(x * x, 0) * (1.0 / N) + eps)
+    return weight * (x * scale)
+
+
+@triton.jit
+def _reference_rmsnorm_kernel(
+    X,
+    W,
+    OUT,
+    X0,
+    O0,
+    N: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, BLOCK)
+    mask = d < N
+    x = tl.load(X + row * X0 + d, mask, 0.0).to(tl.float32)
+    weight = tl.load(W + d, mask, 0.0).to(tl.float32)
+    tl.store(OUT + row * O0 + d, reference_rmsnorm_row(x, weight, EPS, N), mask)
+
+
+def reference_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor | None
+) -> torch.Tensor:
+    """RMSNorm ``x`` with the cast order of the eager FP32 reference.
+
+    Args:
+        x: Floating ``[..., N]`` rows with a unit last stride.
+        weight: ``[N]`` contiguous weight in any floating dtype.
+        eps: Variance epsilon added to the FP32 mean of squares.
+        out: Contiguous destination shaped like ``x`` in ``x``'s dtype, or
+            None to allocate one.
+
+    Returns:
+        ``out``: ``(weight.float() * (x.float() * rsqrt(mean(x.float()**2) +
+        eps))).to(x.dtype)`` row by row, rounded once at the store.
+    """
+    n = x.shape[-1]
+    if x.ndim < 1 or x.stride(-1) != 1:
+        raise ValueError("reference RMSNorm rows need a unit last stride")
+    if weight.shape != (n,) or not weight.is_contiguous():
+        raise ValueError(f"reference RMSNorm weight must be contiguous [{n}]")
+    if out is None:
+        out = torch.empty_like(x)
+    elif out.shape != x.shape or out.dtype != x.dtype or not out.is_contiguous():
+        raise ValueError("reference RMSNorm out must be contiguous and match x")
+    rows = x.reshape(-1, n) if x.ndim != 2 else x
+    if rows.numel():
+        _reference_rmsnorm_kernel[(rows.shape[0],)](
+            rows,
+            weight,
+            out.view(-1, n),
+            rows.stride(0),
+            n,
+            N=n,
+            EPS=eps,
+            BLOCK=triton.next_power_of_2(n),
+            num_warps=8 if n >= 4096 else 4,
+            enable_fp_fusion=False,
+        )
+    return out
+
+
+@triton.jit
 def _rmsnorm_fused_parallel_kernel(
     input1_ptr,
     weight1_ptr,
@@ -148,6 +223,7 @@ def _grouped_gemma_rmsnorm_kernel(
     group_offset = group * GROUP_SIZE
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     x = tl.load(
         x_ptr + row * row_stride + group_offset + offsets,
         mask=mask,
@@ -163,8 +239,6 @@ def _grouped_gemma_rmsnorm_kernel(
         normalized,
         mask=mask,
     )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def grouped_gemma_rmsnorm(
@@ -255,12 +329,14 @@ def _gated_residual_combine_norm_kernel(
 
     if ENABLE_PDL and not PRELOAD_RESIDUAL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     residual = tl.load(residual_ptr + positions, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(
         weight_ptr + group * weight_group_stride + offsets, mask=mask, other=0.0
     ).to(tl.float32)
     if ENABLE_PDL and PRELOAD_RESIDUAL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     block_output = tl.load(
         block_ptr + row * GROUP_SIZE + offsets, mask=mask, other=0.0
@@ -275,8 +351,6 @@ def _gated_residual_combine_norm_kernel(
     variance = tl.sum(combined * combined, axis=0) / GROUP_SIZE
     normalized = combined * tl.rsqrt(variance + eps) * (1.0 + weight)
     tl.store(norm_out_ptr + positions, normalized, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def gated_residual_combine_norm(

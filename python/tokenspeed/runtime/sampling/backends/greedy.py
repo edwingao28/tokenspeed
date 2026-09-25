@@ -142,21 +142,6 @@ class GreedySamplingBackend(SamplingBackend):
         self._sample_token_buf = torch.empty(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
-        self._predict_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
-        # (required by maybe_broadcast / NCCL).
-        self._accept_index_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._accept_length_buf = torch.zeros(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
 
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
@@ -229,14 +214,23 @@ class GreedySamplingBackend(SamplingBackend):
             num_draft_tokens=num_tokens_per_req,
         )
 
+        # Retain normal verification cost before forcing benchmark acceptance.
+        if self.config.synthetic_acceptance_length is not None:
+            lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
+            target_tokens = target_predict.gather(
+                1, (lengths - 1).long()[:, None]
+            ).squeeze(1)
+            self.write_synthetic_outputs(
+                candidates, target_tokens, lengths, predict, accept_index, accept_length
+            )
+
         accept_length += 1
 
         # TP-rank sync on the full verify-output triple, mirrors
         # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length
         # divergence (logits not bit-identical across ranks) desyncs batch
-        # composition and deadlocks the model all-reduce. Buffers are laid out
-        # flat so these views are NCCL-contiguous.
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        # composition and deadlocks the model all-reduce.
+        self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(

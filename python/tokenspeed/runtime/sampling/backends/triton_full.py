@@ -535,9 +535,21 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             target_sampled=target_sampled,
         )
 
+        # Retain normal verification cost before forcing benchmark acceptance.
+        if self.config.synthetic_acceptance_length is not None:
+            lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
+            target_tokens = (
+                target_sampled.reshape(bs, num_tokens_per_req)
+                .gather(1, (lengths - 1).long()[:, None])
+                .squeeze(1)
+            )
+            self.write_synthetic_outputs(
+                candidates, target_tokens, lengths, predict, accept_index, accept_length
+            )
+
         accept_length += 1
 
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        self.broadcast_verify_outputs()
 
         valid = accept_index >= 0
         safe_positions = accept_index.clamp(min=0).long()
