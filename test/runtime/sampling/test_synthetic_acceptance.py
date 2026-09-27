@@ -152,6 +152,9 @@ def test_bootstrap_limit_is_refreshed_for_next_step(al):
 @pytest.mark.parametrize("al", [None, 1.0, 2.6, 4.0])
 @pytest.mark.parametrize("natural_length", [1, 4])
 def test_backend_verify_and_cuda_graph_replay(name, al, natural_length):
+    if name in ("flashinfer", "flashinfer_full") and torch.version.hip:
+        pytest.skip("FlashInfer sampling kernels require CUDA (not ROCm)")
+
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.flashinfer import (
         FlashInferSamplingBackend,
