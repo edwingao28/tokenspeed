@@ -121,6 +121,7 @@ class SamplingBackend(ABC):
     # pool-state work only; shared synthetic lengths still need refreshing.
     _HAS_POOL_STATE: bool = False
     _SUPPORTS_DP_VERIFY: bool = False
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE: bool = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
@@ -128,20 +129,32 @@ class SamplingBackend(ABC):
 
         self._synthetic_generator: torch.Generator | None = None
         self._synthetic_lengths: torch.Tensor | None = None
+        self._synthetic_coins: torch.Tensor | None = None
         if config.synthetic_acceptance_length is not None:
+            if not self._SUPPORTS_SYNTHETIC_ACCEPTANCE:
+                raise ValueError(
+                    "synthetic acceptance requires the greedy sampling backend"
+                )
             al = config.synthetic_acceptance_length
             if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
                 raise ValueError(
-                    "synthetic_acceptance_length must be within the verify width"
+                    f"synthetic_acceptance_length {al} must be within the verify width "
+                    f"[1, {config.max_draft_tokens_per_req}]"
                 )
-            tp_size = len(config.tp_group) if config.tp_group is not None else 1
-            max_bs = (config.max_bs + tp_size - 1) // tp_size * tp_size
             self._synthetic_generator = torch.Generator(
                 device=config.device
             ).manual_seed(config.random_seed)
             self._synthetic_lengths = torch.full(
-                (max_bs,), math.floor(al), dtype=torch.int32, device=config.device
+                (config.max_bs,),
+                math.floor(al),
+                dtype=torch.int32,
+                device=config.device,
             )
+
+            if al != math.floor(al):
+                self._synthetic_coins = torch.empty(
+                    (config.max_bs,), device=config.device
+                )
 
         # Sentinel of "which rid currently owns each slot from this backend's
         # point of view". rid is just a comparison value here, not a lookup
@@ -300,16 +313,14 @@ class SamplingBackend(ABC):
             return
         # Refill outside capture, like the rejection sampler's coin buffers.
         # A private device generator avoids host copies and global RNG state.
-        coins = torch.rand(
-            self._synthetic_lengths.shape,
-            generator=self._synthetic_generator,
-            device=self._synthetic_lengths.device,
-        )
-        self._synthetic_lengths.copy_((coins < al % 1).to(torch.int32) + math.floor(al))
+        self._synthetic_coins.uniform_(generator=self._synthetic_generator)
+        torch.lt(self._synthetic_coins, al % 1, out=self._synthetic_lengths)
+        self._synthetic_lengths.add_(math.floor(al))
 
     def synthetic_lengths(
         self, candidates: torch.Tensor, row_offset: int
     ) -> torch.Tensor:
+        """Read lengths in full-batch order; row_offset skips any prefill rows."""
         bs, n = candidates.shape
         return self._synthetic_lengths[row_offset : row_offset + bs].clamp(max=n)
 
@@ -347,43 +358,6 @@ class SamplingBackend(ABC):
             )
         )
         accept_length.copy_(lengths - 1)
-
-    def verify_synthetic_probs(
-        self,
-        candidates: torch.Tensor,
-        target_probs: torch.Tensor,
-        final_coins: torch.Tensor,
-        lengths: torch.Tensor,
-        predict: torch.Tensor,
-        accept_index: torch.Tensor,
-        accept_length: torch.Tensor,
-        deterministic: bool,
-    ) -> None:
-        from tokenspeed_kernel.ops.sampling.cuda import (
-            chain_speculative_sampling_target_only,
-        )
-
-        bs = candidates.shape[0]
-        rows = torch.arange(bs, device=candidates.device)
-        # N=1 is the existing sampler's ordinary target-token sampling path.
-        probs = target_probs[rows, (lengths - 1).long()].unsqueeze(1)
-        target_tokens = torch.empty((bs,), dtype=predict.dtype, device=predict.device)
-        chain_speculative_sampling_target_only(
-            predicts=target_tokens,
-            accept_index=torch.empty((bs, 1), dtype=torch.int32, device=predict.device),
-            accept_token_num=accept_length,
-            candidates=candidates[:, :1].to(torch.int32).contiguous(),
-            uniform_samples=final_coins[:, None],
-            uniform_samples_for_final_sampling=final_coins,
-            target_probs=probs,
-            draft_probs=None,
-            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-            deterministic=deterministic,
-        )
-        self.write_synthetic_outputs(
-            candidates, target_tokens, lengths, predict, accept_index, accept_length
-        )
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
         """Return sampler-specific CUDA graph variants to capture."""

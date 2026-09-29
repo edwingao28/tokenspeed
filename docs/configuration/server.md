@@ -222,6 +222,13 @@ draft model, and token count together.
 
 ### Synthetic Acceptance Length
 
+The supported benchmark configuration is `--sampling-backend greedy`, with
+speculative decoding enabled and `--dp-sampling` and `--enable-output-logprobs`
+disabled. Other sampling backends and those two options are rejected at startup.
+As with ordinary greedy sampling, token selection is always argmax; stochastic
+sampling and penalties are not supported. Use unconstrained greedy requests
+(`temperature: 0`) for this benchmark.
+
 Use `--synthetic-acceptance-length L` to benchmark speculative execution at a
 fixed mean acceptance length (AL). AL includes the guaranteed target token,
 so `1 <= L <= --speculative-num-draft-tokens` (the verify width). AL `1`
@@ -233,8 +240,8 @@ accepts one draft token on 40% of steps and two on 60%, plus a target token.
 The draft and target models and the normal verification kernel still execute.
 The verification result is then overridden with synthetic acceptance before
 committing tokens and updating request state, preserving verification overhead.
-The override itself adds work, including target-token sampling at the forced
-cutoff for probability-based backends.
+The override copies the forced draft prefix and selects the existing target
+argmax at the cutoff. It adds no second verification or target-resampling pass.
 **Do not use generated text for correctness or accuracy evaluation.** Request
 termination can truncate the last verification's output.
 
@@ -242,8 +249,8 @@ Either spelling below configures three draft slots (verify width four) and
 AL `2.6`:
 
 ```bash
---speculative-algorithm MTP --speculative-num-steps 3 --synthetic-acceptance-length 2.6
---speculative-config '{"method":"mtp","num_speculative_tokens":3,"synthetic_acceptance_length":2.6}'
+--sampling-backend greedy --speculative-algorithm MTP --speculative-num-steps 3 --synthetic-acceptance-length 2.6
+--sampling-backend greedy --speculative-config '{"method":"mtp","num_speculative_tokens":3,"synthetic_acceptance_length":2.6}'
 ```
 
 Conflicting values between the flag and JSON configuration are rejected.

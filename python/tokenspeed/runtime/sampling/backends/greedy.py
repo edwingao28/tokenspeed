@@ -129,6 +129,8 @@ class GreedySamplingBackend(SamplingBackend):
     supported. Intended as the default backend and as a fallback when
     flashinfer is unavailable."""
 
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
+
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)

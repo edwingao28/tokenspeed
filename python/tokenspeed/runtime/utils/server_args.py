@@ -771,6 +771,15 @@ class ServerArgs:
                     f"[1, {self.speculative_num_draft_tokens}] "
                     "(the speculative verify width including the target token)"
                 )
+            if self.sampling_backend != "greedy":
+                raise ValueError(
+                    "--synthetic-acceptance-length requires --sampling-backend greedy"
+                )
+            if self.dp_sampling or self.enable_output_logprobs:
+                raise ValueError(
+                    "--synthetic-acceptance-length does not support "
+                    "--dp-sampling or --enable-output-logprobs"
+                )
             logger.warning(
                 f"Synthetic acceptance length {length:.4f} enabled for benchmarking. "
                 "Generated text is synthetic and must not be used for correctness "
@@ -2002,7 +2011,8 @@ class ServerArgs:
             help="Benchmark-only mean accepted length including the guaranteed "
             "target token, in [1, speculative_num_draft_tokens]. Forces a "
             "floor/ceil acceptance distribution; generated text is not valid "
-            "for correctness evaluation. Unset disables synthetic acceptance.",
+            "for correctness evaluation. Requires --sampling-backend greedy without "
+            "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
         parser.add_argument(
             "--enable-replay-ssm",

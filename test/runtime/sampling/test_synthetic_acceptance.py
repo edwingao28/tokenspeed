@@ -41,6 +41,8 @@ register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 
 class _BufferBackend(SamplingBackend):
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
+
     def sample(self, logits_output, sampling_info):
         raise NotImplementedError
 
@@ -70,8 +72,17 @@ def test_config_requires_explicit_synthetic_acceptance():
 
 @pytest.mark.parametrize("al", [float("nan"), float("inf"), 0.99, 4.01])
 def test_reject_invalid_final_width(al):
-    with pytest.raises(ValueError, match="verify width"):
+    with pytest.raises(ValueError, match=rf"{al}.*verify width \[1, 4\]"):
         _BufferBackend(_config(al, 4, 4, "cpu"))
+
+
+def test_unsupported_backend_rejects_synthetic_acceptance():
+    class UnsupportedBackend(_BufferBackend):
+        _SUPPORTS_SYNTHETIC_ACCEPTANCE = False
+
+    UnsupportedBackend(_config(None, 4, 4, "cpu"))
+    with pytest.raises(ValueError, match="requires the greedy sampling backend"):
+        UnsupportedBackend(_config(2.6, 4, 4, "cpu"))
 
 
 @pytest.mark.parametrize(
@@ -104,7 +115,8 @@ def test_fractional_lengths_and_rng_isolation(device):
     assert set(backend._synthetic_lengths.tolist()) == {3, 4}
     assert abs(backend._synthetic_lengths.float().mean().item() - 3.77) < 0.015
     first = backend._synthetic_lengths.clone()
-    backend.prepare_step([], [], [], 5)
+    with patch("torch.rand", side_effect=AssertionError("must reuse coin storage")):
+        backend.prepare_step([], [], [], 5)
     assert not torch.equal(first, backend._synthetic_lengths)
 
 
@@ -146,45 +158,18 @@ def test_bootstrap_limit_is_refreshed_for_next_step(al):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize(
-    "name", ["greedy", "triton", "triton_full", "flashinfer", "flashinfer_full"]
-)
 @pytest.mark.parametrize("al", [None, 1.0, 2.6, 4.0])
 @pytest.mark.parametrize("natural_length", [1, 4])
-def test_backend_verify_and_cuda_graph_replay(name, al, natural_length):
-    if name in ("flashinfer", "flashinfer_full") and torch.version.hip:
-        pytest.skip("FlashInfer sampling kernels require CUDA (not ROCm)")
-
+def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-    from tokenspeed.runtime.sampling.backends.flashinfer import (
-        FlashInferSamplingBackend,
-        chain_speculative_sampling_target_only,
-    )
-    from tokenspeed.runtime.sampling.backends.flashinfer_full import (
-        FlashInferFullSamplingBackend,
-    )
     from tokenspeed.runtime.sampling.backends.greedy import (
         GreedySamplingBackend,
         _verify_chain_greedy,
     )
-    from tokenspeed.runtime.sampling.backends.triton import (
-        TritonSamplingBackend,
-        verify_chain_target_sampled,
-    )
-    from tokenspeed.runtime.sampling.backends.triton_full import (
-        TritonFullSamplingBackend,
-    )
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
-    classes = {
-        "greedy": GreedySamplingBackend,
-        "triton": TritonSamplingBackend,
-        "triton_full": TritonFullSamplingBackend,
-        "flashinfer": FlashInferSamplingBackend,
-        "flashinfer_full": FlashInferFullSamplingBackend,
-    }
-    backend = classes[name](_config(al, 5, 4, "cuda"))
+    backend = GreedySamplingBackend(_config(al, 5, 4, "cuda"))
     params = []
     rids = [f"synthetic-{i}" for i in range(5)]
     for rid in rids:
@@ -234,22 +219,10 @@ def test_backend_verify_and_cuda_graph_replay(name, al, natural_length):
                 range(row * 4, row * 4 + length)
             ) + [-1] * (4 - length)
 
-    if name == "greedy":
-        kernel_name, verify_kernel = "_verify_chain_greedy", _verify_chain_greedy
-    elif name in ("triton", "triton_full"):
-        kernel_name, verify_kernel = (
-            "verify_chain_target_sampled",
-            verify_chain_target_sampled,
-        )
-    else:
-        kernel_name, verify_kernel = (
-            "chain_speculative_sampling_target_only",
-            chain_speculative_sampling_target_only,
-        )
-
     prepare()
     with patch(
-        f"{classes[name].__module__}.{kernel_name}", wraps=verify_kernel
+        "tokenspeed.runtime.sampling.backends.greedy._verify_chain_greedy",
+        wraps=_verify_chain_greedy,
     ) as normal_verify:
         write_outputs = backend.write_synthetic_outputs
 

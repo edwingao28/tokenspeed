@@ -44,7 +44,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         *,
         enable_prefix_caching: bool = True,
     ) -> ServerArgs:
-        argv = ["--model", model]
+        argv = ["--model", model, "--sampling-backend", "greedy"]
         if not enable_prefix_caching:
             argv.append("--disable-prefix-caching")
         argv.extend(["--speculative-config", config])
@@ -493,6 +493,8 @@ class TestCLIConfigCompat(unittest.TestCase):
                     argv = [
                         "--model",
                         "test/model",
+                        "--sampling-backend",
+                        "greedy",
                         "--speculative-config",
                         json.dumps(config),
                     ]
@@ -512,6 +514,36 @@ class TestCLIConfigCompat(unittest.TestCase):
             "test/model", '{"method":"mtp","num_speculative_tokens":3}'
         )
         self.assertIsNone(sa.synthetic_acceptance_length)
+
+    def test_synthetic_acceptance_length_rejects_unsupported_modes(self):
+        unsupported = [
+            ([], "requires --sampling-backend greedy"),
+            *[
+                (["--sampling-backend", name], "requires --sampling-backend greedy")
+                for name in ("triton", "triton_full", "flashinfer", "flashinfer_full")
+            ],
+            *[
+                (["--sampling-backend", "greedy", flag], "does not support")
+                for flag in ("--dp-sampling", "--enable-output-logprobs")
+            ],
+        ]
+        for extra, message in unsupported:
+            with self.subTest(extra=extra):
+                args = self._parse_args(
+                    [
+                        "--model",
+                        "test/model",
+                        "--speculative-algorithm",
+                        "MTP",
+                        "--synthetic-acceptance-length",
+                        "2.6",
+                        *extra,
+                    ]
+                )
+                sa = self._from_cli_args_no_init(args)
+                sa.resolve_basic_defaults()
+                with self.assertRaisesRegex(ValueError, message):
+                    sa.resolve_speculative_decoding()
 
     def test_synthetic_acceptance_length_conflicting_sources(self):
         args = self._parse_args(
