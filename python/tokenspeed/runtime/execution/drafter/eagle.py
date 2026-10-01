@@ -33,6 +33,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DsaTopKState = tuple[Any | None, Any | None]
@@ -90,6 +91,7 @@ class Eagle(BaseDrafter):
 
     shares_target_embed_head = True
     supports_pd_layerwise_finalization = True
+    supports_request_token_history = True
 
     def __init__(
         self,
@@ -129,6 +131,32 @@ class Eagle(BaseDrafter):
         # Drafter-owned alias source for the draft attn backend; advanced in
         # place during multi-step decode.
         self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
+
+        # Draft-side request-token history (e.g. a draft with its own n-gram
+        # over-embedding). The drafter owns the per-slot write frontier: it
+        # advances through the speculative chain, unlike valid_cache_lengths.
+        self.draft_reads_token_history: bool = bool(
+            draft_model_runner.model_config.requires_request_token_history
+        )
+        self.draft_history_lengths_buf: torch.Tensor | None = None
+        self.draft_history_offsets_buf: torch.Tensor | None = None
+        if self.draft_reads_token_history:
+            target_history = self.runtime_states.request_token_history_ids
+            if target_history is None:
+                raise NotImplementedError(
+                    "a draft model reading request-token history requires the "
+                    "target model to keep one (the capacity comes from it)"
+                )
+            self.runtime_states.init_draft_request_token_history(
+                target_history.shape[1]
+            )
+            pool_size = self.runtime_states.valid_cache_lengths.shape[0]
+            self.draft_history_lengths_buf = torch.zeros(
+                (pool_size,), dtype=torch.int32, device=self.device
+            )
+            self.draft_history_offsets_buf = torch.arange(
+                self.input_buffers.max_bs + 1, dtype=torch.int32, device=self.device
+            )
 
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
@@ -283,6 +311,12 @@ class Eagle(BaseDrafter):
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=draft_input.num_extends,
+            output_layout=ForwardOutputLayout(
+                draft_input.num_extends,
+                draft_input.num_extends,
+                bs - draft_input.num_extends,
+                1,
+            ),
             input_num_tokens=input_num_tokens,
             forward_mode=forward_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -308,12 +342,26 @@ class Eagle(BaseDrafter):
             dsa_topk = (None, None)
         self._attach_dsa_topk(dsa_topk)
 
+        history_kwargs = {}
+        if self.draft_reads_token_history:
+            # The step-0 rows mirror the target forward's packed layout, so
+            # the offsets and mask the executor prepared for the target apply
+            # verbatim; the write frontier is the pre-forward committed length.
+            history_kwargs["request_token_history"] = (
+                self.runtime_states.draft_request_token_history_view(
+                    req_pool_indices=buffers.req_pool_indices_buf[:bs],
+                    input_start_offsets=buffers.input_start_offsets_buf[: bs + 1],
+                    active_request_mask=buffers.active_request_mask_buf[:bs],
+                    committed_lengths=self.runtime_states.valid_cache_lengths,
+                )
+            )
         logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
             positions=buffers.positions_buf[:input_num_tokens],
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
+            **history_kwargs,
         )
         dsa_topk = self._extract_dsa_topk(dsa_topk)
         if compute_dsa_topk_first_step and prepare_dsa_topk is not None:
@@ -346,6 +394,16 @@ class Eagle(BaseDrafter):
 
         positions = cache_start.clone()
 
+        history_pool_indices = None
+        if self.draft_reads_token_history:
+            # Step i appends its one input token at frontier + (i - 1), the
+            # same advancing position the KV chain writes. Tensor-only writes
+            # on persistent buffers, so graph capture records the update.
+            history_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
+            self.draft_history_lengths_buf.index_copy_(
+                0, history_pool_indices, cache_start.to(torch.int32)
+            )
+
         for i in range(1, self.spec_num_steps):
             # make a ctx every time model runner forward
             # Multi-step decode is pure DECODE mode: one token per request.
@@ -363,6 +421,7 @@ class Eagle(BaseDrafter):
             ctx = ForwardContext(
                 bs=bs,
                 num_extends=0,
+                output_layout=ForwardOutputLayout(0, 0, bs, 1),
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
                 input_num_tokens=bs,
@@ -388,6 +447,18 @@ class Eagle(BaseDrafter):
                 num_tokens=1,
             )
 
+            history_kwargs = {}
+            if self.draft_reads_token_history:
+                history_kwargs["request_token_history"] = (
+                    self.runtime_states.draft_request_token_history_view(
+                        req_pool_indices=history_pool_indices,
+                        input_start_offsets=self.draft_history_offsets_buf[: bs + 1],
+                        active_request_mask=(
+                            self.input_buffers.active_request_mask_buf[:bs]
+                        ),
+                        committed_lengths=self.draft_history_lengths_buf,
+                    )
+                )
             with nvtx_range("draft_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
@@ -395,8 +466,15 @@ class Eagle(BaseDrafter):
                     positions=positions,
                     captured_hidden_states=logits_output.hidden_states,
                     spec_step_idx=i,
+                    **history_kwargs,
                 )
                 dsa_topk = self._extract_dsa_topk(dsa_topk)
+            if self.draft_reads_token_history and i + 1 < self.spec_num_steps:
+                self.draft_history_lengths_buf.index_copy_(
+                    0,
+                    history_pool_indices,
+                    draft_seq_lens.to(torch.int32),
+                )
 
             with nvtx_range("draft_sample", color="yellow"):
                 if logits_output.next_token_ids is not None:

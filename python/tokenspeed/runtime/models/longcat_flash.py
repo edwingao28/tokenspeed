@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable as _Iterable
 
+import tokenspeed_kernel
 import torch
 import torch.nn as nn
 import torch.nn.functional as _F
@@ -64,9 +65,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 )
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader as _default_weight_loader,
-)
-from tokenspeed.runtime.model_loader.weight_utils import (
-    kv_cache_scales_loader as _kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM as _BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
@@ -186,6 +184,15 @@ class _RuntimeLongcatRouter(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # The classifier's logits feed expert selection, so they must be
+            # batch-invariant or top-k flips at near-ties. cuBLAS and the
+            # dsv3 router kernel tile by shape; the aok leaf does not.
+            return tokenspeed_kernel.mm(
+                hidden_states.float(),
+                self.classifier.weight.float(),
+                override="aok",
+            )
         if _longcat_is_hopper_plus and hidden_states.shape[0] > 0:
             return _dsv3_router_gemm(
                 hidden_states,
@@ -245,6 +252,10 @@ class _RuntimeLongcatMoE(nn.Module):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             zero_expert_type=config.zero_expert_type,
+            zero_expert_num=config.zero_expert_num,
+            # LongCat applies its own zero-expert routing to gated SiLU experts.
+            activation="swiglu",
+            routing_mode="precomputed_topk",
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "normalize_topk_weights": config.norm_topk_prob,
@@ -717,7 +728,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
             return None
         if name.endswith(_LONGCAT_OPTIONAL_MISSING_WEIGHT_SUFFIXES):
             return None
-        _longcat_logger.warning("The %s is not in the model.", name)
+        _longcat_logger.warning(f"The {name!s} is not in the model.")
         return None
 
     def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]):
@@ -861,24 +872,6 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                     self_attn.kv_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.kv_lora_rank
                     ) ** 0.5
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = self.mapping.attn.tp_size
-        tp_rank = self.mapping.attn.tp_rank
-        for attn_idx, scaling_factor in _kv_cache_scales_loader(
-            quantization_param_path,
-            tp_rank,
-            tp_size,
-            self.config.num_hidden_layers * 2,
-            self.config.__class__.model_type,
-        ):
-            layer_idx, branch_idx = divmod(attn_idx, 2)
-            if not isinstance(self.model.layers[layer_idx], nn.Identity):
-                self_attn = self.model.layers[layer_idx].self_attn[branch_idx]
-                for attn in (self_attn.attn_mha, self_attn.attn_mqa):
-                    if attn is not None and hasattr(attn, "k_scale"):
-                        attn.k_scale = scaling_factor
-                        attn.k_scale_float = scaling_factor
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

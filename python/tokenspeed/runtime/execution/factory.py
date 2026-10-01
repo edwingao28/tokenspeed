@@ -32,9 +32,11 @@ from tokenspeed.runtime.execution.model_executor import (
     ModelExecutorConfig,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -75,7 +77,7 @@ def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
     return None
 
 
-def _wire_draft_to_target_model(
+def configure_draft_target(
     server_args: ServerArgs,
     model_runner: ModelRunner,
     draft_model_runner: ModelRunner,
@@ -86,9 +88,25 @@ def _wire_draft_to_target_model(
     budget, so weights the draft shares with the target (embed/LM head) are
     released before profiling instead of being double-counted.
     """
-    DrafterImpl = get_drafter_impl(
-        server_args.speculative_algorithm, draft_model_runner.model
-    )
+    draft_model = draft_model_runner.model
+    DrafterImpl = get_drafter_impl(server_args.speculative_algorithm, draft_model)
+    if (
+        draft_model_runner.model_config.requires_request_token_history
+        and not DrafterImpl.supports_request_token_history
+    ):
+        raise NotImplementedError(
+            f"draft model requires request-token history, but drafter "
+            f"{DrafterImpl.__name__} does not thread it through its forwards"
+        )
+    if server_args.speculative_algorithm in ("DFLASH", "DSPARK"):
+        if not isinstance(draft_model, TargetCaptureConfigurator):
+            raise TypeError(
+                f"{type(draft_model).__name__} must implement TargetCaptureConfigurator "
+                f"for {server_args.speculative_algorithm}."
+            )
+        draft_model.configure_target(
+            model_runner.model, model_runner.model_config.hf_text_config
+        )
     if DrafterImpl.shares_target_embed_head:
         embed, head = model_runner.model.get_embed_and_head()
         draft_model = draft_model_runner.model
@@ -120,24 +138,26 @@ def create_model_runner(
     global_rank: int,
 ):
     """Create the main model runner and optional draft model runner."""
-    model_runner = ModelRunner(
-        model_config=model_config,
-        gpu_id=gpu_id,
-        server_args=server_args,
-        global_rank=global_rank,
-    )
-
-    draft_model_runner = None
-    if draft_model_config is not None:
-        draft_model_runner = ModelRunner(
-            model_config=draft_model_config,
+    with startup_phase("weights.target", rank=global_rank):
+        model_runner = ModelRunner(
+            model_config=model_config,
             gpu_id=gpu_id,
             server_args=server_args,
             global_rank=global_rank,
-            is_draft_worker=True,
         )
+
+    draft_model_runner = None
+    if draft_model_config is not None:
+        with startup_phase("weights.draft", rank=global_rank):
+            draft_model_runner = ModelRunner(
+                model_config=draft_model_config,
+                gpu_id=gpu_id,
+                server_args=server_args,
+                global_rank=global_rank,
+                is_draft_worker=True,
+            )
         if server_args.speculative_algorithm is not None:
-            _wire_draft_to_target_model(server_args, model_runner, draft_model_runner)
+            configure_draft_target(server_args, model_runner, draft_model_runner)
 
     return model_runner, draft_model_runner
 

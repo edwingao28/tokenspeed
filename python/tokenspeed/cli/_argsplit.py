@@ -78,6 +78,8 @@ _HEADLESS_FLAG = "--headless"
 _ENGINE_MULTI_VALUE_FLAGS = {
     "--cudagraph-capture-sizes",
     "--prefill-graph-capture-sizes",
+    "--prefill-graph-capture-token-sizes",
+    "--prefill-graph-capture-batch-sizes",
 }
 
 
@@ -93,7 +95,7 @@ def _has_model_flag(tokens: Iterable[str]) -> bool:
 
 @dataclass
 class OrchestratorOpts:
-    engine_startup_timeout: int = 1800
+    engine_startup_timeout: int = 3600
     gateway_startup_timeout: int = 60
     drain_timeout: int = 30
     control_port: int | None = None

@@ -108,7 +108,7 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
 
     prefill.get_config = forced
     try:
-        out = prefill.gluon_mha_prefill_gfx1250(
+        out = prefill.launch_gluon_mha_prefill_gfx1250(
             q, k, v, cu, cu_cpu, max_seqlen, window_left=window_left
         )
     finally:
@@ -122,6 +122,36 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
     assert out.shape == q.shape
     assert not torch.isnan(out).any()
     expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_mha_prefill_selects_deep_pipeline(dtype, head_dim):
+    """Check that a full, sufficiently occupied launch selects the deep path."""
+    device = "cuda"
+    seqlens = [2048] * 4 if head_dim == 64 else [1024] * 8
+    n_q_heads, n_kv_heads = 8, 1
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_selector = prefill._select_deep_pipeline
+    selected = []
+
+    def capture_selection(**kwargs):
+        result = original_selector(**kwargs)
+        selected.append(result)
+        return result
+
+    prefill._select_deep_pipeline = capture_selection
+    try:
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill._select_deep_pipeline = original_selector
+
+    assert selected == [True]
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
 
 
@@ -145,6 +175,43 @@ def test_select_llvm_fn_attrs():
         prefill._select_llvm_fn_attrs(head_dim=128, max_seqlen=4096, window_left=512)
         == ""
     )
+
+
+def test_select_deep_pipeline():
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "head_dim": 128,
+        "block_m": 256,
+        "block_n": 64,
+        "num_warps": 8,
+        "num_buffers": 2,
+        "window_left": -1,
+        "workgroups": 256,
+        "min_positive_seqlen": 129,
+        "seqlens": [4096] * 4,
+        "max_seqlen": 4096,
+    }
+    assert prefill._select_deep_pipeline(**kwargs)
+    assert prefill._select_deep_pipeline(
+        **(kwargs | {"dtype": torch.float16, "head_dim": 64})
+    )
+    short_kwargs = kwargs | {
+        "min_positive_seqlen": 1024,
+        "seqlens": [1024] * 8,
+        "max_seqlen": 1024,
+    }
+    assert prefill._select_deep_pipeline(**short_kwargs)
+    assert not prefill._select_deep_pipeline(**(short_kwargs | {"head_dim": 64}))
+
+    for override in (
+        {"dtype": torch.float8_e4m3fn},
+        {"block_m": 128},
+        {"window_left": 64},
+        {"workgroups": 255},
+        {"seqlens": [4096, 3840]},
+        {"seqlens": [4097] * 4, "max_seqlen": 4097},
+    ):
+        assert not prefill._select_deep_pipeline(**(kwargs | override))
 
 
 def test_select_tdm_warp_hint():
@@ -202,7 +269,7 @@ def test_mha_prefill_reverse_counts_live_ragged_workgroups():
 
     prefill._select_reverse_q_blocks = capture_workgroups
     try:
-        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
     finally:
         prefill._select_reverse_q_blocks = original_order
 
@@ -236,9 +303,11 @@ def test_mha_prefill_tdm_warp_hint_remainder():
     prefill.get_config = forced_config
     try:
         prefill._select_tdm_warp_hint = lambda **_kwargs: False
-        control = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        control = prefill.launch_gluon_mha_prefill_gfx1250(
+            q, k, v, cu, cu_cpu, max_seqlen
+        )
         prefill._select_tdm_warp_hint = lambda **_kwargs: True
-        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
     finally:
         prefill.get_config = original_config
         prefill._select_tdm_warp_hint = original_hint
@@ -273,9 +342,11 @@ def test_mha_prefill_reverse_q_blocks_ragged():
     prefill.get_config = forced_config
     try:
         prefill._select_reverse_q_blocks = lambda **_kwargs: False
-        control = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        control = prefill.launch_gluon_mha_prefill_gfx1250(
+            q, k, v, cu, cu_cpu, max_seqlen
+        )
         prefill._select_reverse_q_blocks = lambda **_kwargs: True
-        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
     finally:
         prefill.get_config = original_config
         prefill._select_reverse_q_blocks = original_order

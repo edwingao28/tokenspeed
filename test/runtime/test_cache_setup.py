@@ -1,8 +1,13 @@
+import os
+import sys
 from dataclasses import fields, replace
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
 
 import tokenspeed.runtime.layers.attention.kv_cache.mha as mha_cache
 from tokenspeed.runtime.cache.transfer.layout import (
@@ -44,6 +49,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
+
+register_cuda_ci(
+    est_time=10,
+    suite="runtime-1gpu",
+    nightly=False,
+    disabled=None,
+    disabled_on_runners=None,
+    disabled_on_runners_reason=None,
+)
 
 
 def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
@@ -141,6 +155,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
         windows=None,
         extra_state_group=None,
         cache_budget_bytes=2_048,
+        probe_batch_rows=None,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -154,6 +169,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
             draft_model_config=None,
             draft_attn_config=None,
             cache_budget_bytes=cache_budget_bytes,
+            probe_batch_rows=probe_batch_rows,
             decode_input_tokens=1,
             overlap_schedule_depth=0,
             **kwargs,
@@ -200,6 +216,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
                     sliding_window_tokens=None,
                     family="state",
                     checkpoint_granularity=self.prefix_granularity,
+                    replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
             ),
@@ -293,6 +310,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=16_384,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -371,6 +389,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         draft_model_config=SimpleNamespace(num_attention_layers=1),
         draft_attn_config=draft_config,
         cache_budget_bytes=16_384,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -436,6 +455,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         ),
         draft_attn_config=draft_config,
         cache_budget_bytes=1 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -474,12 +494,25 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 
-def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
+@pytest.mark.parametrize(
+    ("full_layers", "sliding_layers", "usable_pages"),
+    ((2, 0, 15), (1, 4, 7)),
+)
+def test_ordinary_mha_reserves_null_parent_within_cache_budget(
+    full_layers: int, sliding_layers: int, usable_pages: int
+) -> None:
     model_config = SimpleNamespace(
-        num_attention_layers=2,
+        num_attention_layers=full_layers + sliding_layers,
         hf_config=SimpleNamespace(),
     )
     attn_config = _mha_config()
+    mha = replace(
+        attn_config.component(MHAConfig),
+        cache_layer_types=(FULL_ATTENTION,) * full_layers
+        + ("sliding_attention",) * sliding_layers,
+        sliding_window_tokens=512,
+    )
+    attn_config = replace(attn_config, components=(mha,))
     server_args = SimpleNamespace(max_total_tokens=None)
 
     setup = prepare_cache_setup(
@@ -490,24 +523,27 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=16_384,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
 
     assert setup.spec.family == "mha"
     assert setup.spec.memory_plan.prefix_granularity == 64
-    assert setup.spec.memory_plan.num_lcm_blocks == 15
+    assert setup.spec.memory_plan.num_lcm_blocks == usable_pages
     assert setup.spec.memory_plan.arena_bytes <= 16_384
-    assert setup.spec.token_capacity == 960
+    assert setup.spec.token_capacity == usable_pages * 64
     assert setup.num_draft_layers == 0
-    pool = _pool_over_new_arena(setup.spec, attn_config, num_layers=2)
+    pool = _pool_over_new_arena(
+        setup.spec, attn_config, num_layers=model_config.num_attention_layers
+    )
     assert type(pool) is MHATokenToKVPool
     assert pool.arena.runtime_contract.token_capacity == setup.spec.token_capacity
     with pytest.raises(TypeError, match="incompatible with MHAConfig"):
         _pool_over_new_arena(
             replace(setup.spec, family="kimi_k3"),
             attn_config,
-            num_layers=2,
+            num_layers=model_config.num_attention_layers,
         )
 
 
@@ -527,6 +563,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=24_576,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -568,6 +605,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         draft_model_config=draft_model_config,
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=65_536,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -680,12 +718,21 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family,
     )
 
-    assert _resolve_heterogeneous_draft_family("mla", "mha") == "mha"
-    assert _resolve_heterogeneous_draft_family("kimi_k3", "mla") == "mla"
+    assert (
+        _resolve_heterogeneous_draft_family("mla", "mha", draft_family_declared=False)
+        == "mha"
+    )
+    assert (
+        _resolve_heterogeneous_draft_family(
+            "kimi_k3", "mla", draft_family_declared=False
+        )
+        == "mla"
+    )
     with pytest.raises(RuntimeError, match="require an MHA draft"):
-        _resolve_heterogeneous_draft_family("mha", "mla")
+        _resolve_heterogeneous_draft_family("mha", "mla", draft_family_declared=False)
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):
         _create_draft_components(
+            backend=None,
             server_args=None,
             model_config=SimpleNamespace(num_attention_layers=1),
             config=object(),
@@ -694,8 +741,7 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
             num_target_layers=1,
             full_attn_backend_name=None,
             is_heterogeneous=True,
-            is_hybrid_linear=True,
-            is_kda=False,
+            linear_attention="gdn",
             is_inkling=False,
         )
 
@@ -719,13 +765,15 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
         hf_config=SimpleNamespace(
             architectures=("LlamaForCausalLM",),
             is_deepseek_v4=False,
-        )
+        ),
+        model_profile=None,
     )
     draft = SimpleNamespace(
         hf_config=SimpleNamespace(
             architectures=("DeepseekV4ForCausalLMNextN",),
             is_deepseek_v4=True,
-        )
+        ),
+        model_profile=None,
     )
 
     with pytest.raises(NotImplementedError, match="target-only"):
@@ -736,6 +784,11 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
             rank=0,
             gpu_memory=0,
             draft_model_config=draft,
+            graph_reserve_bytes=0,
+            probe_batch_rows=None,
+            profiled_cache_bytes=None,
+            reuse_target_backend=None,
+            reuse_draft_backend=None,
         )
 
 
@@ -778,6 +831,7 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         num_draft_layers=2,
         windows=(None, None, 8),
         cache_budget_bytes=4_096,
+        probe_batch_rows=None,
     ).setup()
 
     # One big model: both draft layers are continuation layers (global
@@ -800,8 +854,9 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     conversion carry them with their natural retention — the C++ side
     instantiates its existing SwaManager for them, no draft concept
     anywhere."""
+    from test.runtime.cache_pool_test_utils import MinimalCacheView
+
     import torch
-    from cache_pool_test_utils import MinimalCacheView
 
     from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups
 
@@ -811,6 +866,7 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
         num_draft_layers=2,
         windows=(None, None, 8),
         cache_budget_bytes=4_096,
+        probe_batch_rows=None,
     ).setup()
     pool = MinimalCacheView(
         CacheArena(
@@ -844,7 +900,7 @@ def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
     REJECTED rather than offset a second time -- silently addressing another
     model's planes is how the KV of two models gets crossed.
     """
-    from cache_pool_test_utils import MinimalCacheView
+    from test.runtime.cache_pool_test_utils import MinimalCacheView
 
     class _Window(MinimalCacheView):
         """Just a layer window: the subject is _field_layer_id's arithmetic."""
@@ -930,3 +986,148 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
 
     assert usable_pages == 15
     assert (usable_pages + 1) * 64 * 16 <= 16_384
+
+
+@pytest.mark.parametrize(
+    "target_backend,draft_backend,error",
+    [
+        (None, None, None),
+        ("tokenspeed_mla", None, None),
+        (None, "tokenspeed_mla", None),
+        ("trtllm_mla", None, "does not support MLA DCP"),
+        (None, "trtllm_mla", "DCP currently requires"),
+        (None, "flashmla", "does not yet support speculation"),
+    ],
+)
+def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
+    monkeypatch, target_backend, draft_backend, error
+):
+    from test.runtime.conftest import kimi_recipe
+
+    from tokenspeed.runtime.layers.attention import registry
+    from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+
+    base = kimi_recipe(tp_size=8).attn_config
+    args = SimpleNamespace(
+        attention_backend=target_backend,
+        drafter_attention_backend=draft_backend,
+        decode_context_parallel_size=2,
+        disaggregation_mode="null",
+        mapping=SimpleNamespace(world_size=8, world_group=tuple(range(8))),
+        gpu_memory_utilization=0.9,
+    )
+    target = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+        model_profile=None,
+        attention_arch=registry.AttentionArch.MLA,
+    )
+    draft = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["KimiK3ForConditionalGenerationNextN"]
+        ),
+        model_profile=None,
+    )
+    built_draft = []
+
+    def create_config(server_args, model, is_draft=False):
+        name = (
+            server_args.drafter_attention_backend
+            if is_draft
+            else server_args.attention_backend
+        )
+        components = (replace(base.components[0], backend_name=name),)
+        config = replace(
+            base,
+            device="cuda",
+            dcp_size=2,
+            dcp_group=(0, 1),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            is_draft=is_draft,
+            components=components if is_draft else components + base.components[1:],
+        )
+        if is_draft:
+            built_draft.append(config)
+        return config
+
+    class ReadyForAllocation(Exception):
+        pass
+
+    def profile(**kwargs):
+        config = kwargs["attn_config"]
+        assert config.component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        assert (
+            built_draft[0].component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        )
+        raise ReadyForAllocation
+
+    monkeypatch.setattr(
+        registry, "current_platform", lambda: SimpleNamespace(is_amd=False)
+    )
+
+    # This test resolves NVIDIA backend capabilities without constructing them.
+    # Their modules are not registered on AMD hosts.
+    class DCPBackend(AttentionBackend):
+        supports_mla_dcp = True
+
+    for name in ("tokenspeed_mla", "flashmla"):
+        monkeypatch.setitem(
+            registry._BACKEND_REGISTRY,
+            name,
+            ({registry.AttentionArch.MLA}, DCPBackend),
+        )
+    monkeypatch.setattr(registry, "_create_attn_config", create_config)
+    monkeypatch.setattr(registry, "profile_available_cache_memory_bytes", profile)
+    expected = (
+        pytest.raises(ValueError, match=error)
+        if error
+        else pytest.raises(ReadyForAllocation)
+    )
+    with expected:
+        registry.create_attn_components(
+            args,
+            target,
+            gpu_id=0,
+            rank=0,
+            gpu_memory=0,
+            draft_model_config=draft,
+            graph_reserve_bytes=0,
+            probe_batch_rows=None,
+            profiled_cache_bytes=None,
+            reuse_target_backend=None,
+            reuse_draft_backend=None,
+        )
+    if draft_backend is not None:
+        assert args.drafter_attention_backend == draft_backend
+
+
+@pytest.mark.parametrize("degree", [1, 2])
+def test_kimi_dspark_rejects_sharded_context_writes(degree):
+    from tokenspeed.runtime.layers.attention import registry
+
+    def side(architecture):
+        return registry._resolve_attn_side(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=[architecture]),
+                model_profile=None,
+            ),
+            "tokenspeed_mla",
+        )
+
+    args = SimpleNamespace(
+        attention_backend="tokenspeed_mla",
+        drafter_attention_backend="tokenspeed_mla",
+        decode_context_parallel_size=degree,
+    )
+    target = side("KimiK3ForConditionalGeneration")
+    draft = side("K3DSparkModel")
+    if degree > 1:
+        with pytest.raises(ValueError, match="K3 DSpark does not support DCP"):
+            registry._apply_backend_overrides(args, target, draft)
+    else:
+        registry._apply_backend_overrides(args, target, draft)
+        assert args.drafter_attention_backend == "tokenspeed_mla"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

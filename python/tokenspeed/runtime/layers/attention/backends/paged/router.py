@@ -52,7 +52,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    reject_bounded_replay,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -69,6 +72,8 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+_PREWRITTEN = "paged attention KV is written by the prologue before core attention"
 
 
 @dataclass(frozen=True)
@@ -178,7 +183,7 @@ class CacheGroupRouter(AttentionBackend):
         self._stacks: GroupTableStacks | None = None
         self._decode_views: dict[tuple[int, int], RouterDecodeWriteLocations] = {}
         # Published write locations: the decode slot (graph-recorded views,
-        # refreshed in place) and the extend slot (fresh per round).
+        # refreshed in place) and the extend span (the stack's buffer, or fresh past it).
         self.decode_write_locations: RouterDecodeWriteLocations | None = None
         self._extend_write_locations: dict[str, torch.Tensor] | None = None
         self._decode_request_offset = 0
@@ -247,8 +252,18 @@ class CacheGroupRouter(AttentionBackend):
         super()._publish_cache_pool(cache_pool)
 
     def configure_runtime(self, **kwargs) -> None:
-        for leaf in self.leaves.values():
-            leaf.configure_runtime(**kwargs)
+        specs = {
+            spec.group_id: spec for spec in self.cache_pool.arena.cache_group_specs
+        }
+        for group_id, leaf in self.leaves.items():
+            leaf.configure_runtime(
+                block_granularity=self.geometry.granularity_of(group_id),
+                shard_count=specs[group_id].shard_count,
+                virtual_block_count=self.cache_pool.arena.runtime_contract.virtual_block_counts[
+                    group_id
+                ],
+                **kwargs,
+            )
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():
@@ -308,11 +323,11 @@ class CacheGroupRouter(AttentionBackend):
         unconditionally at wrapper construction so eager decode refreshes the
         same buffers a graph would.
         """
-        del kwargs
         self._stacks = GroupTableStacks(
             self._table_specs(),
             max_bs=max_bs,
             max_tokens_per_req=self.spec_num_tokens,
+            max_extend_tokens=int(kwargs.get("max_extend_tokens", 0)),
             device=self.device,
         )
         self._decode_views = {}
@@ -425,18 +440,45 @@ class CacheGroupRouter(AttentionBackend):
             )
         return self._extend_write_locations[gid]
 
-    def _forward_decode_write_locations(self, layer: PagedAttention) -> torch.Tensor:
-        """Include EXTEND rows when draft step 0 locally dispatches as DECODE."""
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """The forward's rows padded with the dummy slot 0 to the rows a
+        graph-padded forward carries: the extend span, then a MIXED round's
+        decode rows, then the stack buffer's zero tail; decode rows carry their
+        own slots. A forward wider than the buffer runs eager and gets a fresh
+        tensor."""
+        locations = self.forward_write_locations(layer, forward_mode)
+        if locations.numel() == rows:
+            return locations
+        if not forward_mode.is_extend_or_mixed():
+            raise ValueError(
+                f"{locations.numel()} {forward_mode.name.lower()} write slots for {rows} rows"
+            )
+        return self.stacks.padded_extend_span(layer.group_id, rows)
+
+    def _append_decode_rows(self, bs: int, num_extends: int) -> None:
+        """A MIXED round's decode rows follow its extend span in the padded span."""
+        n = self._decode_tokens_per_req
+        self.stacks.append_decode_rows(num_extends * n, (bs - num_extends) * n)
+
+    def forward_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """A draft step 0 over a MIXED round carries the extend rows and then the
+        decode rows, whether it dispatches as MIXED or locally as DECODE."""
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-        decode_locations = self.write_locations(layer, ForwardMode.DECODE)
-        if (
-            not self.is_draft
-            or self._decode_request_offset == 0
-            or self._extend_write_locations is None
-        ):
-            return decode_locations
+        mixed_draft_step_zero = (
+            (forward_mode.is_decode() or forward_mode.is_mixed())
+            and self.is_draft
+            and self._decode_request_offset != 0
+            and self._extend_write_locations is not None
+        )
+        if not mixed_draft_step_zero:
+            return self.write_locations(layer, forward_mode)
         extend_locations = self._extend_write_locations[layer.group_id]
+        decode_locations = self.write_locations(layer, ForwardMode.DECODE)
         if decode_locations.numel() == 0:
             return extend_locations
         return torch.cat((extend_locations, decode_locations))
@@ -470,6 +512,8 @@ class CacheGroupRouter(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
@@ -482,6 +526,8 @@ class CacheGroupRouter(AttentionBackend):
         or chunked prefix) travels with the extend lengths: leaves size their
         paged-prefix metadata by it, so it must reach them unchanged.
         """
+        del extend_prompt_lens_cpu
+        reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
         del kwargs
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()
@@ -506,6 +552,7 @@ class CacheGroupRouter(AttentionBackend):
             # sliced.
             self._refresh_decode_locations(bs, seq_lens)
             self._decode_request_offset = num_extends
+            self._append_decode_rows(bs, num_extends)
         for gid, leaf in self.leaves.items():
             leaf.init_forward_metadata(
                 bs,
@@ -549,6 +596,8 @@ class CacheGroupRouter(AttentionBackend):
         # targets).
         self._decode_request_offset = num_extends
         self._refresh_decode_locations(bs, seq_lens)
+        if num_extends and self._extend_write_locations is not None:
+            self._append_decode_rows(bs, num_extends)
         for gid, leaf in self.leaves.items():
             leaf.refresh_decode_metadata(
                 bs,
@@ -721,17 +770,14 @@ class CacheGroupRouter(AttentionBackend):
                 stack.enter_context(leaf.override_num_extends(num_extends))
             yield
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         return all(
-            leaf.support_kv_cache_prewrite(forward_mode)
+            leaf.supports_narrowed_draft_decode(forward_mode)
             for leaf in self.leaves.values()
         )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    def cache_placement(self, layer):
+        return self._leaf_for(layer).cache_placement(layer)
 
     @break_point
     def forward(
@@ -743,23 +789,17 @@ class CacheGroupRouter(AttentionBackend):
         token_to_kv_pool: CachePool,
         forward_mode: ForwardMode,
         bs: int,
-        save_kv_cache: bool = True,
+        save_kv_cache: bool,
         record_kv_cache: bool | None = None,
         **kwargs,
     ):
-        # NOTE: deliberately no ambient-ctx override here (unlike the
-        # layer-id composites): a MIXED round's model code dispatches its
-        # extend and decode halves through sub-contexts whose mode this
-        # forward must honor; the outer ambient mode would clobber them.
-        # Under a prefill-graph replay the frozen forward_mode scalar is
-        # always EXTEND, which is also the live mode.
+        # No ambient-ctx override: a MIXED round's halves pass sub-context modes this must honor.
+        assert not save_kv_cache, _PREWRITTEN
         leaf = self._leaf_for(layer)
-        out_cache_loc = (
-            self._forward_decode_write_locations(layer)
-            if forward_mode.is_decode()
-            else self.write_locations(layer, forward_mode)
-        )
-        with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
+        out_cache_loc = self.forward_write_locations(layer, forward_mode)
+        with self.record_pd_cache_step(
+            forward_mode, writes_in_call=False, record_kv_cache=record_kv_cache
+        ):
             if forward_mode.is_decode():
                 return leaf.forward_decode(
                     q,
@@ -769,7 +809,6 @@ class CacheGroupRouter(AttentionBackend):
                     out_cache_loc,
                     token_to_kv_pool,
                     bs,
-                    save_kv_cache=save_kv_cache,
                     **kwargs,
                 )
             return leaf.forward_extend(
@@ -780,7 +819,6 @@ class CacheGroupRouter(AttentionBackend):
                 out_cache_loc,
                 token_to_kv_pool,
                 bs,
-                save_kv_cache=save_kv_cache,
                 forward_mode=forward_mode,
                 **kwargs,
             )
@@ -793,12 +831,15 @@ class CacheGroupRouter(AttentionBackend):
         layer,
         token_to_kv_pool,
         bs,
-        save_kv_cache=True,
+        save_kv_cache: bool,
         **kwargs,
     ):
         """Composite hosts (hybrid GDN/KDA) dispatch decode directly."""
+        assert not save_kv_cache, _PREWRITTEN
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
         leaf = self._leaf_for(layer)
-        out_cache_loc = self._forward_decode_write_locations(layer)
+        out_cache_loc = self.forward_write_locations(layer, ForwardMode.DECODE)
         return leaf.forward_decode(
             q,
             k,
@@ -807,7 +848,6 @@ class CacheGroupRouter(AttentionBackend):
             out_cache_loc,
             token_to_kv_pool,
             bs,
-            save_kv_cache=save_kv_cache,
             **kwargs,
         )
 
@@ -819,11 +859,12 @@ class CacheGroupRouter(AttentionBackend):
         layer,
         token_to_kv_pool,
         bs,
-        save_kv_cache=True,
+        save_kv_cache: bool,
         forward_mode=None,
         **kwargs,
     ):
         """Composite hosts dispatch extend directly."""
+        assert not save_kv_cache, _PREWRITTEN
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
         leaf = self._leaf_for(layer)
@@ -836,7 +877,6 @@ class CacheGroupRouter(AttentionBackend):
             out_cache_loc,
             token_to_kv_pool,
             bs,
-            save_kv_cache=save_kv_cache,
             forward_mode=forward_mode,
             **kwargs,
         )

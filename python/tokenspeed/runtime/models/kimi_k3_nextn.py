@@ -54,7 +54,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
-    KimiLinearMoE,
+    create_kimi_linear_moe,
     sigmoid_mul,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -91,11 +91,13 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
             )
             gate = None
             absorbed_query = None
+        expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(
             positions,
             q,
             latent_cache,
             ctx,
+            expanded=expanded,
             absorbed_query=absorbed_query,
         )
         if gate is not None:
@@ -144,7 +146,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
             reduce_attn_results=True,
             alt_stream=alt_stream,
         )
-        self.block_sparse_moe = KimiLinearMoE(
+        self.block_sparse_moe = create_kimi_linear_moe(
             config=config,
             mapping=mapping,
             layer_index=0,
@@ -212,6 +214,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             ctx=ctx,
+            prefix_is_sharded=False,
         )
         return prefix.view(residual.shape)
 

@@ -60,6 +60,7 @@ if TYPE_CHECKING:
         AttnConfig,
         SoftmaxAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -124,6 +125,10 @@ class CachePoolBinding:
         """A node's own binding work: read the old pool before super(), use the new one after."""
         self.cache_pool = cache_pool
 
+    def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
+        """Return logical-slot ownership, or None for local/replicated storage."""
+        return None
+
 
 class AttentionBackend(CachePoolBinding, ABC):
     """The runner-facing contract; see the module docstring.
@@ -135,6 +140,11 @@ class AttentionBackend(CachePoolBinding, ABC):
     # validation: every published family must have a consumer); composites
     # union their children's.
     cache_consumer_families: frozenset[str] = frozenset({"history"})
+    # Only backends whose model skips incomplete-prefill outputs opt in.
+    skips_incomplete_prefill_outputs: bool = False
+    # MLA sharded history reads/writes and global attention-partial merging,
+    # independent of whether the model also has linear-attention layers.
+    supports_mla_dcp: bool = False
     supports_mla_projected_value_decode: bool = False
     # Bound by register_step_counter (PD layerwise transfer); None otherwise.
     step_counter: StepCounter | None = None
@@ -177,6 +187,37 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
 
+    @property
+    def prefill_metadata_is_capture_ready(self) -> bool:
+        """Whether the current execution metadata supports a captured forward."""
+        return False
+
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        """Whether a captured prefill graph can include attention for this shape.
+
+        The question ``prepare_prefill_metadata`` answers on its way to doing
+        the work, asked on its own so a caller can decide before anything is
+        written. Must read no forward context and change nothing.
+        """
+        return False
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        """Prepare execution metadata before eager forward or graph replay.
+
+        ``capture`` only retains startup buffers at their captured addresses;
+        it must not select different computation. Returns the same answer as
+        :meth:`admits_prefill_graph`; the prefill capture raises if an override
+        refuses a shape that query admitted. Other backends keep
+        their existing metadata and attention breaks. Call on the consumer
+        stream, after the scheduler-derived metadata is built and before any
+        layer consumes it.
+        """
+        return self.admits_prefill_graph(token_capacity, bs, forward_mode)
+
     # ------------------------------------------------------------------
     # Metadata (docs/design/unified_path.md)
     # ------------------------------------------------------------------
@@ -210,6 +251,8 @@ class AttentionBackend(CachePoolBinding, ABC):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
@@ -229,6 +272,14 @@ class AttentionBackend(CachePoolBinding, ABC):
                 tables for every published group (placeholders on warmup).
             extend_*: ``[>= num_extends]`` per-request new-token / prefix
                 lengths and their pinned host mirrors (empty on idle warmup).
+            extend_replay_lens_cpu: ``[>= num_extends]`` host-only leading
+                input rows per request that re-feed cached prompt positions
+                (bounded replay). Positions ``[prefix, prefix + replay)``
+                regenerate replayable cache groups only; a node that cannot
+                honour that calls :func:`reject_bounded_replay`.
+            extend_prompt_lens_cpu: ``[>= num_extends]`` host-only whole
+                prompt lengths, so a node can tell the chunk that ends a
+                prompt from an intermediate one.
             extend_with_prefix: Whether any extend row continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero).
             **kwargs: Model-side extras (positions, capture mode, ...) a
@@ -335,9 +386,9 @@ class AttentionBackend(CachePoolBinding, ABC):
         same object whichever level of the tree they hold."""
         return self._sparse_topk
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        """Whether a narrowed draft step in a round of ``forward_mode`` can
+        attend its live rows as a DECODE dispatch (Eagle3's first step)."""
         return False
 
     # ------------------------------------------------------------------
@@ -374,12 +425,32 @@ class AttentionBackend(CachePoolBinding, ABC):
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for the requests the forward covers —
-        the one accessor for writers outside the backend (fused RoPE
-        prewrite, model-side MLA cache writes)."""
+        """This layer's KV write slots for one mode's requests: the EXTEND span
+        or the DECODE window."""
         raise NotImplementedError(
             f"{type(self).__name__} owns no paged write locations"
         )
+
+    def forward_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """Slots for the K/V rows a forward in ``forward_mode`` carries: the
+        attention prologue's write target."""
+        raise NotImplementedError(
+            f"{type(self).__name__} owns no paged write locations"
+        )
+
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """:meth:`forward_write_locations` widened to the ``rows`` a graph-padded
+        forward carries, the extra rows landing in the dummy slot 0, so the
+        prologue can be captured; a backend without a padded span serves exact
+        counts only."""
+        locations = self.forward_write_locations(layer, forward_mode)
+        if locations.numel() != rows:
+            raise ValueError(f"{locations.numel()} write slots for {rows} rows")
+        return locations
 
     # ------------------------------------------------------------------
     # PD / speculative side state
@@ -409,22 +480,22 @@ class AttentionBackend(CachePoolBinding, ABC):
     def record_pd_cache_step(
         self,
         forward_mode: ForwardMode,
-        save_kv_cache: bool,
+        writes_in_call: bool,
         record_kv_cache: bool | None,
     ):
-        """Anchor the PD layerwise cache-step record to the wrapped KV write:
-        before the attention call when the KV was pre-written
-        (``save_kv_cache=False``), after it otherwise. No-op without a step
+        """Anchor the PD layerwise cache-step record to the layer's last cache
+        write: after the wrapped call when it writes a cache field
+        (``writes_in_call``), before it otherwise. No-op without a step
         counter."""
         if record_kv_cache is None:
             record_cache = not forward_mode.is_decode() and not forward_mode.is_idle()
         else:
             record_cache = record_kv_cache
         record_cache = record_cache and self.step_counter is not None
-        if record_cache and not save_kv_cache:
+        if record_cache and not writes_in_call:
             self.step_counter.record_cache()
         yield
-        if record_cache and save_kv_cache:
+        if record_cache and writes_in_call:
             self.step_counter.record_cache()
 
     # ------------------------------------------------------------------
@@ -503,3 +574,21 @@ class AttentionBackend(CachePoolBinding, ABC):
         **kwargs,
     ):
         raise NotImplementedError()
+
+
+def reject_bounded_replay(extend_replay_lens_cpu: torch.Tensor, node: str) -> None:
+    """Fail loud when a forward re-feeds cached positions a node cannot mask.
+
+    Replayed rows must not rewrite the groups whose rows the prefix hit
+    already holds; only a backend that plans its writes around
+    ``extend_replay_lens_cpu`` may accept them.
+
+    Args:
+        extend_replay_lens_cpu: ``[num_extends]`` host replay lengths.
+        node: Backend name for the diagnostic.
+    """
+    if extend_replay_lens_cpu.numel() and bool((extend_replay_lens_cpu != 0).any()):
+        raise RuntimeError(
+            f"{node} cannot mask bounded-replay rows; its cache groups must not "
+            "be replayable"
+        )

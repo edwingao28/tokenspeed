@@ -73,7 +73,7 @@ class LoadConfig:
     ignore_patterns: list[str] | str | None = None
     decryption_key_file: str | None = None
     weight_loader_prefetch_checkpoints: bool = True
-    weight_loader_prefetch_num_threads: int = 4
+    weight_loader_prefetch_num_threads: int = 8
 
     ext_yaml: str | None = None
 
@@ -85,8 +85,8 @@ class LoadConfig:
 
         if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
             logger.info(
-                "Ignoring the following patterns when downloading weights: %s",
-                self.ignore_patterns,
+                "Ignoring the following patterns when downloading weights: "
+                f"{self.ignore_patterns!s}",
             )
         else:
             self.ignore_patterns = ["original/**/*"]

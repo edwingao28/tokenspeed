@@ -64,6 +64,8 @@ class CommBackend(ABC):
         producer_direct_max_numel: int,
         attnres_max_numel: int,
         attnres_max_rows: int,
+        enable_lamport: bool,
+        moe_tail_max_rows: int,
         dtype: torch.dtype,
     ) -> bool:
         """Return false when the backend has no persistent buffers to prepare."""

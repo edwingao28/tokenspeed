@@ -32,6 +32,10 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     TransferInfo,
     TransferKVChunk,
 )
+from tokenspeed.runtime.pd.mooncake.pack import (  # noqa: E402
+    PageFieldCopies,
+    flatten_transfer_blocks,
+)
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 from tokenspeed.runtime.pd.transfer_plan import CacheTransferFragment  # noqa: E402
 
@@ -228,21 +232,60 @@ def _recording_transfer_manager(layout: CacheTransferContract, src_ptr: int):
     calls = []
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.kv_args = SimpleNamespace(cache_layout=layout, kv_data_ptr=src_ptr)
+
+    # Whole-field descriptors arrive as int64 array columns, fragment rows as
+    # lists; record both as plain lists so the geometry asserts read the same.
+    # The fake engine records per-descriptor WRITEs as lists and expands the
+    # page-gathered WRITE the way Mooncake does (field-major, batched), so the
+    # geometry asserts read the same for both.
+    def record_pages(session, src_pages, dst_pages, fields, *, max_batch_size):
+        src, dst, lengths = zip(
+            *_expand_page_fields(src_pages, dst_pages, fields), strict=True
+        )
+        for start in range(0, len(src), max_batch_size):
+            stop = start + max_batch_size
+            calls.append(
+                (
+                    session,
+                    list(src[start:stop]),
+                    list(dst[start:stop]),
+                    list(lengths[start:stop]),
+                )
+            )
+        return 0
+
     manager.engine = SimpleNamespace(
         batch_transfer_sync=lambda session, src, dst, lengths: (
-            calls.append((session, src, dst, lengths)) or 0
-        )
+            calls.append((session, list(src), list(dst), list(lengths))) or 0
+        ),
+        batch_transfer_sync_pages=record_pages,
     )
     return manager, calls
+
+
+def _expand_page_fields(src_pages, dst_pages, fields) -> list[tuple[int, int, int]]:
+    """Reference expansion of a PageFieldCopies grid, field-major."""
+    return [
+        (
+            int(src_base + page * src_stride),
+            int(dst_base + peer * dst_stride),
+            int(length),
+        )
+        for src_base, src_stride, dst_base, dst_stride, length in fields.tolist()
+        for page, peer in zip(src_pages.tolist(), dst_pages.tolist(), strict=True)
+    ]
 
 
 def _route_manager():
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     manager = object.__new__(MooncakeKVManagerPrefill)
+    layout = _typed_layout(local_heads=4, global_heads=4)
     manager.kv_args = SimpleNamespace(
-        cache_layout=_typed_layout(local_heads=4, global_heads=4),
+        cache_layout=layout,
         kv_data_ptr=0x1000,
+        # A single stage owns every field, as a non-PP prefill declares.
+        cache_fields_by_stage=(tuple(field.field_id for field in layout.plan.fields),),
     )
     manager.topology = _topology()
     return manager
@@ -452,6 +495,12 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
         0,
         "mlx5_0",
         pool,
+        draft_model_config=None,
+        cache_fields_by_stage=(tuple(field.field_id for field in layout.plan.fields),),
+        producer_fields_by_step=tuple(
+            (field.field_id,) for field in layout.plan.fields
+        ),
+        logical_plan=None,
         model_config=SimpleNamespace(
             num_attention_layers=2,
             num_key_value_heads=1,
@@ -471,8 +520,10 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
     )
 
 
+@pytest.mark.parametrize("remote_hits", [0, 1, 4])
 def test_terminal_events_clear_transport_room_state(
     monkeypatch: pytest.MonkeyPatch,
+    remote_hits: int,
 ) -> None:
     from tokenspeed.runtime.pd import decode_executor as decode_module
     from tokenspeed.runtime.pd.base.status import TransferPoll
@@ -491,13 +542,19 @@ def test_terminal_events_clear_transport_room_state(
         expected_prefill_ranks_table={9: frozenset({0})},
         bootstrap_token_table={9: 42},
         spec_candidate_ids_table={9: [1]},
-        _pending_bootstrap_token_table={9: 42},
-        _pending_spec_candidate_ids_table={9: [1]},
+        cached_tokens_table={9: remote_hits},
+        _pending_bootstrap_token_table={},
+        _pending_spec_candidate_ids_table={},
         connection_lock=nullcontext(),
         addr_to_rooms_tracker={"bootstrap": {9}},
-        pop_prefill_metadata=lambda _room: (-1, None),
+    )
+    from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
+
+    decode_manager.pop_prefill_metadata = lambda room: (
+        MooncakeKVManagerDecode.pop_prefill_metadata(decode_manager, room)
     )
     receiver = object.__new__(MooncakeKVReceiver)
+    receiver.prefill = lambda *, block_manifest: None
     receiver.kv_mgr = decode_manager
     receiver.bootstrap_room = 9
     receiver.bootstrap_addr = "bootstrap"
@@ -506,12 +563,24 @@ def test_terminal_events_clear_transport_room_state(
     decode.gloo_group = None
     decode._local_states = {"request": TransferPoll.Bootstrapped}
     decode.kv_manager = decode_manager
-    decode._request_pool_indices = {"request": 7}
+    decode._admissions = {}
     decode._remote_cache_slots = {}
+    decode._remote_cached_tokens = {}
     decode._remote_spec_candidate_ids = {}
+    decode.cache_layout = _layout()
+    admission = _op()
+    admission.request_ids = ["request"]
+    decode._cache_prefill(admission)
 
     assert len(decode.generate_events()) == 1
     assert decode.pop_remote_cache_slot("request") == 7
+    assert decode.pop_remote_cached_tokens("request") == max(2, remote_hits)
+    assert decode.pop_remote_spec_candidate_ids("request") == (7, [1])
+    assert decode._admissions == {}
+    assert decode._remote_cache_slots == {}
+    assert decode._remote_cached_tokens == {}
+    assert decode._remote_spec_candidate_ids == {}
+    assert decode_manager.cached_tokens_table == {}
     assert decode.receivers == {}
     assert decode_manager.request_status == {}
     assert decode_manager.expected_prefill_ranks_table == {}
@@ -527,6 +596,7 @@ def test_terminal_cleanup_wakes_prefill_metadata_waiter() -> None:
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.bootstrap_token_cond = threading.Condition()
     manager.prefill_metadata = {}
+    manager.cached_tokens = {}
     manager.transfer_infos = {9: {}}
     manager.request_status = {9: TransferPoll.WaitingForInput}
     result = []
@@ -554,7 +624,7 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     executor = object.__new__(decode_module.DisaggDecodeExecutor)
     executor.cache_layout = _layout()
     executor.receivers = {"request-0": receiver}
-    executor._request_pool_indices = {}
+    executor._admissions = {}
 
     executor._cache_prefill(_op())
 
@@ -562,7 +632,7 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     args, kwargs = calls[0]
     assert args == ()
     assert kwargs["block_manifest"].groups[0].block_ids == (2, 3)
-    assert executor._request_pool_indices == {"request-0": 7}
+    assert executor._admissions == {"request-0": (7, 2)}
 
 
 def test_prefill_submits_manifest_through_contract_sender() -> None:
@@ -709,6 +779,194 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
             [8, 8],
         )
     ]
+
+
+def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
+    # Two fields and hundreds of pages: the generator resolves each field's
+    # geometry once and expands pages in bulk, so check it against the plain
+    # per-page formula in both the whole-field and the fragment path.
+    def two_field_layout(capacity: int):
+        return make_layout(
+            make_group(
+                "history",
+                make_segment("layer.0.k", dtype="bfloat16", shape=(2, 4, 2)),
+                make_segment("layer.1.k", dtype="bfloat16", shape=(2, 4, 2)),
+            ),
+            capacity=capacity,
+            page_bytes=64,
+        )
+
+    source_layout = two_field_layout(700)
+    destination_layout = two_field_layout(900)
+    pages = 300
+    src_pages = tuple(range(1, 2 * pages, 2))
+    dst_pages = tuple(range(899, 899 - 2 * pages, -2))
+    source_manifest = _single_group_block_manifest("history", src_pages)
+    destination_manifest = _single_group_block_manifest("history", dst_pages)
+
+    def field_pages(layout, ptr, field_id, page_ids):
+        segment = next(f for f in layout.plan.fields if f.field_id == field_id)
+        return [
+            ptr + layout.plan.field_page_byte_offset(field_id, page)
+            for page in page_ids
+        ], segment.payload_bytes
+
+    manager, _ = _recording_transfer_manager(source_layout, 0x1000)
+    fields = tuple(f.field_id for f in source_layout.fields_for_group("history"))
+    expected = []
+    for field_id in fields:
+        src, size = field_pages(source_layout, 0x1000, field_id, src_pages)
+        dst, _ = field_pages(destination_layout, 0x2000, field_id, dst_pages)
+        expected.extend(zip(src, dst, [size] * pages, strict=True))
+    blocks = list(
+        manager._cache_transfer_blocks(
+            dst_ptr=0x2000,
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
+            dst_cache_layout=destination_layout,
+        )
+    )
+    # One pages x fields item for the group, no per-page Python objects.
+    (item,) = blocks
+    assert isinstance(item, PageFieldCopies)
+    assert item.fields.shape == (2, 5) and len(item) == 2 * pages
+    assert _expand_page_fields(item.src_pages, item.dst_pages, item.fields) == expected
+    with pytest.raises(TypeError):
+        list(flatten_transfer_blocks(blocks))
+
+    fragment = CacheTransferFragment(
+        group_id="history",
+        field_id=fields[1],
+        src_byte_offset=4,
+        dst_byte_offset=8,
+        src_row_stride_bytes=16,
+        dst_row_stride_bytes=16,
+        bytes_per_row=8,
+        rows_per_page=2,
+    )
+    src, _ = field_pages(source_layout, 0x1000, fields[1], src_pages)
+    dst, _ = field_pages(destination_layout, 0x2000, fields[1], dst_pages)
+    fragment_blocks = list(
+        manager._cache_transfer_blocks(
+            dst_ptr=0x2000,
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
+            transfer_fragments=(fragment,),
+            dst_cache_layout=destination_layout,
+        )
+    )
+    assert fragment_blocks == [
+        (s + 4 + row * 16, d + 8 + row * 16, 8)
+        for s, d in zip(src, dst, strict=True)
+        for row in range(2)
+    ]
+
+
+def test_transfer_data_writes_page_grids_between_descriptor_batches() -> None:
+    from tokenspeed.runtime.pd.mooncake import prefill as prefill_module
+
+    manager, calls = _recording_transfer_manager(
+        _typed_layout(local_heads=4, global_heads=4), 0
+    )
+    page_calls = []
+    manager.engine.batch_transfer_sync_pages = (
+        lambda session, src, dst, fields, *, max_batch_size: (
+            page_calls.append((session, src, dst, fields, max_batch_size)) or 0
+        )
+    )
+    item = PageFieldCopies(
+        np.asarray([1, 2, 3], dtype=np.int64),
+        np.asarray([9, 8, 7], dtype=np.int64),
+        np.asarray([[100, 10, 200, 20, 5], [300, 30, 400, 40, 6]], dtype=np.int64),
+    )
+    # Pending per-descriptor rows are flushed ahead of the page item, and
+    # rows after it start a new batch; order on the wire is preserved.
+    blocks = [(1, 2, 3), (4, 5, 6), item, (7, 8, 9)]
+    assert manager._transfer_data("session", iter(blocks)) == 0
+    assert [call[1] for call in calls] == [[1, 4], [7]]
+    ((session, src, dst, fields, max_batch_size),) = page_calls
+    assert session == "session" and src is item.src_pages and fields is item.fields
+    assert max_batch_size == prefill_module._TRANSFER_DESCRIPTOR_BATCH_SIZE
+
+    manager.engine.batch_transfer_sync_pages = lambda *args, **kwargs: -3
+    assert manager._transfer_data("session", iter([item])) == -3
+
+
+def test_page_field_copies_validates_its_grid() -> None:
+    item = PageFieldCopies(
+        np.asarray([1, 5], dtype=np.int64),
+        np.asarray([9, 8], dtype=np.int64),
+        np.asarray(
+            [[1000, 64, 5000, 128, 16], [2000, 4096, 3000, 4096, 3000]], dtype=np.int64
+        ),
+    )
+    assert len(item) == 4
+    with pytest.raises(TypeError):
+        PageFieldCopies(item.src_pages, item.dst_pages, item.fields[:, :4].copy())
+    with pytest.raises(ValueError):
+        PageFieldCopies(item.src_pages, item.dst_pages[:1], item.fields)
+    # Neither the packer nor the SGE flattener may see one.
+    with pytest.raises(TypeError):
+        list(flatten_transfer_blocks([item]))
+
+
+def test_engine_wrapper_requires_and_forwards_the_page_gathered_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import types
+
+    from tokenspeed.runtime.pd.base.mooncake_engine import MooncakeTransferEngine
+
+    class FakeTransferEngine:
+        def __init__(self) -> None:
+            self.initialized = None
+
+        def initialize(self, *args):
+            self.initialized = args
+            return 0
+
+        def get_rpc_port(self):
+            return 4321
+
+    fake_module = types.ModuleType("mooncake.engine")
+    fake_module.TransferEngine = FakeTransferEngine
+    monkeypatch.setitem(sys.modules, "mooncake", types.ModuleType("mooncake"))
+    monkeypatch.setitem(sys.modules, "mooncake.engine", fake_module)
+    # An engine without the page-gathered WRITE is a wrong install.
+    with pytest.raises(RuntimeError, match="batch_transfer_sync_write_pages"):
+        MooncakeTransferEngine("10.0.0.1", gpu_id=0, ib_device=None)
+    # With it, bring-up completes and the session id names this rank.
+    FakeTransferEngine.batch_transfer_sync_write_pages = lambda self, *a: 0
+    engine = MooncakeTransferEngine("10.0.0.1", gpu_id=0, ib_device="mlx5_0")
+    assert engine.session_id == "10.0.0.1:4321"
+    assert engine.engine.initialized == ("10.0.0.1", "P2PHANDSHAKE", "rdma", "mlx5_0")
+
+    src = np.asarray([1, 2], dtype=np.int64)
+    dst = np.asarray([3, 4], dtype=np.int64)
+    fields = np.zeros((2, 5), dtype=np.int64)
+    seen = []
+    wrapper = object.__new__(MooncakeTransferEngine)
+    wrapper.engine = SimpleNamespace(
+        batch_transfer_sync_write_pages=lambda session, s, d, f, batch: seen.append(
+            ("pages", s, d, f, batch)
+        )
+        or 0
+    )
+    assert (
+        wrapper.batch_transfer_sync_pages("s", src, dst, fields, max_batch_size=4096)
+        == 0
+    )
+    assert seen == [("pages", src, dst, fields, 4096)]
+    # A raising engine reports failure instead of propagating.
+    wrapper.engine = SimpleNamespace(
+        batch_transfer_sync_write_pages=lambda *args: (_ for _ in ()).throw(
+            RuntimeError("x")
+        )
+    )
+    assert (
+        wrapper.batch_transfer_sync_pages("s", src, dst, fields, max_batch_size=1) == -1
+    )
 
 
 class _FakePackScratch:
@@ -1094,13 +1352,15 @@ def test_shared_manager_uses_destination_page_zero_offsets() -> None:
         )
         == 0
     )
+    # One page-gathered WRITE per cache group.
     assert calls == [
         (
             "session",
-            [0x10000 + 1 * 32, 0x10000 + 2 * 32, 0x10000 + 16 + 4 * 32],
-            [0x20000 + 8 + 5 * 64, 0x20000 + 8 + 6 * 64, 0x20000 + 40 + 3 * 64],
-            [16, 16, 16],
-        )
+            [0x10000 + 1 * 32, 0x10000 + 2 * 32],
+            [0x20000 + 8 + 5 * 64, 0x20000 + 8 + 6 * 64],
+            [16, 16],
+        ),
+        ("session", [0x10000 + 16 + 4 * 32], [0x20000 + 40 + 3 * 64], [16]),
     ]
 
 
@@ -1120,6 +1380,9 @@ def test_cache_heterogeneous_gqa_route_rendezvous_idle_prefill_ranks() -> None:
     prefill = PrefillParallelInfo(
         tp_size=4,
         dp_size=1,
+        cache_fields_by_stage=(
+            tuple(field.field_id for field in prefill_layout.plan.fields),
+        ),
         cache_layout=prefill_layout,
     )
 
@@ -1142,6 +1405,7 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         value.prefill_response_tracker = defaultdict(set)
         value.bootstrap_token_table = {}
         value.spec_candidate_ids_table = {}
+        value.cached_tokens_table = {}
         value._pending_bootstrap_token_table = {}
         value._pending_spec_candidate_ids_table = {}
         value.failure_records = {}
@@ -1151,15 +1415,19 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         return value
 
     complete = manager()
-    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None)
+    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280)
     assert complete.request_status[9] == TransferPoll.WaitingForInput
-    complete._handle_prefill_status(9, TransferPoll.Success, 2, -1, None)
+    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280)
+    assert complete.cached_tokens_table[9] == 1280
+    complete._handle_prefill_status(9, TransferPoll.Success, 2, -1, None, 1280)
     assert complete.request_status[9] == TransferPoll.Success
-    assert complete.bootstrap_token_table == {9: 42}
+    assert complete.bootstrap_token_table[9] == 42
+    assert complete.pop_prefill_metadata(9) == (42, None, 1280)
+    assert complete.cached_tokens_table == {}
 
     wrong_rank = manager()
-    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 0, -1, None)
-    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 1, -1, None)
+    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 0, -1, None, 1280)
+    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 1, -1, None, 1280)
     assert wrong_rank.request_status[9] == TransferPoll.Failed
     assert wrong_rank.prefill_response_tracker[9] == {0}
     assert "unexpected Prefill TP rank" in wrong_rank.failure_records[9]
@@ -1221,6 +1489,74 @@ def test_receiver_bootstrap_failure_is_not_overwritten(
         (9, TransferPoll.Failed),
     ]
     assert failures and failures[0][0] == 9
+
+
+def test_prefill_usage_status_wire_roundtrip():
+    import threading
+
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+    from tokenspeed.runtime.pd.mooncake.decode import parse_prefill_status_message
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.bootstrap_token_cond = threading.Condition()
+    manager.request_status = {9: TransferPoll.Bootstrapped}
+    manager.prefill_metadata = {}
+    manager.cached_tokens = {}
+    messages = []
+    manager._connect = lambda endpoint: (
+        SimpleNamespace(send_multipart=messages.append),
+        nullcontext(),
+    )
+    manager.record_cached_tokens(9, 1280)
+    manager.sync_status_to_decode_endpoint(
+        "127.0.0.1",
+        1234,
+        9,
+        TransferPoll.Success,
+        0,
+        bootstrap_token=42,
+        spec_candidate_ids=[5, 6],
+    )
+    parsed = parse_prefill_status_message(messages[0])
+    assert parsed == (9, TransferPoll.Success, 0, 42, [5, 6], 1280)
+    # Older senders lack the optional trailing usage frame.
+    assert parse_prefill_status_message(messages[0][:-1])[-1] == 0
+    manager.begin_room(9)
+    assert manager.prefill_metadata == {}
+    assert manager.cached_tokens == {}
+
+
+def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
+    import threading
+
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.bootstrap_token_cond = threading.Condition()
+    manager.request_status = {9: TransferPoll.WaitingForInput}
+    manager.prefill_metadata = {}
+    manager.cached_tokens = {}
+    manager.record_cached_tokens(9, 1280)
+    done = threading.Event()
+    result = []
+
+    def wait():
+        result.append(manager._wait_prefill_metadata(9, -1, None))
+        done.set()
+
+    waiter = threading.Thread(target=wait)
+    waiter.start()
+    try:
+        assert not done.wait(0.05)
+    finally:
+        manager.set_prefill_metadata(9, 42, [5, 6])
+        waiter.join(timeout=1)
+    assert not waiter.is_alive()
+    assert result == [(42, [5, 6])]
+    assert manager.prefill_metadata[9] == (42, [5, 6])
+    assert manager.cached_tokens[9] == 1280
 
 
 if __name__ == "__main__":

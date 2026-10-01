@@ -55,6 +55,7 @@ from tokenspeed.runtime.epd.encode_scheduler import EncodeScheduler
 from tokenspeed.runtime.epd.encode_worker import EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.jit_compile_check import mark_jit_compile_serving
 
 logger = get_colorful_logger(__name__)
 
@@ -83,14 +84,13 @@ def _make_embedding_cache(l1_bytes: int, l2_bytes: int, device: str):
     (VRAM L1 + host-DRAM L2) when the L2 capacity is enabled (``l2_bytes > 0``)."""
     if l2_bytes > 0:
         logger.info(
-            "EPD encode embedding cache: L1(VRAM)=%d MiB, L2(host DRAM)=%d MiB",
-            l1_bytes >> 20,
-            l2_bytes >> 20,
+            f"EPD encode embedding cache: L1(VRAM)={l1_bytes >> 20:d} MiB, L2(host "
+            f"DRAM)={l2_bytes >> 20:d} MiB",
         )
         return TieredEmbeddingCache(l1_bytes, l2_bytes, device=device)
     logger.info(
-        "EPD encode embedding cache: L1(VRAM)=%d MiB (host-DRAM L2 disabled)",
-        l1_bytes >> 20,
+        f"EPD encode embedding cache: L1(VRAM)={l1_bytes >> 20:d} MiB (host-DRAM L2 "
+        "disabled)",
     )
     return EmbeddingCache(l1_bytes)
 
@@ -262,6 +262,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             "multimodal_encoder_dtype": multimodal_encoder_dtype,
         }
     )
+    mark_jit_compile_serving()
 
     while True:
         # Rank 0 drains the gateway ZMQ without blocking; other ranks get the

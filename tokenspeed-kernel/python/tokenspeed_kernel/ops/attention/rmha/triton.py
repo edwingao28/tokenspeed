@@ -64,7 +64,9 @@ def _rel_mha_prefill_kernel(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     Lq: tl.constexpr,
@@ -337,7 +339,9 @@ def _rel_mha_decode_stage1_kernel(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -484,7 +488,9 @@ def _rel_mha_decode_grouped_stage1_kernel(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -637,7 +643,9 @@ def _rel_mha_decode_stage2_kernel(
     stride_obs,
     stride_oh,
     MAX_SEQLEN_Q: tl.constexpr,
-    MAX_KV_SPLITS: tl.constexpr,
+    # Grows with the batch's longest context; runtime so every split count
+    # shares one binary.
+    MAX_KV_SPLITS,
     MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
@@ -847,10 +855,9 @@ def _rel_mha_decode_fwd(
     ),
     priority=Priority.PORTABLE,
     traits={
-        "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_rel_mha_prefill(
     q: torch.Tensor,
@@ -914,10 +921,9 @@ def triton_rel_mha_prefill(
     ),
     priority=Priority.PORTABLE,
     traits={
-        "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_rel_mha_extend_with_kvcache(
     q: torch.Tensor,
@@ -997,10 +1003,9 @@ def triton_rel_mha_extend_with_kvcache(
     ),
     priority=Priority.PORTABLE,
     traits={
-        "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False}),
+        "sliding_window": frozenset({False, True}),
     },
-    tags={"portability"},
 )
 def triton_rel_mha_decode_with_kvcache(
     q: torch.Tensor,

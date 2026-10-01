@@ -23,7 +23,7 @@ server:
     --moe-backend flashinfer_trtllm
     --max-model-len 65536
     --max-num-seqs 16
-    --max-total-tokens 131072
+    --max-total-tokens 524288
     --max-prefill-tokens 8192
     --chunked-prefill-size 4096
     --max-cudagraph-capture-size 16
@@ -39,7 +39,7 @@ server:
     --port 8000
     --policy round_robin
     --disable-health-check
-    --engine-startup-timeout 900
+    --engine-startup-timeout 3600
     --gateway-startup-timeout 600
     --speculative-algorithm MTP
     --speculative-num-steps 3

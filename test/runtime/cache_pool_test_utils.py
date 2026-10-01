@@ -60,7 +60,9 @@ def one_group(group_id: str, *fields, **spec_kwargs):
     if "checkpoint_granularity" not in spec_kwargs:
         spec_kwargs.setdefault("rows_per_page", spec_kwargs.pop("page_size", 1))
         spec_kwargs.setdefault("entry_stride_tokens", 1)
-    return spec.CacheGroupSpec(group_id=group_id, **spec_kwargs), tuple(fields)
+    return spec.CacheGroupSpec(
+        group_id=group_id, **spec_kwargs, replayable=False
+    ), tuple(fields)
 
 
 def plan_group_specs(plan) -> tuple[spec.CacheGroupSpec, ...]:
@@ -79,6 +81,7 @@ def plan_group_specs(plan) -> tuple[spec.CacheGroupSpec, ...]:
             retention="full_history",
             rows_per_page=plan.prefix_granularity // group.cache_blocks_per_lcm_block,
             entry_stride_tokens=1,
+            replayable=False,
         )
         for group in plan.groups
     )
@@ -333,8 +336,9 @@ def _reduced(value: object, seen: set[int]) -> object:
 
 
 def storages_of(*tensors: torch.Tensor) -> set[int]:
-    """The untyped storages behind ``tensors``, so views at any offset are recognised."""
-    return {tensor.untyped_storage().data_ptr() for tensor in tensors}
+    """The untyped storages behind ``tensors``, so views at any offset are
+    recognised; an empty tensor has no storage to alias."""
+    return {tensor.untyped_storage().data_ptr() for tensor in tensors if tensor.numel()}
 
 
 def reachable_tensors(node: object) -> list[torch.Tensor]:
@@ -349,7 +353,8 @@ def assert_no_alias(node: object, storages: set[int]) -> None:
     for name, value in vars(node).items():
         for tensor in _tensors(value, set()):
             assert (
-                tensor.untyped_storage().data_ptr() not in storages
+                not tensor.numel()
+                or tensor.untyped_storage().data_ptr() not in storages
             ), f"{name} still aliases the old pool"
 
 

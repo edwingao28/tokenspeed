@@ -25,12 +25,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.configs.numerics import require_verified_numerics
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.model_loader.weight_utils import (
+    non_unit_kv_scale_message,
+    record_non_unit_kv_scales,
+)
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
+from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -91,8 +97,17 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
+        self._weight_update_pg: torch.distributed.ProcessGroup | None = None
+        self._weight_update_device: torch.device | None = None
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
+        # Target and draft alike: the envelope covers every model that serves.
+        require_verified_numerics(
+            server_args.numerics,
+            model_profile=model_config.model_profile,
+            architecture=resolve_architecture(model_config.hf_config),
+            quantization=model_config.quantization,
+        )
 
         draft_moe_override = (
             self.is_draft_worker
@@ -113,8 +128,7 @@ class ModelRunner:
                     server_args.kv_cache_dtype = "fp8_e4m3"
                     logger.info(
                         "Auto-detected kv_cache_dtype=fp8_e4m3 from checkpoint "
-                        "quant config (kv_cache_quant_algo=%s)",
-                        kv_algo,
+                        f"quant config (kv_cache_quant_algo={kv_algo!s})",
                     )
 
         global_server_args_dict_update(server_args)
@@ -159,8 +173,8 @@ class ModelRunner:
         )
         if self.encoder_graph_wrappers:
             logger.info(
-                "Multimodal encoder CUDA graphs installed for %s",
-                sorted(self.encoder_graph_wrappers),
+                "Multimodal encoder CUDA graphs installed for "
+                f"{sorted(self.encoder_graph_wrappers)!s}",
             )
 
         warmup_device = torch.device(self.device)
@@ -293,11 +307,8 @@ class ModelRunner:
             self._weight_update_pg = pg
             self._weight_update_device = device
             logger.info(
-                "weight-update group joined: rank=%d world_size=%d device=%s group=%s",
-                rank,
-                world_size,
-                device,
-                group_name,
+                f"weight-update group joined: rank={rank:d} world_size={world_size:d} "
+                f"device={device!s} group={group_name!s}",
             )
             return True, "weight update group initialized"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
@@ -308,7 +319,7 @@ class ModelRunner:
         """Receive trainer-broadcast weights over the NCCL group and load them."""
         import torch.distributed as dist
 
-        pg = getattr(self, "_weight_update_pg", None)
+        pg = self._weight_update_pg
         if pg is None:
             return False, "weight update group not initialized"
         try:
@@ -329,8 +340,16 @@ class ModelRunner:
                     dist.broadcast(buf, src=0, group=pg)
                     yield name, buf
 
-            self.model.load_weights(_recv())
+            # The update loads to completion so the model stays consistent, then fails on a scale.
+            rejected: list[str] = []
+            self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
             torch.cuda.synchronize(device)
+            if rejected:
+                return False, (
+                    f"applied {len(names)} weights, but the update is rejected and "
+                    f"its weight version not advanced: {non_unit_kv_scale_message(rejected)}; "
+                    "resend the weights without KV-cache scales"
+                )
             return True, f"updated {len(names)} weights"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")
@@ -346,7 +365,7 @@ class ModelRunner:
         clean group. Idempotent: tearing down when no group is live is a success
         so a trainer that always calls destroy (e.g. slime) never errors.
         """
-        pg = getattr(self, "_weight_update_pg", None)
+        pg = self._weight_update_pg
         if pg is None:
             return True, "weight update group not initialized"
 
