@@ -140,6 +140,9 @@ from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import (
     decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
 )
+from tokenspeed_kernel.ops.moe.triton import (
+    kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
+)
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -235,6 +238,7 @@ _RELOAD_MODULES = [
     _moe_native,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
+    _moe_triton_kimi3_sigmoid_topk,
     _moe_triton_sqrt_softplus,
     _moe_triton_mxfp4,
     _moe_triton_softmax_topk,
@@ -323,6 +327,8 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
         # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
         "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
+        # Prefer packed routing while keeping overlapping Gluon selectable.
+        "triton_kimi3_packed_sigmoid_bias_topk_gfx1250": Priority.SPECIALIZED + 1,
     }
     actual_offsets = {
         spec.name: spec.priority
@@ -849,6 +855,26 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     )
     assert tensor_scaled.shape == (4, 128)
     assert tensor_scaled.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("b_layout", ["KN", "NK"])
+def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> None:
+    monkeypatch.setattr(
+        _gemm_pkg,
+        "select_kernel",
+        partial(_gemm_pkg.select_kernel, solution="reference"),
+    )
+    gen = torch.Generator().manual_seed(0)
+    a = torch.randn((4, 256), generator=gen).to(_fp8_dtype())
+    b_kn = torch.randn((256, 128), generator=gen).to(_fp8_dtype())
+    b = b_kn if b_layout == "KN" else b_kn.t().contiguous()
+    scale = torch.ones((1,), dtype=torch.float32)
+
+    out = tokenspeed_kernel.mm(
+        a, b, A_scales=scale, B_scales=scale, out_dtype=torch.float32, quant="fp8"
+    )
+
+    torch.testing.assert_close(out, a.float() @ b_kn.float())
 
 
 def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
@@ -3030,6 +3056,19 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
             signature,
             traits={"tokens": 16, "experts": 896, "topk": 16},
         )
+        forced_gluon = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+            solution="gluon",
+        )
+        past_packed = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 1024, "experts": 896, "topk": 16},
+        )
         other_shape = select_kernel(
             "moe",
             "sigmoid_bias_topk",
@@ -3049,7 +3088,9 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
         registry.clear_cache()
 
     assert decode.name == "triton_decode_sigmoid_bias_topk"
-    assert batched.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert batched.name == "triton_kimi3_packed_sigmoid_bias_topk_gfx1250"
+    assert forced_gluon.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert past_packed.name == "gluon_sigmoid_bias_topk_gfx1250"
     assert other_shape.name == "torch_sigmoid_bias_topk"
     assert reduced_precision.name == "torch_sigmoid_bias_topk"
 
