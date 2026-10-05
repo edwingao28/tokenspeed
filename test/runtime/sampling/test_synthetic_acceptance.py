@@ -52,6 +52,9 @@ class _BufferBackend(SamplingBackend):
 
 def _config(al, bs, width, device):
     return SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         synthetic_acceptance_length=al,
         max_bs=bs,
         max_draft_tokens_per_req=width,
@@ -66,7 +69,12 @@ def test_config_requires_explicit_synthetic_acceptance():
     with pytest.raises(TypeError, match="synthetic_acceptance_length"):
         SamplingBackendConfig()
     for length in (None, 2.6):
-        config = SamplingBackendConfig(synthetic_acceptance_length=length)
+        config = SamplingBackendConfig(
+            synthetic_acceptance_length=length,
+            enable_speculative_sampling=False,
+            sampling_stream="batch",
+            logprob_order="torch",
+        )
         assert config.synthetic_acceptance_length == length
 
 
