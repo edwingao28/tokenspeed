@@ -28,10 +28,6 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.layernorm.triton import (
-    fused_qk_rmsnorm_rope_gate,
-    qk_rmsnorm,
-)
 from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -87,9 +83,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
 )
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -592,6 +585,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_moe = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 mapping=self.mapping,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -615,8 +609,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -762,17 +758,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 mapping=self.mapping,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -800,63 +801,34 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
         self.is_moe = is_moe
         self.comm_manager = CommManager(
             mapping=self.mapping,
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # qk_rmsnorm expects GemmaRMSNorm's effective gamma.
-        return qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.gemma_weight,
-            self.k_norm.gemma_weight,
-            self.q_norm.variance_epsilon,
-        )
-
-    def _project_qkv_rope(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+    def _project_qkv(
+        self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """qkv_proj + split + rope (+ optional gate). ``gate`` is ``None`` when ``attn_output_gate=False``."""
+        """qkv_proj split into views; ``gate`` is ``None`` without ``attn_output_gate``."""
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-            )
-            q, k, gate = fused_qk_rmsnorm_rope_gate(
-                q_gate,
-                k,
-                self.q_norm.gemma_weight,
-                self.k_norm.gemma_weight,
-                self.rotary_emb.cos_sin_cache,
-                positions,
-                self.q_norm.variance_epsilon,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.rotary_emb.rotary_dim,
-            )
-            return q, k, v, gate
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        return q, k, v, None
+        if not self.attn_output_gate:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            return q, k, v, None
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        heads = q_gate.view(q_gate.shape[0], self.num_heads, 2, self.head_dim)
+        q, gate = heads.unbind(dim=2)
+        return q, k, v, gate
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -864,8 +836,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         ctx: ForwardContext,
         **kwargs,
     ) -> torch.Tensor:
-        """Backend attention call + optional gate apply. Subclasses override."""
-        attn_output = self.attn(q, k, v, ctx, **kwargs)
+        """Attention with the optional output gate; draft subclasses override."""
+        attn_output = self.attn(q, k, v, positions, ctx, **kwargs)
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
@@ -877,8 +849,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        attn_output = self._attn(q, k, v, gate, ctx)
+        q, k, v, gate = self._project_qkv(hidden_states)
+        attn_output = self._attn(positions, q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1063,15 +1035,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                )
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+            )
 
             # Process deepstack embeddings if provided
             if (
@@ -1140,7 +1109,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
                     continue
                 param = params_dict[name]
 
@@ -1264,7 +1233,7 @@ class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
             loaded_params.add(name)
 
         return loaded_params
@@ -1564,7 +1533,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             # embed) weight up front, before any rename or params_dict lookup,
             # so none is routed into a None module. self.model is None here, so
             # named_parameters() exposes only visual params.
-            if getattr(self, "encoder_only", False) and "visual" not in name:
+            if self.encoder_only and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1601,7 +1570,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 if name not in params_dict:
                     if _is_ignored_checkpoint_param(self, name):
                         continue
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -1690,7 +1659,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             # lookup, or moe_loader.load (which would KeyError on a missing
             # expert param). self.model is None here, so named_parameters()
             # exposes only visual params.
-            if getattr(self, "encoder_only", False) and "visual" not in name:
+            if self.encoder_only and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1739,7 +1708,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
             loaded_params.add(name)
 
         return loaded_params
@@ -1811,6 +1780,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     row, tile = tl.program_id(0), tl.program_id(1)
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
     QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
@@ -1844,8 +1815,6 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         )
         tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
         tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(

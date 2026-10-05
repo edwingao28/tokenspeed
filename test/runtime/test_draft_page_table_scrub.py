@@ -146,6 +146,8 @@ class IdleReplayScrubTest(unittest.TestCase):
                 extend_prefix_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 extend_seq_lens_buf=torch.zeros(8, dtype=torch.int32),
                 extend_seq_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_replay_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_prompt_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 fill_dummy_decode_buffers=lambda batch_size, total_tokens: None,
             ),
             runtime_states=SimpleNamespace(
@@ -180,6 +182,8 @@ class IdleReplayScrubTest(unittest.TestCase):
             "extend_seq_lens_cpu",
         ):
             self.assertEqual(extend_kwargs[name].numel(), 0, name)
+        # And the runner's required host tables: no request, no groups.
+        self.assertEqual(extend_kwargs["block_tables_cpu"], {})
 
 
 if __name__ == "__main__":

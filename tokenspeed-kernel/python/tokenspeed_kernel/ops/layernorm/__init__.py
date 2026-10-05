@@ -24,12 +24,18 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.layernorm.triton import (
+    add_rmsnorm,
+)
+from tokenspeed_kernel.ops.layernorm.triton import (
     gated_residual_combine_norm as _gated_residual_combine_norm,
 )
 from tokenspeed_kernel.ops.layernorm.triton import (
     grouped_gemma_rmsnorm as _grouped_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
+from tokenspeed_kernel.ops.layernorm.triton import (
+    reference_rmsnorm,
+)
 from tokenspeed_kernel.platform import current_platform
 
 _platform = current_platform()
@@ -97,15 +103,13 @@ def qk_rmsnorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     eps: float,
+    *,
+    weight_offset: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the platform per-head Q/K RMSNorm implementation."""
-    return _qk_rmsnorm(
-        q,
-        k,
-        q_weight,
-        k_weight,
-        eps,
-    )
+    """Apply the platform per-head Q/K RMSNorm implementation; heads scale by
+    ``weight_offset + weight`` (1.0 for Gemma-style weights), formed in fp32
+    except on Ascend, which rounds it to the weight dtype."""
+    return _qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=weight_offset)
 
 
 def grouped_gemma_rmsnorm(
@@ -213,9 +217,11 @@ def gated_residual_combine_norm(
 
 
 __all__ = [
+    "add_rmsnorm",
     "gated_residual_combine_norm",
     "grouped_gemma_rmsnorm",
     "grouped_rmsnorm",
     "qk_rmsnorm",
+    "reference_rmsnorm",
     "rmsnorm",
 ]

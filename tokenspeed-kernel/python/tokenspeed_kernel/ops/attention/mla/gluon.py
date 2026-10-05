@@ -37,52 +37,61 @@ from tokenspeed_kernel.signature import (
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock as _mla_decode_bf16xbf16_bh16_multiblock_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950_bh16bn64 as _mla_decode_bf16xbf16_bh16bn64_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950_bh64 as _mla_decode_bf16xbf16_bh64_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950_bh64_small as _mla_decode_bf16xbf16_bh64_small_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         gluon_mla_decode_bf16xfp8_gfx950 as _mla_decode_bf16xfp8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         gluon_mla_decode_fp8xfp8_gfx950 as _mla_decode_fp8xfp8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_projected_value_gfx950 as _mla_decode_projected_value_impl,
+        launch_gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock as _mla_decode_bf16xbf16_bh16_multiblock_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_bf16xbf16_gfx950_bh16bn64 as _mla_decode_bf16xbf16_bh16bn64_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_bf16xbf16_gfx950_bh64 as _mla_decode_bf16xbf16_bh64_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small as _mla_decode_bf16xbf16_bh64_small_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_fp8_query_blocks_gfx950 as _mla_decode_fp8_query_blocks_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_projected_value_gfx950 as _mla_decode_projected_value_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.extend import (
+        launch_gluon_mla_extend_gfx950 as _mla_extend_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.normalize_project_query import (
-        gluon_mla_normalize_project_query_gfx950 as _mla_normalize_project_query_impl,
+        launch_gluon_mla_normalize_project_query_gfx950 as _mla_normalize_project_query_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import (
-        gluon_mla_prefill_gfx950 as _mla_prefill_gfx950_impl,
+        launch_gluon_mla_prefill_gfx950 as _mla_prefill_gfx950_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill_8wave import (
+        launch_gluon_mla_prefill_8wave_gfx950 as _mla_prefill_8wave_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.project_value import (
-        gluon_mla_project_value_gfx950 as _mla_project_value_impl,
+        launch_gluon_mla_project_value_gfx950 as _mla_project_value_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
-        gluon_mla_decode_gfx1250 as _mla_decode_gfx1250_impl,
+        launch_gluon_mla_decode_gfx1250 as _mla_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
-        gluon_mla_decode_projected_value_gfx1250 as _mla_decode_projected_value_gfx1250_impl,
+        launch_gluon_mla_decode_projected_value_gfx1250 as _mla_decode_projected_value_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.extend import (
-        gluon_mla_extend_gfx1250 as _mla_extend_gfx1250_impl,
+        launch_gluon_mla_extend_gfx1250 as _mla_extend_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.normalize_project_query import (
-        gluon_mla_normalize_project_query_gfx1250 as _mla_normalize_project_query_gfx1250_impl,
+        launch_gluon_mla_normalize_project_query_gfx1250 as _mla_normalize_project_query_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.prefill import (
-        gluon_mla_prefill_gfx1250 as _mla_prefill_gfx1250_impl,
+        launch_gluon_mla_prefill_gfx1250 as _mla_prefill_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.project_value import (
-        gluon_mla_project_value_gfx1250 as _mla_project_value_gfx1250_impl,
+        launch_gluon_mla_project_value_gfx1250 as _mla_project_value_gfx1250_impl,
     )
 
     @register_kernel(
@@ -104,10 +113,10 @@ if current_platform().is_amd:
         traits={
             "q_len": frozenset({1}),
             "num_q_heads": frozenset(range(1, 17)),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -134,11 +143,10 @@ if current_platform().is_amd:
             "batch_size": frozenset({1}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({64}),
-            "batch_size_div_64": frozenset({False}),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -165,11 +173,10 @@ if current_platform().is_amd:
             "batch_size": frozenset({2, 4}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({64}),
-            "batch_size_div_64": frozenset({False}),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -200,10 +207,10 @@ if current_platform().is_amd:
         traits={
             "q_len": frozenset({1}),
             "num_q_heads": frozenset(range(1, 17)),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -232,15 +239,42 @@ if current_platform().is_amd:
         traits={
             "q_len": frozenset({1}),
             "num_q_heads": frozenset(range(1, 17)),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
     def gluon_mla_decode_fp8xfp8_gfx950_bh16bn128(*args, **kwargs):
         return _mla_decode_fp8xfp8_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        name="gluon_mla_decode_fp8_query_blocks_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(("q", "kv_cache"), "dense", {torch.float8_e4m3fn}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "q_len": frozenset(range(2, 17)),
+            "page_size": frozenset({64, 128, 256}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False}),
+            "block_on_query_axis": frozenset({True}),
+            "noncausal_block_size": frozenset({1}),
+        },
+    )
+    def gluon_mla_decode_fp8_query_blocks_gfx950(*args, **kwargs):
+        return _mla_decode_fp8_query_blocks_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -273,12 +307,12 @@ if current_platform().is_amd:
             "batch_size": frozenset({1, 2, 4}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({12, 16}),
-            "page_size": frozenset({64}),
+            "value_head_dim": frozenset({128}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "value_head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
             "gate_kind": frozenset({"none", "sigmoid"}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
         },
     )
     def gluon_mla_decode_projected_value_gfx950(*args, **kwargs):
@@ -306,9 +340,9 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "batch_size": frozenset({1, 2, 4}),
-            "num_heads": frozenset({12, 16}),
-            "latent_dim": frozenset({512}),
-            "value_dim": frozenset({128}),
+            "num_q_heads": frozenset({12, 16}),
+            "value_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
             "gate_kind": frozenset({"none", "sigmoid"}),
             "inputs_contiguous": frozenset({True}),
         },
@@ -351,9 +385,9 @@ if current_platform().is_amd:
             "output_width": frozenset({2304, 3072}),
             "output_prefix_width": frozenset({128, 2304, 3072}),
             "output_tail_width": frozenset({0, 64}),
-            "split_output": frozenset({False, True}),
             "inputs_contiguous": frozenset({True}),
             "outputs_inner_contiguous": frozenset({True}),
+            "split_output": frozenset({False, True}),
         },
     )
     def gluon_mla_normalize_project_query_gfx950(*args, **kwargs):
@@ -394,9 +428,9 @@ if current_platform().is_amd:
             "output_width": frozenset({2304, 3072}),
             "output_prefix_width": frozenset({128, 2304, 3072}),
             "output_tail_width": frozenset({0, 64}),
-            "split_output": frozenset({False, True}),
             "inputs_contiguous": frozenset({True}),
             "outputs_inner_contiguous": frozenset({True}),
+            "split_output": frozenset({False, True}),
         },
     )
     def gluon_mla_normalize_project_query_gfx1250(*args, **kwargs):
@@ -419,13 +453,13 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "batch_size_align": frozenset({64}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({64, 128}),
-            "batch_size_div_64": frozenset({True}),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -456,10 +490,10 @@ if current_platform().is_amd:
         traits={
             "q_len": frozenset({1}),
             "num_q_heads": frozenset(range(1, 129)),
-            "page_size": frozenset({64}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "support_logit_cap": frozenset({False}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
@@ -497,12 +531,12 @@ if current_platform().is_amd:
             "batch_size": frozenset({1, 2, 4, 8}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({12, 16}),
-            "page_size": frozenset({64}),
+            "value_head_dim": frozenset({128}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
-            "value_head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
             "gate_kind": frozenset({"none", "sigmoid"}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
         },
     )
     def gluon_mla_decode_projected_value_gfx1250(*args, **kwargs):
@@ -530,9 +564,9 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "batch_size": frozenset({1, 2, 4, 8}),
-            "num_heads": frozenset({12, 16}),
-            "latent_dim": frozenset({512}),
-            "value_dim": frozenset({128}),
+            "num_q_heads": frozenset({12, 16}),
+            "value_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
             "gate_kind": frozenset({"none", "sigmoid"}),
             "inputs_contiguous": frozenset({True}),
         },
@@ -562,21 +596,87 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_q_heads": frozenset(range(1, 129)),
             # Absorbed attention wins only for short cached extends; longer
             # queries should use expanded prefix replay.
             "max_seqlen_q": frozenset(range(1, 257)),
-            "page_size": frozenset({64}),
+            "num_q_heads": frozenset(range(1, 129)),
             "qk_nope_head_dim": frozenset({128}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
             "is_causal": frozenset({True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
     )
     def gluon_mla_extend_gfx1250(*args, **kwargs):
         return _mla_extend_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_extend_with_kvcache",
+        name="gluon_mla_extend_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(torch.float8_e4m3fn),
+            )
+            for q_dtype in (torch.float8_e4m3fn, torch.bfloat16)
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Absorbed extend spends 512 + 576 MACs per (query, key) pair and
+            # head; prefix replay spends 192 + 128 plus a one-off expansion of
+            # every prefix token to per-head K/V. Absorbed wins below roughly
+            # 200 query tokens at this kernel's FP8 throughput.
+            "max_seqlen_q": frozenset(range(1, 257)),
+            "num_q_heads": frozenset(range(1, 129)),
+            "qk_nope_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "is_causal": frozenset({True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+        },
+    )
+    def gluon_mla_extend_gfx950(*args, **kwargs):
+        return _mla_extend_gfx950_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_extend_with_kvcache",
+        name="gluon_mla_extend_bf16_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(("q", "kv_cache"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Same cost model as the FP8-cache kernel, at the BF16 kernel's
+            # lower (register-bound) throughput.
+            "max_seqlen_q": frozenset(range(1, 17)),
+            "num_q_heads": frozenset(range(1, 129)),
+            "qk_nope_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "is_causal": frozenset({True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+        },
+    )
+    def gluon_mla_extend_bf16_gfx950(*args, **kwargs):
+        return _mla_extend_gfx950_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -600,15 +700,51 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "qk_head_dim": frozenset({192}),
-            "v_head_dim": frozenset({128}),
+            "head_dim": frozenset({192}),
+            "value_head_dim": frozenset({128}),
             "is_causal": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )
     def gluon_mla_prefill_gfx950(*args, **kwargs):
         return _mla_prefill_gfx950_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_prefill",
+        name="gluon_mla_prefill_8wave_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        # Registered for FP8 only for now. gluon_mla_prefill_gfx950 covers
+        # 16-bit inputs; measure and register support for 16-bit if needs arise.
+        signatures=format_signatures(
+            ("q", "k", "v"),
+            "dense",
+            {torch.float8_e4m3fn, torch.float8_e5m2},
+        ),
+        # Preferred over gluon_mla_prefill_gfx950 wherever both apply.
+        priority=Priority.SPECIALIZED + 1,
+        # For FP8 both kernels cover 256 query rows per block, so the 8-wave
+        # pipeline wins once each sequence has enough keys to pay off
+        # refilling it for every block. The threshold comes from cold-cache
+        # measurements of Kimi-K3 prefill shapes. mla_prefill_traits rounds
+        # avg_kv_len down to a power of two, so keep this minimum one too.
+        traits={
+            "avg_kv_len_min": frozenset({1024}),
+            "head_dim": frozenset({192}),
+            "value_head_dim": frozenset({128}),
+            "is_causal": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_prefill_8wave_gfx950(*args, **kwargs):
+        return _mla_prefill_8wave_gfx950_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -632,10 +768,10 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "qk_head_dim": frozenset({192}),
-            "v_head_dim": frozenset({128}),
+            "head_dim": frozenset({192}),
+            "value_head_dim": frozenset({128}),
             "is_causal": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
     )

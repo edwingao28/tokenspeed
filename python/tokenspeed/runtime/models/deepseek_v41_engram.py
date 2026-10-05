@@ -38,9 +38,9 @@ Integration contract:
   the corresponding runtime parameter name loaded. GPU and host-sharded tables
   copy local rows; shared host tables copy every row on the writer rank.
   Do not cast the model wholesale to BF16: table codes/scales must stay bytes.
-* wkv uses the existing quantized ReplicatedLinear and its normal post-load
-  processing. Its 32x32 scales are repeated across output rows as 1x32 MXFP8
-  scales, losslessly; no weight values are expanded or requantized.
+* wkv uses the caller-selected V4.1 Linear method for checkpoint scale
+  expansion, hardware storage and post-load preparation. Engram owns the
+  embedding loader and projection aliases, not a second projection loader.
   checkpoint_weight_aliases() maps raw checkpoint names, including
   wkv.scale, without renaming the embedding's per-row embed.scale.
 """
@@ -66,12 +66,16 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_reduce, prepare_all_reduce_lane
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
+from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+logger = get_colorful_logger(__name__)
 
 DEAD_TOKEN_ID = -1
 _ENGRAM_EMBED_SUFFIXES = (".engram.embed.weight", ".engram.embed.scale")
@@ -287,6 +291,21 @@ class EngramHashState(nn.Module):
             or previous_token_ids.dtype not in (torch.int32, torch.int64)
         ):
             raise TypeError("Engram expects int32/int64 IDs and a bool token mask")
+        if input_ids.is_cuda:
+            from tokenspeed_kernel.ops.embedding import engram_hash
+
+            hashes = engram_hash(
+                input_ids.reshape(-1).contiguous(),
+                previous_token_ids.reshape(-1, 3).contiguous(),
+                token_mask.reshape(-1).contiguous(),
+                self.token_map,
+                self.multipliers,
+                self.primes,
+                self.offsets,
+                self.pad_id,
+                DEAD_TOKEN_ID,
+            )
+            return hashes.view(*input_ids.shape, *self.offsets.shape)
         raw = torch.cat((input_ids.unsqueeze(-1), previous_token_ids), dim=-1).long()
         dead = raw == DEAD_TOKEN_ID
         dead[..., 0] |= ~token_mask
@@ -721,25 +740,32 @@ class RowShardedEngramEmbedding(nn.Module):
                 )
             values = values.masked_fill(~local.unsqueeze(-1), 0)
         if len(self.tp_group) > 1 and self.host_layout != "shared":
+            # The workspace all-reduce sizes itself on rows x trailing width.
+            # Reduce one row per token, [rows, columns * head_dim]: the lane is
+            # widened for that at construction (DeepseekV41Engram), so a
+            # decode batch stays inside the one-shot window. As
+            # [rows * columns, head_dim] the same bytes exceed the window's
+            # row capacity and drop to NCCL, which costs a ring latency plus a
+            # launch stall on every step.
+            flat = values.reshape(-1, values.shape[-2] * values.shape[-1])
             values = all_reduce(
-                values,
+                flat,
                 group=self.tp_group,
                 backend=None,
                 op=torch.distributed.ReduceOp.SUM,
-            )
+            ).view(values.shape)
         return values
 
 
-def _load_projection_scale(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-    if loaded_weight.dtype not in (torch.uint8, torch.float8_e8m0fnu):
-        raise TypeError("Engram wkv.scale must contain E8M0 exponents")
-    if loaded_weight.shape != ((param.shape[0] + 31) // 32, param.shape[1]):
-        raise ValueError("Engram wkv.scale must use checkpoint 32x32 blocks")
-    codes = loaded_weight.view(torch.uint8)
-    # Existing MXFP8 linear kernels accept per-row scales. Repeating exponents
-    # exactly preserves the checkpoint's 32x32 values without requantization.
-    values = codes.repeat_interleave(32, dim=0)[: param.shape[0]]
-    default_weight_loader(param, values)
+def engram_reduce_lane_width(layout: EngramLayout) -> int:
+    """Trailing width of the embedding all-reduce: one row per token.
+
+    The gathered values are ``[tokens, n_hash_cols, head_dim]``; they are
+    reduced as ``[tokens, n_hash_cols * head_dim]`` so the workspace
+    all-reduce sees one row per token and a decode batch stays inside its
+    one-shot row window. This is the lane width to arm for it.
+    """
+    return (layout.max_ngram_size - 1) * layout.n_heads * layout.head_dim
 
 
 class DeepseekV41Engram(nn.Module):
@@ -756,7 +782,7 @@ class DeepseekV41Engram(nn.Module):
         host_table: bool,
         host_layout: str,
     ):
-        """Construct from text config, attention mapping and the model's quant config.
+        """Construct with the V4.1 runtime quant config selected by the caller.
 
         prefix is the runtime module path (e.g. model.layers.1.engram). The
         checkpoint's wkv is [hidden_size * (hc_mult + 1), n_hash_cols * head_dim],
@@ -775,21 +801,14 @@ class DeepseekV41Engram(nn.Module):
         self.n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         if quant_config is not None:
             if (
-                not isinstance(quant_config, Fp8Config)
+                not isinstance(quant_config, Mxfp8Config)
                 or not quant_config.is_checkpoint_fp8_serialized
-                or quant_config.weight_block_size != [32, 32]
+                or quant_config.weight_block_size != [1, 32]
                 or quant_config.scale_fmt != "ue8m0"
             ):
                 raise ValueError(
-                    "Engram wkv requires checkpoint FP8 with 32x32 E8M0 scales"
+                    "Engram wkv requires the V4.1 runtime 1x32 MXFP8 config"
                 )
-            quant_config = Mxfp8Config(
-                is_checkpoint_fp8_serialized=True,
-                activation_scheme="dynamic",
-                ignored_layers=quant_config.ignored_layers,
-                weight_block_size=[1, 32],
-                scale_fmt="ue8m0",
-            )
         with torch.device(device):
             self.wkv = ReplicatedLinear(
                 input_size=self.n_hash_cols * layout.head_dim,
@@ -808,7 +827,9 @@ class DeepseekV41Engram(nn.Module):
                 torch.ones(self.hc_mult, self.dim, dtype=torch.bfloat16),
                 requires_grad=False,
             )
-        if quant_config is not None and self.wkv.weight.dtype != torch.float8_e4m3fn:
+        if quant_config is not None and not isinstance(
+            self.wkv.quant_method, Fp8LinearMethod
+        ):
             raise ValueError(
                 "Do not exclude Engram wkv from checkpoint FP8 quantization"
             )
@@ -823,8 +844,24 @@ class DeepseekV41Engram(nn.Module):
         )
         self.q_weight.weight_loader = default_weight_loader
         self.k_weight.weight_loader = default_weight_loader
-        if hasattr(self.wkv, "weight_scale_inv"):
-            self.wkv.weight_scale_inv._weight_loader = _load_projection_scale
+        # The embedding reduces [tokens, n_hash_cols * head_dim] across attention
+        # TP; widen the one-shot lane to that width so decode batches take the
+        # workspace kernel. Collective: every rank builds the same layers.
+        self.reduce_lane_armed = False
+        if (
+            len(mapping.attn.tp_group) > 1
+            and host_layout != "shared"
+            and torch.distributed.is_initialized()
+        ):
+            width = engram_reduce_lane_width(layout)
+            self.reduce_lane_armed = prepare_all_reduce_lane(
+                mapping.attn.tp_group, width
+            )
+            if not self.reduce_lane_armed:
+                logger.warning(
+                    f"{prefix!s}: one-shot all-reduce lane of width {width:d} not "
+                    "armed; the Engram embedding reduce falls back to NCCL"
+                )
 
     def checkpoint_weight_aliases(self) -> dict[str, str]:
         """Return raw layers.<id>.engram checkpoint names to runtime param paths.

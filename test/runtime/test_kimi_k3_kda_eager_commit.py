@@ -27,7 +27,7 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     _packed_qkv_views,
 )
-from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
+from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
 _LOWER_BOUND = -5.0
 H, D, D_FA = 4, 128, 128
@@ -66,7 +66,9 @@ class _Harness:
             component=lambda cls: None,
         )
         self.config = config
-        self.backend = KdaAttnBackend(config, spec)
+        self.backend = KdaAttnBackend(
+            config, spec, enable_prefill_graph=False, kda_backend="auto"
+        )
         self.backend.set_kv_pool(self.pool)
         # The persistent decode buffers exist from construction, as at the
         # wrapper (the verify refresh below writes into them).
@@ -160,7 +162,7 @@ class _Harness:
         self.prepare_metadata(rpis, pages, seq_lens)
         self.forward(self.inputs(bs, seed), bs)
         self.backend.commit_verified_state(
-            torch.tensor(accepted, dtype=torch.int32, device=DEV)
+            torch.tensor(accepted, dtype=torch.int32, device=DEV), accepted_path=None
         )
 
 
@@ -295,8 +297,8 @@ def test_direct_committed_read_matches_seeded_verify_and_commit_bitwise():
             )
 
     accepted = torch.tensor([1, T, 2], dtype=torch.int32, device=DEV)
-    direct.backend.commit_verified_state(accepted)
-    seeded.backend.commit_verified_state(accepted)
+    direct.backend.commit_verified_state(accepted, accepted_path=None)
+    seeded.backend.commit_verified_state(accepted, accepted_path=None)
     torch.cuda.synchronize()
     for layer_id in direct.layer_ids:
         for component in ("conv_state", "recurrent_state"):
@@ -387,8 +389,8 @@ def test_packed_qkv_views_match_materialized_split_across_commits():
             assert torch.equal(viewed_state[write_rows], materialized_state[write_rows])
 
         accepted_tensor = torch.tensor(accepted, dtype=torch.int32, device=DEV)
-        viewed.backend.commit_verified_state(accepted_tensor)
-        materialized.backend.commit_verified_state(accepted_tensor)
+        viewed.backend.commit_verified_state(accepted_tensor, accepted_path=None)
+        materialized.backend.commit_verified_state(accepted_tensor, accepted_path=None)
         torch.cuda.synchronize()
         for viewed_layer in viewed.layer_ids:
             for component in ("conv_state", "recurrent_state"):
@@ -492,11 +494,11 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
             stable_inputs[name].copy_(value)
         accepted_source.copy_(torch.tensor(accepted, dtype=torch.int32, device=DEV))
         graph.replay()
-        captured.backend.commit_verified_state(stable_accepted)
+        captured.backend.commit_verified_state(stable_accepted, accepted_path=None)
 
         eager.prepare_metadata(rpis, pages, seq_lens)
         eager.forward(replay_inputs, bs)
-        eager.backend.commit_verified_state(stable_accepted)
+        eager.backend.commit_verified_state(stable_accepted, accepted_path=None)
         torch.cuda.synchronize()
         _assert_committed_pages_equal(captured, eager, pages)
         seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
@@ -528,7 +530,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     graph.replay()  # Deliberately omit commit_verified_state.
     eager.prepare_metadata(rpis, pages, seq_lens)
     eager.forward(replay_inputs, bs)
-    eager.backend.commit_verified_state(stable_accepted)
+    eager.backend.commit_verified_state(stable_accepted, accepted_path=None)
     torch.cuda.synchronize()
     with pytest.raises(AssertionError):
         _assert_committed_pages_equal(captured, eager, pages)
@@ -549,10 +551,10 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
     )
     assert planned_bytes == allocated_bytes
     server_args = SimpleNamespace(speculative_num_draft_tokens=T)
-    config = SimpleNamespace(max_bs=8)
+    config = SimpleNamespace(max_bs=8, qcp_size=1)
     backend = SimpleNamespace(linear_attn_backend=harness.backend)
 
-    _prepare_verify_workspace(
+    _prepare_fixed_workspaces(
         server_args=server_args,
         config=config,
         backend=backend,
@@ -564,9 +566,9 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
 
     with pytest.raises(
         RuntimeError,
-        match="planned verify workspace does not match allocated tensors",
+        match="planned fixed workspace does not match allocated tensors",
     ):
-        _prepare_verify_workspace(
+        _prepare_fixed_workspaces(
             server_args=server_args,
             config=config,
             backend=backend,
@@ -600,7 +602,13 @@ def test_equal_geometry_pool_replacement_rebinds_batched_replay():
     assert harness.backend._batched_replay_ready
 
     replacement = _make_kimi_pool(DEV, usable_pages=24)
+    # Prefill snapshots also refer to the old pool; publishing a replacement
+    # must drop them before eager preparation or startup recapture rebuilds them.
+    harness.backend._prefill_metadata[8, 1] = object()
+    harness.backend._prefill_metadata_pool = harness.pool
     harness.backend.set_kv_pool(replacement)
+    assert not harness.backend._prefill_metadata
+    assert harness.backend._prefill_metadata_pool is None
     harness.pool = replacement
     harness.contract = replacement.arena.runtime_contract
     harness.prepare_metadata([0], pages, [8 + T])

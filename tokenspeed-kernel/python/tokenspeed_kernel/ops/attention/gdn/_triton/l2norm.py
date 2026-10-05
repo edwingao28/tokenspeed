@@ -42,6 +42,8 @@ def l2norm_fwd_kernel1(
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     i_t = tl.program_id(0)
     x += i_t * D
     y += i_t * D
@@ -55,8 +57,6 @@ def l2norm_fwd_kernel1(
     # Normalize and apply linear transformation
     b_y = b_x * b_rstd
     tl.store(y + cols, b_y, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -64,8 +64,9 @@ def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    # The row count follows the batch; runtime so every batch shape shares one
+    # binary (block pointer shapes accept runtime values).
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
@@ -73,6 +74,8 @@ def l2norm_fwd_kernel(
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     i_t = tl.program_id(0)
     p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
@@ -80,8 +83,6 @@ def l2norm_fwd_kernel(
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
     p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def l2norm_fwd(
@@ -104,7 +105,6 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -113,7 +113,6 @@ def l2norm_fwd(
             x,
             y,
             eps,
-            NB=NB,
             T=T,
             D=D,
             BD=BD,

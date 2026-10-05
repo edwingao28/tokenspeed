@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -99,6 +100,12 @@ public:
         return std::max(0, max_new_tokens_ - (PrefillSize() - submitted_prompt_size_));
     }
 
+    // Longest prompt prefix the admission probe may claim from the prefix
+    // cache (RequestSpec::max_cached_prefix_tokens); INT32_MAX means
+    // unbounded. A readmission after retraction relaxes it to the positions
+    // whose results had landed before (fsm::Retracted::LandedTokens).
+    std::int32_t MaxCachedPrefixTokens() const { return max_cached_prefix_tokens_; }
+
     template <typename Event>
     void Apply(Event&& event) {
         state_ = std::visit(
@@ -170,6 +177,12 @@ public:
     std::vector<std::int32_t> TakeSpecCandidates() { return std::exchange(spec_candidate_ids_, {}); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
     PrefillInfo CurrentPrefillInfo() const;
+    // Tokens whose KV and state the ordered forward stream has written, or
+    // is writing, ahead of any later plan: the end of a scheduled prefill
+    // window, or -- once decoding -- every token but the last, which is the
+    // sampled input the next forward computes. Exact for any verify width;
+    // the frontier for prefix publication and retention.
+    std::int32_t NumComputedTokens() const;
 
     std::int32_t UnscheduledPrefillSize() const {
         return std::visit(Overloaded{
@@ -193,7 +206,6 @@ public:
     // tables the same admission fills: resources and progress land at
     // admission time, and a state transition only moves them on.
     fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
-    std::int32_t MaterializedStateBoundaryTokens() const;
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
@@ -233,6 +245,7 @@ private:
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
+    std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};

@@ -128,11 +128,9 @@ def _load_a_to_shared(
         )
     else:
         values = gl.load(base + offsets, mask=mask, other=0)
-        # E4M3 MFMAs share each A row across N-partitioned waves. Finish
-        # reading the old tile before any wave reuses this LDS slot.
-        gl.barrier()
+        # The compiler's LDS dependence analysis orders this store against
+        # the previous tile's cross-wave reads and the reads that follow.
         destination.store(values)
-        gl.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +150,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     num_tokens_post_padded_ptr,
     sorted_weights_ptr,
     N,
+    K: gl.constexpr,
     EM,
     token_num,
     top_k,
@@ -201,12 +200,18 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     """
 
     gl.static_assert(
-        BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == 128,
-        "1x2 kernel requires BLOCK_M in {32, 64, 128}",
+        BLOCK_M == 32
+        or BLOCK_M == 64
+        or BLOCK_M == 128
+        or (BLOCK_M == 16 and A_FORMAT == "e2m1"),
+        "1x2 kernel requires BLOCK_M in {32, 64, 128}, or 16 for E2M1",
     )
     gl.static_assert(
-        SORT_BLOCK_M == 32 or SORT_BLOCK_M == 64 or SORT_BLOCK_M == 128,
-        "1x2 kernel requires SORT_BLOCK_M in {32, 64, 128}",
+        SORT_BLOCK_M == 16
+        or SORT_BLOCK_M == 32
+        or SORT_BLOCK_M == 64
+        or SORT_BLOCK_M == 128,
+        "1x2 kernel requires SORT_BLOCK_M in {16, 32, 64, 128}",
     )
     gl.static_assert(SORT_BLOCK_M % BLOCK_M == 0)
     gl.static_assert(BLOCK_N == 256, "1x2 kernel requires BLOCK_N=256")
@@ -219,8 +224,10 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     BLOCK_K_A: gl.constexpr = BLOCK_K // A_DIV
     BLOCK_K_B: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32  # 4
-    NUM_K_ITERS: gl.constexpr = K_PACKED_TOTAL // BLOCK_K_B
-    gl.static_assert(NUM_K_ITERS >= 2 and NUM_K_ITERS % 2 == 0)
+    NUM_K_ITERS: gl.constexpr = K // BLOCK_K
+    gl.static_assert(K % BLOCK_K == 0 and NUM_K_ITERS >= 2)
+    gl.static_assert(K <= K_PACKED_TOTAL * 2)
+    gl.static_assert(K_PACKED_TOTAL % 128 == 0)
     NUM_BUFFERS: gl.constexpr = 2
     # 4 N-chunks of 64 cols each at BLOCK_N = 256. With warps_per_cta=[1, 4]
     # each wave owns 1/4 of a chunk = 16 cols, so per wave [128, 16] per chunk.
@@ -285,6 +292,14 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
             [1, 0],
         )
         shared_a_m_bases: gl.constexpr = []
+    elif BLOCK_M == 16:
+        gload_a_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 16],
+            [16, 4],
+            [1, 4],
+            [1, 0],
+        )
+        shared_a_m_bases: gl.constexpr = [[1, 0], [2, 0], [4, 0], [8, 0]]
     elif BLOCK_M == 32:
         gload_a_layout: gl.constexpr = gl.BlockedLayout(
             [1, 16],
@@ -389,8 +404,14 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
             flat_tile = pid_n * num_pid_m + pid_m
         else:
             flat_tile = cta_id
-            pid_m = flat_tile % num_pid_m
-            pid_n = flat_tile // num_pid_m
+            if not USE_REDUCE and A_FORMAT == "e2m1":
+                # Spread simultaneous atomic updates across output columns,
+                # instead of having every expert update the same N tile.
+                pid_m = flat_tile // num_pid_n
+                pid_n = flat_tile % num_pid_n
+            else:
+                pid_m = flat_tile % num_pid_m
+                pid_n = flat_tile // num_pid_m
         tile_ok = (
             (pid_n < num_pid_n)
             & (pid_m < num_pid_m)
@@ -459,11 +480,10 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 )
 
                 if COALESCE_SCALES:
-                    if DIRECT_SCALE_LAYOUT:
-                        # Diagnostic path: load A scales directly in the MFMA
-                        # scale layout.  This removes the full-layout
-                        # convert_layout that emits v_cndmask near line 395,
-                        # at the cost of a less coalescer-friendly load shape.
+                    if DIRECT_SCALE_LAYOUT or BLOCK_M == 16:
+                        # A 16-row tile covers half of the 32-row scale panel.
+                        # Address its half directly in the MFMA layout instead
+                        # of reshaping it into a whole-panel coalesced load.
                         m_full_layout: gl.constexpr = gl.SliceLayout(
                             1, a_scale_layout_full
                         )
@@ -913,11 +933,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     b_scale1_c3 = gl.convert_layout(b_scale1_c3, b_scale_layout_chunk)
 
                 cdna4_async_copy.wait_group(1)
-                if USE_ASYNC_A:
-                    # The async copy and MFMA layouts distribute rows across
-                    # waves differently. Publish the completed LDS writes
-                    # before every wave reads its dot operand.
-                    gl.barrier()
+                # The copy wait is wave-local; the compiler emits the CTA
+                # barrier that publishes the LDS writes right after the wait.
                 a0 = cdna4_async_copy.load_shared_relaxed(smem_a.index(0), dot_a_layout)
                 acc0 = gl.amd.cdna4.mfma_scaled(
                     a=a0,
@@ -984,12 +1001,25 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 # BM64, and [8, 64] at BM32. A fixed four-row ownership
                 # would alias rows for the smaller tiles.
                 if MFMA_STORE_LAYOUT:
-                    # Small-M atomic A/B path: keep the accumulator's MFMA
-                    # layout through the store to avoid the convert_layout
-                    # LDS shuffle/barrier tax.  Stores are less coalesced, so
-                    # reduce mode keeps the coalesced C-shuffle layout because
-                    # the launcher pairs MFMA-store layout with atomic mode.
+                    # Keep the existing E4M3 atomic epilogue in MFMA layout.
                     store_layout: gl.constexpr = mfma_layout
+                elif not USE_REDUCE:
+                    # Packed BF16 atomics update two adjacent columns per lane.
+                    # Unlike the eight-value plain-store layout below, a half
+                    # wave issues one contiguous 128-byte span per instruction.
+                    store_layout: gl.constexpr = gl.BlockedLayout(
+                        size_per_thread=[1, 2],
+                        threads_per_warp=[2, 32],
+                        warps_per_cta=[4, 1],
+                        order=[1, 0],
+                    )
+                elif BLOCK_M == 16:
+                    store_layout: gl.constexpr = gl.BlockedLayout(
+                        size_per_thread=[1, 8],
+                        threads_per_warp=[4, 16],
+                        warps_per_cta=[4, 1],
+                        order=[1, 0],
+                    )
                 else:
                     store_layout: gl.constexpr = gl.BlockedLayout(
                         size_per_thread=[BLOCK_M // 32, 8],
@@ -1056,8 +1086,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 m3 = tok_ok
 
                 cdna4_async_copy.wait_group(0)
-                if USE_ASYNC_A:
-                    gl.barrier()
                 a1 = cdna4_async_copy.load_shared_relaxed(smem_a.index(1), dot_a_layout)
 
                 if DEFER_EPILOGUE:
@@ -1105,11 +1133,13 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     # every remaining pair so EP can consume the full expert
                     # intermediate (K=3072 for Kimi-K3), while retaining the
                     # same two-buffer schedule used by the short TP shard.
-                    for pair_k in range(2, NUM_K_ITERS, 2):
+                    for pair_k in range(2, NUM_K_ITERS - NUM_K_ITERS % 2, 2):
                         if USE_ASYNC_A:
                             # Every MFMA wave reads all M rows. Finish those
                             # cross-wave reads before any wave reuses either
                             # shared slot as the next async-copy destination.
+                            # load_shared_relaxed opts out of the compiler's
+                            # async-copy hazard tracking, so this stays explicit.
                             gl.barrier()
                         _load_a_to_shared(
                             smem_a.index(0),
@@ -1255,8 +1285,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         )
 
                         cdna4_async_copy.wait_group(1)
-                        if USE_ASYNC_A:
-                            gl.barrier()
                         a_even = cdna4_async_copy.load_shared_relaxed(
                             smem_a.index(0), dot_a_layout
                         )
@@ -1297,8 +1325,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             acc=acc3,
                         )
                         cdna4_async_copy.wait_group(0)
-                        if USE_ASYNC_A:
-                            gl.barrier()
                         a_odd = cdna4_async_copy.load_shared_relaxed(
                             smem_a.index(1), dot_a_layout
                         )
@@ -1335,6 +1361,125 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             a_format=A_FORMAT,
                             b=b_odd_c3,
                             b_scale=b_scale_odd_c3,
+                            b_format="e2m1",
+                            acc=acc3,
+                        )
+                    if NUM_K_ITERS % 2:
+                        # The pipeline consumes BK128 tiles in pairs. For odd
+                        # multiples of 128, handle the final tile alone instead
+                        # of computing a padding tile. This branch is compile-time;
+                        # even tile counts omit it. Keep physical storage padded
+                        # and finish prior LDS reads before reusing their slot.
+                        tail_k: gl.constexpr = NUM_K_ITERS - 1
+                        if USE_ASYNC_A:
+                            gl.barrier()
+                        _load_a_to_shared(
+                            smem_a.index(0),
+                            a_base_ptr,
+                            a_copy_offsets + tail_k * A_DATA_K_STEP,
+                            token_mask[:, None],
+                            USE_ASYNC=USE_ASYNC_A,
+                        )
+                        cdna4_async_copy.commit_group()
+                        a_k_tail = tail_k * BLOCK_K_SCALE + a_k_lanes
+                        a_k_part_tail = (
+                            (a_k_tail // 8) * 256
+                            + (a_k_tail % 4) * 64
+                            + ((a_k_tail % 8) // 4) * 2
+                        )[None, :]
+                        a_scale_tail = gl.amd.cdna4.buffer_load(
+                            ptr=a_scales_ptr, offsets=a_m_part + a_k_part_tail
+                        )
+                        if B_GDOT128:
+                            b_tail_k = tail_k * BLOCK_K_B + offs_bk
+                            b_tail_c0_off = _gdot128_weight_offset(
+                                b_tail_k[:, None], offs_bn_c0[None, :], N_PHYS
+                            )
+                            b_tail_c1_off = _gdot128_weight_offset(
+                                b_tail_k[:, None], offs_bn_c1[None, :], N_PHYS
+                            )
+                            b_tail_c2_off = _gdot128_weight_offset(
+                                b_tail_k[:, None], offs_bn_c2[None, :], N_PHYS
+                            )
+                            b_tail_c3_off = _gdot128_weight_offset(
+                                b_tail_k[:, None], offs_bn_c3[None, :], N_PHYS
+                            )
+                        else:
+                            b_tail_c0_off = offs_b_c0 + tail_k * B_DATA_K_STEP1
+                            b_tail_c1_off = offs_b_c1 + tail_k * B_DATA_K_STEP1
+                            b_tail_c2_off = offs_b_c2 + tail_k * B_DATA_K_STEP1
+                            b_tail_c3_off = offs_b_c3 + tail_k * B_DATA_K_STEP1
+                        b_tail_c0 = gl.amd.cdna4.buffer_load(
+                            ptr=b_base_ptr, offsets=b_tail_c0_off
+                        )
+                        b_tail_c1 = gl.amd.cdna4.buffer_load(
+                            ptr=b_base_ptr, offsets=b_tail_c1_off
+                        )
+                        b_tail_c2 = gl.amd.cdna4.buffer_load(
+                            ptr=b_base_ptr, offsets=b_tail_c2_off
+                        )
+                        b_tail_c3 = gl.amd.cdna4.buffer_load(
+                            ptr=b_base_ptr, offsets=b_tail_c3_off
+                        )
+                        bsc_k_tail = tail_k * BLOCK_K_SCALE + b_k_lanes
+                        bsc_k_off_tail = (
+                            (bsc_k_tail // 8) * 256
+                            + (bsc_k_tail % 4) * 64
+                            + ((bsc_k_tail % 8) // 4) * 2
+                        )[None, :]
+                        b_scale_tail_c0 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base,
+                            offsets=b_n_scale_part_c0 + bsc_k_off_tail,
+                        )
+                        b_scale_tail_c1 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base,
+                            offsets=b_n_scale_part_c1 + bsc_k_off_tail,
+                        )
+                        b_scale_tail_c2 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base,
+                            offsets=b_n_scale_part_c2 + bsc_k_off_tail,
+                        )
+                        b_scale_tail_c3 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base,
+                            offsets=b_n_scale_part_c3 + bsc_k_off_tail,
+                        )
+                        cdna4_async_copy.wait_group(0)
+                        a_tail = cdna4_async_copy.load_shared_relaxed(
+                            smem_a.index(0), dot_a_layout
+                        )
+                        acc0 = gl.amd.cdna4.mfma_scaled(
+                            a=a_tail,
+                            a_scale=a_scale_tail,
+                            a_format=A_FORMAT,
+                            b=b_tail_c0,
+                            b_scale=b_scale_tail_c0,
+                            b_format="e2m1",
+                            acc=acc0,
+                        )
+                        acc1 = gl.amd.cdna4.mfma_scaled(
+                            a=a_tail,
+                            a_scale=a_scale_tail,
+                            a_format=A_FORMAT,
+                            b=b_tail_c1,
+                            b_scale=b_scale_tail_c1,
+                            b_format="e2m1",
+                            acc=acc1,
+                        )
+                        acc2 = gl.amd.cdna4.mfma_scaled(
+                            a=a_tail,
+                            a_scale=a_scale_tail,
+                            a_format=A_FORMAT,
+                            b=b_tail_c2,
+                            b_scale=b_scale_tail_c2,
+                            b_format="e2m1",
+                            acc=acc2,
+                        )
+                        acc3 = gl.amd.cdna4.mfma_scaled(
+                            a=a_tail,
+                            a_scale=a_scale_tail,
+                            a_format=A_FORMAT,
+                            b=b_tail_c3,
+                            b_scale=b_scale_tail_c3,
                             b_format="e2m1",
                             acc=acc3,
                         )
@@ -1442,37 +1587,47 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
 
 @gluon.jit
 def gluon_mxfp4_moe_stage2_reduce_kernel(
-    partials_ptr,  # bf16, shape [token_num, topk, N], contiguous
-    out_ptr,  # bf16, shape [token_num, N]
+    partials_ptr,  # shape [token_num, topk, N]
+    out_ptr,  # shape [token_num, N]
     token_num,
     N,
-    stride_pt,  # partials: stride for token dim = topk * N
-    stride_ps,  # partials: stride for slot  dim = N
-    stride_pn,  # partials: stride for col   dim = 1
+    stride_pt,  # partials: stride for token dim
+    stride_ps,  # partials: stride for slot dim
+    stride_pn,  # partials: stride for col dim
     stride_ot,
     stride_on,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     TOP_K: gl.constexpr,
+    MASK_INVALID_ROUTES: gl.constexpr,
+    route_ids_ptr=None,  # [token_num, topk] expert IDs, read when masking
+    stride_rt=0,
+    stride_rs=0,
+    expert_start=0,
+    num_experts=0,
 ):
     """Sum per-(token, slot) partials over the topk dim.
 
     Grid: ``(cdiv(token_num, BLOCK_M) * cdiv(N, BLOCK_N),)``. Each CTA
     owns a ``[BLOCK_M, BLOCK_N]`` tile of the output and reads
     ``TOP_K`` slices from the partial buffer, accumulating in fp32 and
-    casting back to bf16 at the end. ``TOP_K`` is a constexpr so the
-    accumulation loop unrolls (TOP_K is small: 4-10 across the models
-    we serve).
+    casting to the output dtype at the end. ``TOP_K`` is a constexpr so the
+    accumulation loop unrolls.
+
+    With ``MASK_INVALID_ROUTES``, a slot whose route ID lies outside
+    ``[expert_start, expert_start + num_experts)`` contributes zero instead of
+    reading its partial row, which a producer that drops such routes (the
+    expert-sorted decode tiles) never writes.
     """
     pid = gl.program_id(axis=0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    # Plain blocked layout for the bf16 tile. 1 wave / CTA, NUM_WARPS=1.
+    # Plain blocked layout for the tile. 1 wave / CTA, NUM_WARPS=1.
     blk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[16, 4],
+        size_per_thread=[1, 4],
+        threads_per_warp=[1, 64],
         warps_per_cta=[1, 1],
         order=[1, 0],
     )
@@ -1490,7 +1645,16 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     )
     for s in gl.static_range(0, TOP_K):
         p = base + s * stride_ps
-        v = gl.load(p, mask=m_mask, other=0.0)
+        mask = m_mask
+        if MASK_INVALID_ROUTES:
+            ids = gl.load(
+                route_ids_ptr + offs_m.to(gl.int64) * stride_rt + s * stride_rs,
+                mask=offs_m < token_num,
+                other=-1,
+            )
+            valid = (ids >= expert_start) & (ids < expert_start + num_experts)
+            mask = mask & valid[:, None]
+        v = gl.load(p, mask=mask, other=0.0)
         acc += v.to(gl.float32)
 
     out_ptrs = (
@@ -1563,9 +1727,9 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     by launching the GEMM kernel followed, in reduce mode, by a small
     reduce that sums each token's ``topk`` partial contributions into
-    ``out``. The wrapper can instead use the direct-atomic path for
-    small M, but the standalone Kimi comparison currently forces reduce
-    mode at M512 because this Gluon atomic epilogue is still slower.
+    ``out``. The direct-atomic path instead combines in BF16 inside GEMM2,
+    avoiding the partials buffer and reduction launch. Atomic accumulation
+    order is not deterministic and differs from the FP32 reduction.
 
     Steps below correspond to the ``# Step N:`` comments in the body:
       1. Validate inputs; reject unsupported modes.
@@ -1584,13 +1748,17 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     Layout contract:
         inter_states : E2M1-packed uint8 or E4M3 activation rows, optionally
-                       already flattened and sorted
-        w2           : (E, D, I_r_packed) uint8 in MFMA-tile layout
-        a2_scale     : (M_padded_aligned, K // 32) uint8 e8m0
-        w2_scale     : (E, D, K // 32) uint8 e8m0
+                       already flattened and sorted. A 2D view can expose
+                       logical K while keeping its physical row pitch.
+                       K must be a multiple of 128 and at least 256.
+        w2           : (E, D, K_physical // 2) uint8 in MFMA-tile layout;
+                       K_physical >= K, with unchanged expert strides
+        a2_scale     : (M_padded_aligned, K_physical // 32) uint8 e8m0
+        w2_scale     : (E, D, K_physical // 32) uint8 e8m0; both scale
+                       tensors retain physical CDNA4 panel pitches
         out          : (token_num, D) bf16 -- final per-token output
         sorted_*     : generated with ``sort_block_m`` when it differs
-                       from compute ``block_m``; use 32/64/128 to mirror
+                       from compute ``block_m``; use 16/32/64/128 to mirror
                        FlyDSL sort_block_m
 
     Unsupported: ``quant_type`` and ``activation`` are signature
@@ -1651,16 +1819,28 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     assert w2.dim() == 3
     E_w, D, I_r_packed_w = w2.shape
     N = D
-    assert I_r_packed_w * 2 == K
+    K_physical = I_r_packed_w * 2
+    assert K <= K_physical, "logical K exceeds physical W2 capacity"
     EM = sorted_token_ids.shape[0]
     if input_sorted and M_padded < EM:
         raise ValueError(
             f"sorted stage2 input has {M_padded} rows but routing requires {EM}"
         )
-    K_scale = K // 32
+    assert K_physical % 256 == 0, "physical K needs complete scale panels"
+    K_scale = K_physical // 32
     assert a2_scale.dim() == 2 and a2_scale.shape[1] == K_scale
     assert w2_scale.shape == (E_w, N, K_scale)
     assert sorted_weights.shape[0] == EM
+    if K < K_physical:
+        # The scale swizzle is a physical 32-row x 8-column panel layout,
+        # not a row-major logical-K view. Only the A reduction width shrinks.
+        assert inter_2d.stride(1) == 1
+        assert inter_2d.stride(0) >= I_r_stored
+        assert w2.stride(2) == 1 and w2.stride(0) >= N * I_r_packed_w
+        assert a2_scale.is_contiguous()
+        assert a2_scale.shape[0] >= triton.cdiv(EM, 32) * 32
+        assert w2_scale.stride(1) == K_scale and w2_scale.stride(2) == 1
+        assert w2_scale.stride(0) >= N * K_scale
 
     # The kernel reads the valid extent from ``num_valid_ids_ptr`` on-device
     # (``num_tokens_post_padded = gl.load(...)``); the device pointer is the
@@ -1673,19 +1853,20 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         )
 
     BLOCK_M = 128 if block_m is None else int(block_m)
-    if BLOCK_M not in (32, 64, 128):
+    if BLOCK_M not in (16, 32, 64, 128) or (BLOCK_M == 16 and a_format != "e2m1"):
         raise NotImplementedError(
-            f"stage2 1x2 block_m must be one of 32, 64, 128; got {BLOCK_M}"
+            f"stage2 1x2 block_m must be 32, 64, 128, or 16 for E2M1; got {BLOCK_M}"
         )
     SORT_BLOCK_M = BLOCK_M if sort_block_m is None else int(sort_block_m)
-    if SORT_BLOCK_M not in (32, 64, 128) or SORT_BLOCK_M % BLOCK_M != 0:
+    if SORT_BLOCK_M not in (16, 32, 64, 128) or SORT_BLOCK_M % BLOCK_M != 0:
         raise NotImplementedError(
-            "stage2 1x2 sort_block_m must be one of 32, 64, 128 "
+            "stage2 1x2 sort_block_m must be one of 16, 32, 64, 128 "
             f"and divisible by block_m; got {SORT_BLOCK_M} for block_m={BLOCK_M}"
         )
     BLOCK_N = 256
     BLOCK_K = 128
     NUM_WARPS = 4
+    assert K >= 256, "stage2 requires at least two BK128 tiles"
     assert K % BLOCK_K == 0, f"K ({K}) must be divisible by BLOCK_K ({BLOCK_K})"
 
     num_pid_m = triton.cdiv(EM, BLOCK_M)
@@ -1711,29 +1892,13 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     # epilogue phase) is ~3.6% faster and bit-exact, so it is always on.
     DEFER_EPILOGUE = True
 
-    # Atomic vs reduce dispatch.
-    #
-    # At small M, the cross-slot reduce overhead (extra scratch write +
-    # separate reduce kernel launch) dominates: at M=16 the reduce alone
-    # is ~12 % of the stage 2 budget while reducing essentially nothing
-    # (each output row has at most a handful of contributors and the
-    # atomic_add path costs ~3-4 atomic_pk_add_bf16 per row instead).
-    #
-    # At large M the atomic_add path loses to scratch+reduce because
-    # M * topk concurrent atomic_pk_add_bf16 ops contend on the same
-    # output rows (the cost is in serialization at the HBM line, not
-    # the instruction).
-    #
-    # With FlyDSL-like smaller sort blocks, the reduce path is faster
-    # starting at M512: direct atomic avoids the reduce launch, but this
-    # Gluon epilogue still loses to topk-way output-row contention.
-    # Keep tiny/decode shapes on atomic and switch to scratch+reduce for
-    # M>=512. The ``force_reduce`` caller argument overrides the tuned default.
+    # Preserve the standalone launcher's default; the package dispatcher
+    # explicitly selects combine mode using the local/global expert range.
     if force_reduce is not None:
         _use_reduce = bool(force_reduce)
     else:
         _use_reduce = token_num >= 512
-    _mfma_store_layout = not _use_reduce
+    _mfma_store_layout = not _use_reduce and a_format == "e4m3"
 
     # See stage 1: the async-copy path uses raw bytes in LDS and the scaled
     # MFMA interprets them as E4M3 according to ``A_FORMAT``.
@@ -1744,7 +1909,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     stride_bse_e = w2_scale.stride(0)
     stride_bse_n = w2_scale.stride(1)
     stride_se_n_pad = a2_scale.shape[1]
-    K_packed_total = K // 2
+    K_packed_total = I_r_packed_w
 
     if _use_reduce:
         # Reduce path (large M): GEMM writes per-(token, slot) cells of
@@ -1782,6 +1947,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         num_valid_ids_ptr,
         sorted_weights,
         N,
+        K,
         EM,
         token_num,
         topk,
@@ -1814,9 +1980,9 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     if _use_reduce:
         # Step 6: reduce. Sum partials[token, :, n] over the topk dim
-        # (fp32 accumulate, bf16 output) into `out`. Tile (32, 256),
+        # (fp32 accumulate, bf16 output) into `out`. Tile (1, 256),
         # 1 wave/CTA.
-        BLOCK_M_R = 16 if token_num >= 4096 else 32
+        BLOCK_M_R = 1
         BLOCK_N_R = 256
         NUM_WARPS_R = 1
         rgrid = (triton.cdiv(token_num, BLOCK_M_R) * triton.cdiv(N, BLOCK_N_R),)
@@ -1833,6 +1999,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             BLOCK_M=BLOCK_M_R,
             BLOCK_N=BLOCK_N_R,
             TOP_K=topk,
+            MASK_INVALID_ROUTES=False,
             num_warps=NUM_WARPS_R,
         )
     if _USES_FP32_ATOMIC is None:

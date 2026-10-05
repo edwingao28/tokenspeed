@@ -66,46 +66,30 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
-@pytest.mark.parametrize("save_kv_cache", [False, True])
-def test_qsa_sparse_requires_cache_write(monkeypatch, forward_name, save_kv_cache):
+def test_qsa_sparse_attends_the_prewritten_cache(monkeypatch, forward_name):
     backend = object.__new__(QSAAttnBackend)
     sparse = Mock(return_value=object())
     monkeypatch.setattr(backend, "_sparse_attention", sparse)
-    args = tuple(object() for _ in range(6))
+    q, k, v, layer, locs, pool = (object() for _ in range(6))
     topk, ctx = object(), object()
-    forward = partial(
-        getattr(backend, forward_name),
-        *args,
-        bs=1,
-        save_kv_cache=save_kv_cache,
-        topk_indices=topk,
-        ctx=ctx,
+    output = getattr(backend, forward_name)(
+        q, k, v, layer, locs, pool, bs=1, topk_indices=topk, ctx=ctx
     )
-    if save_kv_cache:
-        assert forward() is sparse.return_value
-        sparse.assert_called_once_with(*args, topk, ctx)
-    else:
-        with pytest.raises(AssertionError, match="QSA.*requires save_kv_cache=True"):
-            forward()
-        sparse.assert_not_called()
+    assert output is sparse.return_value
+    sparse.assert_called_once_with(q, layer, pool, topk, ctx)
 
 
 @pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
-@pytest.mark.parametrize("save_kv_cache", [False, True])
-def test_qsa_dense_forwards_cache_write_flag(monkeypatch, forward_name, save_kv_cache):
+def test_qsa_dense_falls_through_to_mha(monkeypatch, forward_name):
     backend = object.__new__(QSAAttnBackend)
     dense = Mock(return_value=object())
     monkeypatch.setattr(MHAAttnBackend, forward_name, dense)
     args = tuple(object() for _ in range(6))
     output = getattr(backend, forward_name)(
-        *args,
-        bs=1,
-        save_kv_cache=save_kv_cache,
-        topk_indices=None,
-        ctx=object(),
+        *args, bs=1, topk_indices=None, ctx=object()
     )
     assert output is dense.return_value
-    dense.assert_called_once_with(*args, 1, save_kv_cache=save_kv_cache)
+    dense.assert_called_once_with(*args, 1)
 
 
 def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
@@ -233,16 +217,24 @@ def test_qsa_preallocation_preserves_workspace_and_budget(state) -> None:
     assert state._verify_workspace is workspace
 
 
-def test_qsa_indexer_workspace_cannot_be_rebound(state) -> None:
+def test_qsa_indexer_rebind_moves_its_verify_state_to_the_new_pool(state) -> None:
     _, backend = _root_with_indexer(
         _qsa_config(max_bs=8, is_draft=False, device="cpu"), state.cache_pool
     )
     backend.preallocate_verify_workspace(8, 4)
+    backend.init_cuda_graph_state(8)
     workspace = backend._verify_state._verify_workspace
+    tables = backend._tables
     backend.set_cache_pool(state.cache_pool)
-    with pytest.raises(RuntimeError, match="cannot be rebound"):
-        backend.set_cache_pool(_qsa_pool(device="cpu", layer_offset=0))
     assert backend._verify_state._verify_workspace is workspace
+
+    replacement = _qsa_pool(device="cpu", layer_offset=0)
+    backend.set_cache_pool(replacement)
+    assert backend._verify_state.cache_pool is replacement
+    assert backend.preallocate_verify_workspace(8, 4) > 0
+    assert backend._verify_state._verify_workspace is not workspace
+    # Same table geometry: the graph-visible tables keep their addresses.
+    assert backend._tables is tables
 
 
 def test_qsa_rebind_rejection_leaves_the_entire_tree_unchanged() -> None:
@@ -250,11 +242,20 @@ def test_qsa_rebind_rejection_leaves_the_entire_tree_unchanged() -> None:
     root, indexer = _root_with_indexer(
         _qsa_config(max_bs=4, is_draft=False, device="cpu"), pool
     )
+    indexer.init_cuda_graph_state(4)
     router = root.attention_backend
     leaves = tuple(router.leaves.values())
     replacement = _qsa_pool(device="cpu", layer_offset=0)
+    replacement.arena.cache_group_specs = tuple(
+        (
+            SimpleNamespace(**{**vars(spec), "block_granularity": 128})
+            if spec.group_id == QWEN4_EXP_QSA_RECENT_CACHE_GROUP
+            else spec
+        )
+        for spec in replacement.arena.cache_group_specs
+    )
 
-    with pytest.raises(RuntimeError, match="cannot be rebound"):
+    with pytest.raises(RuntimeError, match="different geometry"):
         root.set_cache_pool(replacement)
 
     for backend in (root, router, indexer, *leaves):
@@ -441,7 +442,9 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
             # Both rounds must commit even without another host-side staging call.
             graph.replay()
         backend.commit_speculative_state_after_verify(
-            torch.tensor(accepted, dtype=torch.int32, device="cuda"), num_extends=0
+            torch.tensor(accepted, dtype=torch.int32, device="cuda"),
+            num_extends=0,
+            accepted_path=None,
         )
         assert state._verify_workspace is workspace
         source_cpu = source.cpu()
@@ -480,7 +483,7 @@ def test_qsa_only_target_verification_creates_state(
     with pytest.raises(RuntimeError, match="speculative target"):
         backend.verify_staging_buffers(1, 2)
     root.commit_speculative_state_after_verify(
-        torch.tensor([3, 1], dtype=torch.int32), num_extends=0
+        torch.tensor([3, 1], dtype=torch.int32), num_extends=0, accepted_path=None
     )
     assert commit_calls == []
 
@@ -563,6 +566,71 @@ def test_qsa_indexer_requires_both_live_tables() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "prefixes, queries, decode_lengths, expected_columns",
+    [
+        ([0], [1], [], 1),
+        ([0], [512], [], 2),
+        ([700], [15], [], 3),
+        ([768, 0], [20, 32], [], 4),
+        ([0], [16], [900], 4),
+    ],
+)
+def test_qsa_extend_table_bound_includes_prefix_and_mixed_decode(
+    prefixes, queries, decode_lengths, expected_columns
+) -> None:
+    root, indexer = _root_with_indexer(
+        _qsa_config(max_bs=4, is_draft=False, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=0),
+    )
+    root.init_cuda_graph_state(4)
+    bs = len(queries) + len(decode_lengths)
+    seq_lens = torch.tensor(
+        [prefix + query for prefix, query in zip(prefixes, queries, strict=True)]
+        + decode_lengths,
+        dtype=torch.int32,
+    )
+    query_lengths = torch.tensor(queries, dtype=torch.int32)
+    prefix_lengths = torch.tensor(prefixes, dtype=torch.int32)
+    tables = {
+        gid: torch.arange(1, bs * 4 + 1, dtype=torch.int32).reshape(bs, 4)
+        for gid in (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
+    }
+    indexer.init_forward_metadata(
+        bs,
+        len(queries),
+        torch.arange(bs),
+        seq_lens,
+        ForwardMode.MIXED if decode_lengths else ForwardMode.EXTEND,
+        block_tables=tables,
+        extend_seq_lens=query_lengths,
+        extend_seq_lens_cpu=query_lengths,
+        extend_prefix_lens=prefix_lengths,
+        extend_prefix_lens_cpu=prefix_lengths,
+        extend_replay_lens_cpu=torch.zeros_like(query_lengths),
+        extend_prompt_lens_cpu=seq_lens[: len(queries)],
+        extend_with_prefix=any(prefixes),
+        query_shard=None,
+    )
+    metadata = indexer.forward_extend_metadata
+    table = indexer._tables.table(QWEN4_EXP_QSA_CACHE_GROUP, bs)
+    assert table.shape == (bs, 4)
+    assert metadata.qsa_block_table.shape == (bs, expected_columns)
+    assert metadata.qsa_block_table.data_ptr() == table.data_ptr()
+    torch.testing.assert_close(metadata.qsa_block_table, table[:, :expected_columns])
+    # A later decode must retain capacity even after a compact extend view.
+    indexer.refresh_decode_metadata(
+        bs,
+        bs,
+        torch.arange(bs),
+        seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+    )
+    assert indexer.forward_decode_metadata.qsa_block_table.shape == (bs, 4)
+    assert indexer.forward_extend_metadata is metadata
+
+
 def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
     monkeypatch,
 ) -> None:
@@ -590,7 +658,11 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
         extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
         extend_prefix_lens=torch.tensor([5], dtype=torch.int32),
         extend_prefix_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        extend_replay_lens_cpu=torch.zeros_like(torch.tensor([5], dtype=torch.int32)),
+        extend_prompt_lens_cpu=torch.tensor([5], dtype=torch.int32)
+        + torch.tensor([3], dtype=torch.int32),
         extend_with_prefix=True,
+        query_shard=None,
     )
     extend = indexer.forward_extend_metadata
     indexer.refresh_decode_metadata(

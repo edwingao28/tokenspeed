@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda import (
+    KdaPrefillCapacity,
     kda_batched_replay_uses_raw_gate,
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
@@ -45,17 +46,19 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
-from tokenspeed_kernel.ops.attention.kda.triton import (
-    capture_replay_payload,
-    commit_state_pages,
-)
+from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    MambaAttnBackend,
+    _reject_skip_term,
     logger,
 )
+from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
+    CapacityPrefillBackend,
+    CapacityPrefillMetadata,
+)
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
@@ -87,7 +90,7 @@ def _slice_kda_prefill_inputs(
     )
 
 
-class KdaAttnBackend(MambaAttnBackend):
+class KdaAttnBackend(CapacityPrefillBackend):
     """Attention backend for KDA linear attention layers (Kimi-K3).
 
     Everything generic to linear attention -- state paging and cache groups --
@@ -102,15 +105,19 @@ class KdaAttnBackend(MambaAttnBackend):
 
     _verify_reads_committed_recurrent_state = True
     _verify_packed_qkv_views = True
+    # Eager forwards keep the same metadata contract as replay.
+    _capacity_layout_when_uncaptured = True
 
     def __init__(
         self,
         config: AttnConfig,
         spec: SoftmaxAttnConfig,
         *,
+        enable_prefill_graph: bool,
         kda_backend: str = "auto",
     ) -> None:
         super().__init__(config, spec)
+        self._prefill_graph_enabled = enable_prefill_graph
         self.max_bs = config.max_bs
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()
@@ -126,10 +133,49 @@ class KdaAttnBackend(MambaAttnBackend):
                 f"got {self.kda_backend!r}"
             )
         logger.info(
-            "KDA prefill routes through %s; decode remains on the "
+            f"KDA prefill routes through {self.kda_backend!s}; decode remains on the "
             "platform-selected kernels",
-            self.kda_backend,
         )
+
+    def _admits_capacity_prefill(self) -> bool:
+        return self._prefill_graph_enabled and self.kda_backend == "cutedsl_kda"
+
+    def forward_extend(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        token_to_kv_pool,
+        bs,
+        forward_mode,
+        *,
+        save_kv_cache,
+        **kwargs,
+    ):
+        output = super().forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            bs,
+            forward_mode,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )
+        if isinstance(self.forward_metadata, CapacityPrefillMetadata):
+            checkpoint = self.forward_metadata.prefill_checkpoint_batch
+            if checkpoint is not None and checkpoint.output_sources is not None:
+                # The fused gather writes the complete output, including padding.
+                return output
+            # No eager handoff remains to scrub undefined native output padding.
+            rows = torch.arange(output.shape[0], device=output.device)
+            padding = rows >= self.forward_metadata.query_start_loc[-1]
+            return output.masked_fill_(padding.view(-1, *([1] * (output.ndim - 1))), 0)
+        # Uncaptured batches keep eager attention inside the ordinary outer
+        # graph. Serving forwards never allocate or capture a KDA subgraph.
+        return output
 
     def _reset_replay_state(self) -> None:
         self._verify_producer_stream: torch.cuda.Stream | None = None
@@ -537,6 +583,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -548,6 +595,7 @@ class KdaAttnBackend(MambaAttnBackend):
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
     ) -> torch.Tensor:
+        _reject_skip_term(D)
         seq_len = query.shape[0]
         num_heads = query.shape[2]
         head_k_dim = query.shape[3]
@@ -588,6 +636,11 @@ class KdaAttnBackend(MambaAttnBackend):
                 enable_pdl=pdl_enabled(),
             ).view(1, -1, num_value_heads, head_v_dim)
         return core_attn_out.squeeze(0)
+
+    @override
+    def tree_support(self) -> TreeSupport:
+        blocker = "the fused KDA verify kernel follows a chain; no draft trees yet"
+        return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
 
     @override
     def _verify(
@@ -756,6 +809,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -768,6 +822,7 @@ class KdaAttnBackend(MambaAttnBackend):
         lower_bound: float | None,
     ) -> torch.Tensor:
 
+        _reject_skip_term(D)
         from tokenspeed_kernel.ops.attention.kda.triton import (
             kda_recurrent_decode_mtp,
         )
@@ -810,45 +865,38 @@ class KdaAttnBackend(MambaAttnBackend):
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     @override
-    def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Replay and eagerly commit this round's accepted KDA prefix."""
+    def commit_verified_state(
+        self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
+    ) -> None:
+        """Replay and eagerly commit this round's accepted KDA prefix (a chain:
+        KDA refuses draft trees)."""
         if not self._replay_active:
-            return super().commit_verified_state(accepted_length)
+            return super().commit_verified_state(
+                accepted_length, accepted_path=accepted_path
+            )
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
         from tokenspeed_kernel.ops.attention.kda import try_kda_replay_commit
 
-        committed, tables, draft_token_num, read_pages_by_group = ctx
+        _, _, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
-        # Runtime accept lengths count draft matches; the target token itself
-        # always advances state, matching the established scratch commit.
         group_ids = list(self._replay_group_ids or self._state_groups())
-        write_stack = torch.empty(
-            (len(group_ids), bs), dtype=torch.int32, device=accepted_length.device
+        write_stack, steps = self._resolve_verify_commit_pages(
+            accepted_length, group_ids
         )
-        steps = torch.empty(bs, dtype=torch.int32, device=accepted_length.device)
-        for out_row, group_id in enumerate(group_ids):
-            commit_state_pages(
-                accepted_length,
-                committed,
-                tables[group_id],
-                batch_size=bs,
-                draft_tokens=draft_token_num,
-                granularity=self._checkpoint_granularity,
-                pages_out=write_stack,
-                out_row=out_row,
-                steps_out=steps,
-            )
         rows = bs * draft_token_num
         if self._batched_replay_ready:
-            read_pages = torch.stack(
-                [
-                    read_pages_by_group[group_id][:bs]
-                    for group_id in self._replay_group_ids
-                ]
-            ).to(torch.int32)
-            self._batched_replay_launch(read_pages, write_stack, steps)
+            self._batched_replay_launch(
+                torch.stack(
+                    [
+                        read_pages_by_group[group_id][:bs]
+                        for group_id in self._replay_group_ids
+                    ]
+                ).to(torch.int32),
+                write_stack,
+                steps,
+            )
             self._verify_commit_ctx = None
             return
         if self._replay_uses_raw_gate:
@@ -902,6 +950,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -911,25 +960,25 @@ class KdaAttnBackend(MambaAttnBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
+        inputs_packed: bool,
         cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run only the real-token prefix through the KDA prefill kernel.
+        """Run an exact-length or fixed-capacity KDA scan with live boundaries.
 
-        FlashKDA sizes its output from the input shape but tiles from
-        ``cu_seqlens``: bucket-padded inputs would leave the output tail
-        unwritten and feed padding into its final full-tile loads. The graph
-        handoff clears and restores the bucket tail afterward.
+        Ordinary metadata slices inputs to the real-token prefix. Capacity
+        metadata retains the physical packed extent; GPU boundaries determine
+        live work, so that extent is not a live-token count. The adapter clears
+        inputs before full-tile loads; inline output padding is cleared by the
+        in-graph gather or scrub. Only an ordinary break uses the handoff copy.
 
-        ``cu_seqlens_cpu`` is the metadata-built host int64 copy of
-        ``query_start_loc``'s contents (``init_forward_metadata`` constructs
-        and validates it once per extend batch, mirroring MHA's
-        ``cu_extend_seq_lens_cpu``). It is REQUIRED by the kda_paged_prefill
-        op: every solution plans its chunk indices from it on the host —
-        otherwise the boundary read recurs as a stream-synchronizing D2H on
-        every KDA layer of every prefill chunk, stalling the launch thread
-        behind all queued GPU work (which serializes the chunk pipeline's
-        stages).
+        ``cu_seqlens_cpu`` is the required metadata-built int64 mirror of
+        ``query_start_loc``. It supplies exact-length host planning and
+        capacity admission without a per-layer synchronizing D2H. The prepared
+        capacity path builds its chunk plan on device instead of on the host.
+        ``inputs_packed`` carries the producer promise defined by the kernel
+        facade; being inside a graph alone does not establish that promise.
         """
+        _reject_skip_term(D)
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
 
@@ -963,6 +1012,12 @@ class KdaAttnBackend(MambaAttnBackend):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             cu_seqlens_cpu=cu_seqlens_cpu,
+            inputs_packed=inputs_packed,
+            capacity=(
+                KdaPrefillCapacity(seq_len, query_start_loc.numel() - 1)
+                if isinstance(self.forward_metadata, CapacityPrefillMetadata)
+                else None
+            ),
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
             recurrent_layout=self.kda_recurrent_layout,

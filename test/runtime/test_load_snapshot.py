@@ -503,7 +503,11 @@ def test_event_loop_binds_the_output_setter_only_where_it_exists():
     loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
     loop.attn_tp_rank = 1
     loop.dp_rank = 4
-    loop.server_args = SimpleNamespace(zmq_msgpack=True, load_watch_interval=0.25)
+    loop.server_args = SimpleNamespace(
+        zmq_msgpack=True,
+        load_watch_interval=0.25,
+        mapping=SimpleNamespace(has_pp=False, rank=1),
+    )
     loop.port_args = SimpleNamespace(metrics_ipc_name="tcp://metrics")
     loop.send_to_tokenizer = TrapSender()
     loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)

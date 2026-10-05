@@ -3,7 +3,6 @@ name: eval-deepseek-v4-flash-mtp-gsm8k
 type: eval
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:
@@ -24,7 +23,6 @@ server:
     --max-model-len 4096
     --max-total-tokens 16384
     --chunked-prefill-size 8192
-    --gpu-memory-utilization 0.9
     --disable-kvstore
     --trust-remote-code
     --speculative-algorithm MTP
