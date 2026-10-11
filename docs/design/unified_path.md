@@ -721,6 +721,8 @@ The persistent length
 buffer is refreshed in `prepare_step` or `prepare_capture`, outside graph
 capture, using a private device generator. Preparation must remain
 asynchronous so it does not stall forward launches.
+The sampler precomputes the configured length's floor, fractional part and
+integer flag at initialization and reuses them for each buffer refresh.
 
 ### Non-speculative serving is the N == 1 case, not a second path
 

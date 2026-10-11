@@ -187,6 +187,9 @@ class SamplingBackend(ABC):
         self._synthetic_generator: torch.Generator | None = None
         self._synthetic_lengths: torch.Tensor | None = None
         self._synthetic_coins: torch.Tensor | None = None
+        self._synthetic_floor: int = 0
+        self._synthetic_frac: float = 0.0
+        self._synthetic_is_integer: bool = True
         if config.synthetic_acceptance_length is not None:
             if not self._SUPPORTS_SYNTHETIC_ACCEPTANCE:
                 raise ValueError(
@@ -198,17 +201,20 @@ class SamplingBackend(ABC):
                     f"synthetic_acceptance_length {al} must be within the verify width "
                     f"[1, {config.max_draft_tokens_per_req}]"
                 )
+            self._synthetic_floor = math.floor(al)
+            self._synthetic_frac = al % 1
+            self._synthetic_is_integer = self._synthetic_frac == 0.0
             self._synthetic_generator = torch.Generator(
                 device=config.device
             ).manual_seed(config.random_seed)
             self._synthetic_lengths = torch.full(
                 (config.max_bs,),
-                math.floor(al),
+                self._synthetic_floor,
                 dtype=torch.int32,
                 device=config.device,
             )
 
-            if al != math.floor(al):
+            if not self._synthetic_is_integer:
                 self._synthetic_coins = torch.empty(
                     (config.max_bs,), device=config.device
                 )
@@ -431,17 +437,18 @@ class SamplingBackend(ABC):
         )
 
     def _prepare_synthetic_acceptance(self) -> None:
-        al = self.config.synthetic_acceptance_length
-        if al is None:
+        if self._synthetic_lengths is None:
             return
-        if al == math.floor(al):
-            self._synthetic_lengths.fill_(int(al))
+        if self._synthetic_is_integer:
+            self._synthetic_lengths.fill_(self._synthetic_floor)
             return
         # Refill outside capture, like the rejection sampler's coin buffers.
         # A private device generator avoids host copies and global RNG state.
         self._synthetic_coins.uniform_(generator=self._synthetic_generator)
-        torch.lt(self._synthetic_coins, al % 1, out=self._synthetic_lengths)
-        self._synthetic_lengths.add_(math.floor(al))
+        torch.lt(
+            self._synthetic_coins, self._synthetic_frac, out=self._synthetic_lengths
+        )
+        self._synthetic_lengths.add_(self._synthetic_floor)
 
     def synthetic_lengths(
         self, candidates: torch.Tensor, row_offset: int

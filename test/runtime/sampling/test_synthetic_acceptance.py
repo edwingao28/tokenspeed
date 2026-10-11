@@ -153,16 +153,32 @@ def test_prefix_bonus_indices_and_mixed_row_offset(width):
     torch.testing.assert_close(accepted + 1, lengths)
 
 
-@pytest.mark.parametrize("al", [2.6, 4.0])
-def test_bootstrap_limit_is_refreshed_for_next_step(al):
-    backend = _BufferBackend(_config(al, 5, 4, "cpu"))
+def test_disabled_preparation_leaves_synthetic_buffers_unallocated():
+    backend = _BufferBackend(_config(None, 5, 4, "cpu"))
     backend.prepare_step([], [], [], 4)
+    backend.prepare_capture(5, 4)
+    assert backend._synthetic_lengths is None
+    assert backend._synthetic_coins is None
+
+
+@pytest.mark.parametrize("al, allowed_lengths", [(1.0, {1}), (2.6, {2, 3}), (4.0, {4})])
+@pytest.mark.parametrize("capture", [False, True])
+def test_bootstrap_limit_is_refreshed_for_next_step(al, allowed_lengths, capture):
+    backend = _BufferBackend(_config(al, 5, 4, "cpu"))
+
+    def prepare():
+        if capture:
+            backend.prepare_capture(5, 4)
+        else:
+            backend.prepare_step([], [], [], 4)
+
+    prepare()
     backend.limit_synthetic_acceptance(torch.tensor([True, False, True]), 1)
     assert backend._synthetic_lengths[1].item() == 1
     assert backend._synthetic_lengths[3].item() == 1
-    assert backend._synthetic_lengths[2].item() >= 2
-    backend.prepare_step([], [], [], 4)
-    assert (backend._synthetic_lengths >= 2).all()
+    assert backend._synthetic_lengths[2].item() in allowed_lengths
+    prepare()
+    assert set(backend._synthetic_lengths.tolist()) <= allowed_lengths
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
