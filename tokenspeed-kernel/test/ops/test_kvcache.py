@@ -23,6 +23,8 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    _copy_state_rows_kernel,
+    _state_verify_commit_rows_kernel,
     _zero_page_fields_kernel,
     copy_state_rows,
     fused_fp8_set_kv_buffer,
@@ -37,13 +39,13 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     _local_visible_lengths,
-    dcp_local_visible_lengths,
+    kvp_local_visible_lengths,
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
 
-def test_dcp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> None:
+def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> None:
     def run(batch, cols, queries, padding):
         owned = torch.arange(cols) % 3 == 0
         prefix = torch.zeros((batch, cols + 1 + padding), dtype=torch.int32)
@@ -64,7 +66,7 @@ def test_dcp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         )
         out = backing[:, :queries]
         local = torch.empty(batch, dtype=torch.int32, device=device)
-        dcp_local_visible_lengths(
+        kvp_local_visible_lengths(
             prefix, visible, page_size=64, out=out, local_lengths=local
         )
         torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
@@ -502,6 +504,69 @@ def test_state_verify_commit_rows_matches_torch(
     ).repeat(num_layers)
     assert torch.equal(src_rows.to(torch.int64), expected_src)
     assert torch.equal(dst_rows.to(torch.int64), expected_dst)
+
+
+def test_verify_commit_rows_compile_once_across_batch_sizes(device: str) -> None:
+    """Batch and row counts follow the batch every round; neither keys a binary."""
+    num_layers, verify_width, words = 2, 3, 40
+
+    def table(tensors: list[torch.Tensor], value) -> torch.Tensor:
+        dtype = torch.uint64 if value == "address" else torch.int64
+        return torch.tensor(
+            [t.data_ptr() if value == "address" else t.stride(0) for t in tensors],
+            device=device,
+            dtype=dtype,
+        )
+
+    def run(batch_size: int) -> None:
+        accepted = torch.randint(
+            0, verify_width + 2, (batch_size,), device=device, dtype=torch.int32
+        )
+        pages = torch.arange(1, batch_size + 1, device=device, dtype=torch.int64)
+        src_rows = torch.empty(
+            num_layers * batch_size, device=device, dtype=torch.int64
+        )
+        dst_rows = torch.empty_like(src_rows)
+        state_verify_commit_rows(
+            accepted,
+            pages,
+            src_rows,
+            dst_rows,
+            verify_width=verify_width,
+            num_layers=num_layers,
+            group_indices=None,
+        )
+        scratch = [
+            torch.randint(
+                0, 1000, (batch_size * (verify_width + 1), words), device=device
+            ).int()
+            for _ in range(num_layers)
+        ]
+        committed = [
+            torch.full((batch_size + 1, words), -1, device=device, dtype=torch.int32)
+            for _ in range(num_layers)
+        ]
+        copy_state_rows(
+            table(scratch, "address"),
+            table(committed, "address"),
+            src_rows,
+            dst_rows,
+            row_bytes=words * 4,
+            src_row_strides=table(scratch, "stride"),
+            dst_row_strides=table(committed, "stride"),
+        )
+        rows = torch.arange(batch_size, device=device) * (
+            verify_width + 1
+        ) + accepted.long().clamp(1, verify_width)
+        for layer in range(num_layers):
+            assert torch.equal(committed[layer][1:], scratch[layer][rows])
+
+    run(4)
+    with assert_no_triton_compile(
+        _state_verify_commit_rows_kernel, _copy_state_rows_kernel
+    ):
+        for batch_size in (1, 16, 17, 33, 64):
+            run(batch_size)
 
 
 def test_state_verify_commit_rows_single_layer_matches_tiled_prefix(
