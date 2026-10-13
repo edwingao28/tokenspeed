@@ -225,7 +225,10 @@ def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
 
     def verify():
         return backend.verify(
-            LogitsProcessorOutput(next_token_logits=logits.clone()), info, candidates
+            LogitsProcessorOutput(next_token_logits=logits.clone()),
+            info,
+            candidates,
+            tree=None,
         )
 
     def check(tokens, lengths):

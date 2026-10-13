@@ -548,7 +548,14 @@ class TestCLIConfigCompat(unittest.TestCase):
                 for flag in ("--dp-sampling", "--enable-output-logprobs")
             ],
             (
-                ["--sampling-backend", "greedy", "--speculative-eagle-topk", "2"],
+                [
+                    "--sampling-backend",
+                    "greedy",
+                    "--speculative-eagle-topk",
+                    "2",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                ],
                 "does not support draft trees",
             ),
         ]
