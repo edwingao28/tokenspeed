@@ -62,6 +62,7 @@ def test_npu_validates_required_options_without_rewriting_them():
         model="Qwen/Qwen3-0.6B",
         device="npu",
         attention_backend="mha",
+        sampling_backend="greedy",
         disable_prefill_graph=True,
         disable_pdl=True,
         max_num_seqs=1,
@@ -148,9 +149,10 @@ def test_cache_batch_metadata_accepts_npu_tables():
         group_specs=(
             CacheGroupSpec(
                 group_id="full_attention",
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=4,
                 entry_stride_tokens=1,
+                replayable=False,
             ),
         ),
         group_page_counts={"full_attention": 2},

@@ -74,7 +74,9 @@ class HoleOverflowRoutingTest(unittest.TestCase):
         page_sizes = torch.tensor([2], dtype=torch.int32)
         prefix = torch.tensor([1], dtype=torch.int32)
         new = torch.tensor([4], dtype=torch.int32)
-        locs = extend_write_locations(tables, page_sizes, prefix, new, 4)
+        locs = extend_write_locations(
+            tables, page_sizes, prefix, new, 4, torch.empty((1, 4), dtype=torch.int32)
+        )
         # pos 1 -> page 3 slot 1 = 7; pos 2, 3 -> hole page 0 -> 0; pos 4 ->
         # page index 2 >= width -> 0.
         self.assertEqual(locs[0].tolist(), [7, 0, 0, 0])
@@ -149,10 +151,10 @@ class MtpReanchorTest(unittest.TestCase):
         )
         geometry = CacheGroupGeometry(
             granularities={FULL: 4, SWA: 4},
-            families={FULL: "history", SWA: "history"},
+            attn_kinds={FULL: "full_history", SWA: "sliding_window"},
             full_history_group_id=FULL,
             row_geometry={FULL: (4, 1), SWA: (4, 1)},
-            retentions={FULL: ("full_history", None), SWA: ("sliding_window", 4)},
+            windows={FULL: None, SWA: 4},
         )
         router.bind(geometry, leaves)
         router.init_cuda_graph_state(4)

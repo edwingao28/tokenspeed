@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -38,15 +39,21 @@ def test_triton_bf16_moe_matches_torch(activation: str) -> None:
     weights.top_k = 2
     weights.activation_situ_beta = 4.0
     weights.activation_situ_linear_beta = 25.0
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode="precomputed_topk",
         ispp=32,
         solution="triton",
+        hidden=None,
+        swiglu_form=("standard" if activation == "swiglu" else None),
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         x,
         weights,

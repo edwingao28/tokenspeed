@@ -48,6 +48,7 @@ from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     CachePDLayerwiseBlockSelection,
     CachePDLayerwiseGroupSelection,
+    CacheProducerSchedule,
     CacheTransferContract,
     build_cache_layerwise_block_selection,
 )
@@ -91,19 +92,9 @@ def _segment(
     )
 
 
-def _group(
-    group_id,
-    family,
-    *segments,
-    retention="full_history",
-    sliding_window_tokens: int | None = None,
-):
+def _group(group_id, attn_kind, *segments, sliding_window_tokens: int | None = None):
     return make_group(
-        group_id,
-        *segments,
-        family=family,
-        retention=retention,
-        window=sliding_window_tokens,
+        group_id, *segments, attn_kind=attn_kind, window=sliding_window_tokens
     )
 
 
@@ -111,7 +102,7 @@ def _grouped_groups():
     return (
         _group(
             "history",
-            "history",
+            "full_history",
             _segment("layer.0.kv", producer_step=0, page_zero_offset=0),
         ),
         _group(
@@ -140,8 +131,8 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
     layout = _grouped_layout()
     tables = {
         "history": np.asarray([[1, 2, 3, 4]], dtype=np.int32),
-        "state-a": np.asarray([[5, 6, 7, 8]], dtype=np.int32),
-        "state-b": np.asarray([[9, 10, 11, 12]], dtype=np.int32),
+        "state-a": np.asarray([[5, 8, -1, -1]], dtype=np.int32),
+        "state-b": np.asarray([[0, 12, -1, -1]], dtype=np.int32),
     }
     operation = SimpleNamespace(block_tables_arrays=lambda: tables)
     first = build_cache_layerwise_block_selection(
@@ -152,6 +143,7 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
         prompt_len=7,
         chunk_start=0,
         chunk_end=4,
+        state_prefix_cached=False,
     )
     assert first.groups == (
         CachePDLayerwiseGroupSelection((2,), (0,)),
@@ -166,11 +158,28 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
         prompt_len=7,
         chunk_start=4,
         chunk_end=7,
+        state_prefix_cached=False,
     )
+    # The final chunk sends each state group's live slot: the prompt-end state.
     assert final.groups == (
         CachePDLayerwiseGroupSelection((3, 4), (1, 2)),
         CachePDLayerwiseGroupSelection((8,), (0,)),
         CachePDLayerwiseGroupSelection((12,), (0,)),
+    )
+    cached = build_cache_layerwise_block_selection(
+        operation,
+        layout=layout,
+        request_row=0,
+        prefix_len=2,
+        prompt_len=7,
+        chunk_start=4,
+        chunk_end=7,
+        state_prefix_cached=True,
+    )
+    assert cached.groups == (
+        CachePDLayerwiseGroupSelection((3, 4), (1, 2)),
+        CachePDLayerwiseGroupSelection((), ()),
+        CachePDLayerwiseGroupSelection((), ()),
     )
 
 
@@ -324,7 +333,7 @@ def _ordinary_layerwise_group():
             "layer.4.v", producer_step=4, page_zero_offset=96, page_stride_bytes=128
         ),
     )
-    return _group("history", "history", *segments)
+    return _group("history", "full_history", *segments)
 
 
 def _ordinary_layerwise_layout() -> CacheTransferContract:
@@ -338,7 +347,7 @@ def _ordinary_layerwise_layout() -> CacheTransferContract:
 def _draft_final_group():
     return _group(
         "history",
-        "history",
+        "full_history",
         _segment(
             "layer.0.kv",
             producer_step=0,
@@ -374,7 +383,44 @@ def _draft_final_layout() -> CacheTransferContract:
     )
 
 
-def test_draft_final_reservation_stays_aligned_across_forwards() -> None:
+def _stage_producer_schedule(
+    stage: int, target_cache_windows: tuple[tuple[int, int], ...]
+) -> CacheProducerSchedule:
+    """One stage's schedule over ``_draft_final_group``: two target cache
+    layers (``layer.0``, ``layer.1``) and two draft layers (``layer.2``,
+    ``layer.3``) that the final stage finalizes in one trailing step."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        pipeline_cache_ownership,
+    )
+
+    owner = pipeline_cache_ownership(
+        num_target_cache_layers=2,
+        num_draft_cache_layers=2,
+        target_cache_windows=target_cache_windows,
+    )[stage]
+    return CacheProducerSchedule(
+        tuple(
+            tuple(f"layer.{layer}.kv" for layer in step)
+            for step in owner.producer_cache_layers
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "stage,target_cache_windows,target_steps,draft_final",
+    [
+        # One stage owns everything: two target steps and the draft-final step.
+        (0, ((0, 2),), 2, True),
+        # A pipeline's first stage owns one target layer and no draft fields;
+        # its readiness needs no draft-final event.
+        (0, ((0, 1), (1, 2)), 1, False),
+        # The last stage owns its target layer plus the trailing draft step.
+        (1, ((0, 1), (1, 2)), 1, True),
+    ],
+)
+def test_draft_final_reservation_stays_aligned_across_forwards(
+    stage, target_cache_windows, target_steps, draft_final
+) -> None:
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     class _Counter:
@@ -389,24 +435,30 @@ def test_draft_final_reservation_stays_aligned_across_forwards() -> None:
             assert delta_aux_step == 0
             self.reserved += delta_cache_step
 
+    schedule = _stage_producer_schedule(stage, target_cache_windows)
+    if stage == 0 and len(target_cache_windows) == 1:
+        assert schedule == make_producer_schedule(_draft_final_group(), steps=3)
+    steps_per_forward = target_steps + int(draft_final)
+    assert schedule.step_count == steps_per_forward
+
     counter = _Counter()
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.kv_args = SimpleNamespace(
-        cache_layout=_draft_final_layout(),
-        cache_producer_schedule=make_producer_schedule(_draft_final_group(), steps=3),
+        cache_layout=_draft_final_layout(), cache_producer_schedule=schedule
     )
     manager.register_layerwise_step_counter(counter, interval=1)
 
-    for expected_begin in (0, 3):
+    for expected_begin in (0, steps_per_forward):
         begin = manager.reserve_layerwise_cache_steps()
         assert begin == expected_begin
-        counter.ready += 2  # target layers
+        counter.ready += target_steps  # target layers
         final_target = begin + manager.producer_step_count - 1
-        assert not StepCounter.is_step_ready(counter.ready, final_target)
-        counter.ready += 1  # one synthetic draft-final event
-        assert StepCounter.is_step_ready(counter.ready, final_target)
+        assert StepCounter.is_step_ready(counter.ready, final_target) is not draft_final
+        if draft_final:
+            counter.ready += 1  # one synthetic draft-final event
+            assert StepCounter.is_step_ready(counter.ready, final_target)
 
-    assert counter.reserved == counter.ready == 6
+    assert counter.reserved == counter.ready == 2 * steps_per_forward
 
 
 def _single_history_selection() -> CachePDLayerwiseBlockSelection:
@@ -420,7 +472,7 @@ def _heterogeneous_groups(*, destination: bool):
     return (
         _group(
             "history",
-            "history",
+            "full_history",
             _segment("layer.0.latent", producer_step=0, page_zero_offset=0),
         ),
         _group(
@@ -456,6 +508,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
         decode_tp_size=1,
         prefill_layout=source_layout,
         decode_layout=destination_layout,
+        prefill_field_ids=None,
     )
     rank_one_fragments = planner.plan_for_decode_rank(0).fragments_by_prefill_rank[1]
     assert tuple(
@@ -485,10 +538,12 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
     def blocks(begin, end):
         return list(
             manager._cache_transfer_blocks(
+                dst_tp_rank=0,
                 dst_ptr=0x20000,
                 src_block_manifest=None,
                 dst_block_manifest=destination_block_manifest,
                 transfer_fragments=rank_one_fragments,
+                owner_filters={},
                 dst_cache_layout=destination_layout,
                 block_selection=selection,
                 field_ids=schedule.fields_in_range(begin, end),
@@ -500,6 +555,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
 
 
 def _layerwise_fanout_context():
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     layout = _ordinary_layerwise_layout()
@@ -523,15 +579,17 @@ def _layerwise_fanout_context():
     manager.decode_kv_args_table = {
         request.mooncake_session_id: SimpleNamespace(
             dst_kv_ptr=0x20000 + rank * 0x1000,
+            decode_tp_rank=rank,
             endpoint=f"decode-{rank}",
             dst_port=9000 + rank,
             peer_cache_layout=layout,
             transfer_fragments=(),
+            transfer_owner_filters={},
         )
         for rank, request in enumerate(requests)
     }
     manager.layerwise_debug = False
-    manager.kv_transfer_metrics = None
+    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
     manager.session_failures = defaultdict(int)
     return manager, requests
 
@@ -661,18 +719,19 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     events = []
     backend = object.__new__(dsa_backend.DSABackend)
     backend.index_topk = 2
+    backend.kvp_group = (0,)
+    backend.v_head_dim = 1
     backend.data_type = torch.bfloat16
     backend.qk_nope_head_dim = 1
     backend.kv_lora_rank = 1
     backend.qk_rope_head_dim = 0
     backend.kernel_page_size = 64
+    backend.kernel_solution = None
+    backend.slot_order = "selection"
+    backend.num_local_heads = 1
+    backend.num_attention_heads = 1
+    backend.query_shard_metadata = None
     backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("ready"))
-
-    monkeypatch.setattr(
-        dsa_backend,
-        "workspace_topk_to_global_slots",
-        lambda **_kwargs: torch.zeros((1, 2), dtype=torch.int64),
-    )
 
     def fake_dsa_prefill(**_kwargs):
         events.append("attention")
@@ -687,19 +746,15 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
             v_head_dim=1,
             head_dim=1,
             layer_id=0,
-            k_scale_float=None,
             scaling=1.0,
         ),
         token_to_kv_pool=SimpleNamespace(
             quant_method=None,
             get_key_buffer=lambda _layer_id: torch.zeros(1),
         ),
-        page_table=torch.zeros((1, 1), dtype=torch.int32),
-        seq_lens=torch.ones(1, dtype=torch.int32),
         kv_seq_lens=torch.ones(1, dtype=torch.int32),
-        workspace_indices=torch.zeros((1, 2), dtype=torch.int64),
+        topk_slots=torch.zeros((1, 2), dtype=torch.int64),
         topk_lens=torch.ones(1, dtype=torch.int32),
-        kv_workspace_slots=torch.zeros(1, dtype=torch.int64),
         max_seq_len=1,
     )
 

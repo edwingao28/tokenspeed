@@ -28,22 +28,25 @@ byte width so no parent is wasted.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import cached_property
 
 import torch
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-    LinearAttnConfig,
-)
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
+    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_replay_supported,
+    kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -85,6 +88,7 @@ class KimiK3Recipe(CacheRecipe):
     """
 
     family = "kimi_k3"
+    uses_paged_state_verify = True
 
     # ---- layer vocabulary ----
 
@@ -167,6 +171,21 @@ class KimiK3Recipe(CacheRecipe):
         return tuple(
             FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
             for group_id in self.group_ids
+        )
+
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        shard_count = self.attn_config.kvp_size
+        return tuple(
+            (
+                (
+                    replace(spec, shard_count=shard_count)
+                    if spec.group_id == FULL_ATTENTION
+                    else spec
+                ),
+                fields,
+            )
+            for spec, fields in super().groups()
         )
 
     # ---- geometry ----
@@ -301,132 +320,53 @@ class KimiK3Recipe(CacheRecipe):
         """Whether verify commits by replaying from one conv checkpoint row."""
         if self.server_args.speculative_algorithm is None:
             return False
-        from tokenspeed_kernel.ops.attention.kda import (
-            kda_recurrent_layout,
-            kda_replay_commit_supported,
-        )
+        return kda_replay_supported(self.attn_config)
 
-        _, recurrent_shape = self._kda_shapes
-        heads, head_dim, _ = recurrent_shape
-        return bool(
-            kda_replay_commit_supported(
-                self.attn_config.dtype,
-                recurrent_layout=kda_recurrent_layout(),
-                num_heads=heads,
-                head_dim=head_dim,
-            )
-        )
+    @override
+    def verify_scratch_in_pool(self) -> bool:
+        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
     @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
-        if self.server_args.speculative_algorithm is None:
+        if (
+            self.server_args.speculative_algorithm is None
+            or self.server_args.disaggregation_mode == "prefill"
+        ):
+            # Verify staging exists for the target's verify step; the prefill
+            # role only ever writes committed prompt state.
             return 0
-        if self.replay_kda:
-            conv_shape, recurrent_shape = self._kda_shapes
-            heads, head_dim, _ = recurrent_shape
-            # Replay starts from the committed convolution checkpoint and
-            # reconstructs the accepted recurrent state.
-            from tokenspeed_kernel.ops.attention.kda import (
-                kda_batched_replay_uses_raw_gate,
-            )
-
-            replay_uses_raw_gate = kda_batched_replay_uses_raw_gate(
-                self.attn_config.dtype,
-                num_heads=heads,
-                head_dim=head_dim,
-            )
-            # Raw-g replay reuses the committed convolution pool as verify scratch.
-            conv_bytes = (
-                0
-                if replay_uses_raw_gate
-                else self.attn_config.max_bs
-                * sum(
-                    field.payload_bytes
-                    for spec, fields in self.groups()
-                    if spec.group_id != FULL_ATTENTION
-                    for field in fields
-                    if field.field_id.endswith(".conv_state")
-                )
-            )
-            rows = self.attn_config.max_bs * int(
-                self.server_args.speculative_num_draft_tokens
-            )
-            layer_count = sum(
-                field.field_id.endswith(".conv_state")
-                for spec, fields in self.groups()
-                if spec.group_id != FULL_ATTENTION
-                for field in fields
-            )
-            payload_bytes_per_row = (
-                conv_shape[0] + head_dim + heads
-            ) * torch.bfloat16.itemsize
-            # Fused raw-g capture stores BF16; other replay paths need FP32 scratch.
-            gate_itemsize = (
-                torch.bfloat16.itemsize
-                if replay_uses_raw_gate
-                else torch.float32.itemsize
-            )
-            payload_bytes_per_row += heads * head_dim * gate_itemsize
-            return conv_bytes + layer_count * rows * payload_bytes_per_row
-        verify_rows = self.attn_config.max_bs * (
-            int(self.server_args.speculative_num_draft_tokens) + 1
-        )
-        return verify_rows * sum(
-            field.payload_bytes
-            for spec, fields in self.groups()
-            if spec.group_id != FULL_ATTENTION
-            for field in fields
+        return kda_verify_workspace_bytes(
+            self.attn_config,
+            self.groups(),
+            draft_token_num=int(self.server_args.speculative_num_draft_tokens),
+            replay_kda=self.replay_kda,
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
+    def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        budgeted = self._budgeted_parents(
+            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
+        )
+        if self.token_limit is None:
+            return budgeted
+        # A token limit caps history, not the unsharded KDA working set.
+        # Use the same per-group demand as the inverse capacity calculation.
+        return min(budgeted, self.parents_needed(layout, self.token_limit))
+
+    @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
         upper = self.token_limit
         if upper is None:
+            # Search bound in logical tokens, not per-rank physical rows.
+            # parents_needed still accounts for unsharded KDA state/reservations.
             full_packing = dict(layout.group_packing)[FULL_ATTENTION]
-            upper = num_lcm_blocks * full_packing * layout.prefix_granularity
+            upper = (
+                num_lcm_blocks
+                * full_packing
+                * self._shard_counts[FULL_ATTENTION]
+                * layout.prefix_granularity
+            )
         return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)
-
-    @override
-    def parents_needed(self, layout: CacheLayout, token_capacity: int) -> int:
-        """Physical parents this capacity needs at the configured concurrency.
-
-        K3's KDA state rides inside the MLA planes, so its demand is a pair of
-        closed forms (history pages for MLA, a fixed working set for the state
-        groups) rather than the contract's per-retention page-count formula.
-        """
-        page_tokens = layout.prefix_granularity
-        limits = self.scheduler_limits
-        max_live_requests = limits["max_live_requests"]
-        depth = limits["overlap_schedule_depth"]
-        if depth not in (0, 1):
-            raise ValueError(f"overlap_schedule_depth must be 0 or 1, got {depth}")
-        if depth and limits["decode_input_tokens"] == 0:
-            raise ValueError("overlapped cache sizing requires decode_input_tokens > 0")
-        protected_pages = max_live_requests * math.ceil(
-            depth * limits["decode_input_tokens"] / page_tokens
-        )
-        parents = 0
-        for group_id, packing in layout.group_packing:
-            if group_id == FULL_ATTENTION:
-                child_pages = (
-                    math.ceil(token_capacity / page_tokens)
-                    + max_live_requests
-                    - 1
-                    + protected_pages
-                )
-            else:
-                # A finishing off-page prefill holds its input snapshot and
-                # aligned checkpoint, plus the final tail AND banked decode
-                # growth. Overlap protects one more decode reservation. With
-                # ordinary decode this is four state blocks per live request.
-                growth_tokens = max(
-                    page_tokens, (1 + depth) * limits["decode_input_tokens"]
-                )
-                child_pages = max_live_requests * (
-                    2 + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
-                )
-            parents += math.ceil(child_pages / packing)
-        return parents

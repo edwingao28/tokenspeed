@@ -33,10 +33,13 @@ registry resolves the (nvfp4, situ, precomputed_topk) plan to this kernel.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 NUM_EXPERTS = 16
 TOP_K = 10  # scaled-down test shape (real Kimi-K3 num_experts_per_token=16)
@@ -55,8 +58,15 @@ _E2M1_VALUES = torch.tensor(_E2M1_LUT + [-v for v in _E2M1_LUT])
 def _situ_runtime_reason() -> str | None:
     if not torch.cuda.is_available():
         return "requires CUDA"
-    if not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3):
-        return "flashinfer TRTLLM-Gen SiTU targets the sm_100 family"
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(
+        "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
+    )
+    if spec is None or not spec.capability.satisfied_by(current_platform()):
+        return "outside the kernel's registered capability range"
     return None
 
 
@@ -231,7 +241,7 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
     logical_ispp: int,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_nvfp4_moe_weights,
         flashinfer_trtllm_nvfp4_routed_moe_apply,
         flashinfer_trtllm_nvfp4_situ_moe_weights,
@@ -287,7 +297,6 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
     expected = _reference_moe(hidden_states, raw, topk_ids, topk_weights, situ=True)
     situ_err = _rel_l2(actual, expected)
 
-    import tokenspeed_kernel
     from flashinfer import fp4_quantize
 
     prequantized = fp4_quantize(
@@ -296,7 +305,7 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
         is_sf_swizzled_layout=False,
         enable_pdl=False,
     )
-    quantized_result = tokenspeed_kernel.moe_apply(
+    quantized_result = kernel_moe_apply(
         {
             "apply_kernel_name": "flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
             "a2a_backend": "none",
@@ -365,9 +374,8 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
 def test_moe_plan_selects_nvfp4_situ_routed_kernel(
     routing_mode: str | None,
 ) -> None:
-    import tokenspeed_kernel
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -375,6 +383,12 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
         ep_size=1,
         ispp=ISPP,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     assert plan["support_routing"] is False
@@ -387,7 +401,7 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
 
 @requires_flashinfer_situ
 def test_situ_preprocessor_rejects_mismatched_gate_up_global_scales() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_nvfp4_situ_moe_weights,
     )
 
@@ -407,7 +421,7 @@ def test_registry_deferred_finalize_bit_matches_wiring() -> None:
     while the situ apply actually serves do_finalize=False (the deferred
     triple); a bit/behavior mismatch crashes the experts layer at the first
     MoE forward of a TAIL_FUSION deployment."""
-    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     from tokenspeed_kernel.registry import KernelRegistry
 
     spec = KernelRegistry.get().get_by_name(
@@ -427,13 +441,43 @@ def test_registry_deferred_finalize_bit_matches_wiring() -> None:
     ],
 )
 def test_nvfp4_trtllm_registry_declares_ispp_alignment(kernel_name: str) -> None:
-    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     from tokenspeed_kernel.registry import KernelRegistry
 
     spec = KernelRegistry.get().get_by_name(kernel_name)
     if spec is None:
         pytest.skip("nvfp4 TRT-LLM kernel not registered on this platform")
     assert spec.traits["ispp_alignment"] == frozenset({64})
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "arch_version", "expected"),
+    [
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (9, 0), False),
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 7), True),
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 8), False),
+        # Keep sibling NVFP4 paths capped until they are validated on SM107.
+        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 7), False),
+    ],
+)
+def test_nvfp4_trtllm_capability_range(
+    b300_platform,
+    kernel_name: str,
+    arch_version: tuple[int, int],
+    expected: bool,
+) -> None:
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
+    from tokenspeed_kernel.platform import ArchVersion
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    if spec is None:
+        pytest.skip("nvfp4 TRT-LLM kernel not registered on this platform")
+    platform = replace(
+        b300_platform,
+        arch_version=ArchVersion(*arch_version),
+    )
+    assert spec.capability.satisfied_by(platform) is expected
 
 
 @requires_flashinfer_situ
@@ -443,7 +487,7 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     expert weights, expanded_idx) triple with the latent tail's recipe
     (fp32 ascending-k accumulate, single bf16 round) reproduces the
     do_finalize=True output."""
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_nvfp4_situ_moe_weights,
         flashinfer_trtllm_nvfp4_situ_routed_moe_apply,
     )
@@ -494,7 +538,7 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     )
     torch.cuda.synchronize()
 
-    # Triple contract, as consumed by KimiK3LatentTailOp.call_deferred.
+    # Triple contract, as consumed by allreduce_fusion.
     assert gemm2_out.dtype == torch.bfloat16
     assert expert_weights.dtype == torch.bfloat16
     assert torch.equal(expert_weights, topk_weights)  # routed variant echoes
@@ -518,3 +562,163 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     manual = acc.to(torch.bfloat16)
 
     assert _rel_l2(manual, finalized) < 5e-3, f"{_rel_l2(manual, finalized)=}"
+
+
+@requires_flashinfer_situ
+@pytest.mark.parametrize(
+    "num_tokens,top_k,local_count,routed,enable_pdl",
+    [
+        (1, 2, 16, False, False),
+        (17, 8, 16, False, True),
+        (129, 2, 8, True, False),
+        (257, 8, 16, True, True),
+    ],
+)
+def test_nvfp4_route_padding_is_initialized_on_every_replay(
+    num_tokens: int,
+    top_k: int,
+    local_count: int,
+    routed: bool,
+    enable_pdl: bool,
+    monkeypatch,
+) -> None:
+    """Poison native map padding, change routing, and replay without Python.
+
+    The allocation observer is test-only: it retains the guarded int32 routing
+    map and its preceding padded-count allocation. Upstream routing initializes
+    unused rows inside active expert tiles, not allocation slack or the guard.
+    """
+    import tokenspeed_kernel.ops.moe.flashinfer as impl
+    from flashinfer.fused_moe import core
+    from flashinfer.tllm_enums import ActivationType
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    generator = torch.Generator().manual_seed(401)
+    raw = _make_nvfp4_moe_weights(generator, logical_ispp=ISPP)
+    local_offset = NUM_EXPERTS - local_count
+    # Activation input scales are global scalars, not expert-sharded weights.
+    w = _MoEWeights(
+        {
+            k: (
+                v if k in ("w13_input_scale", "w2_input_scale") else v[local_offset:]
+            ).clone()
+            for k, v in raw.items()
+        }
+    ).cuda()
+    w._spec.top_k = top_k
+    w._spec.num_local_experts = local_count
+    w._spec.ep_rank = local_offset // local_count
+    impl.flashinfer_trtllm_nvfp4_situ_moe_weights({}, w)
+    x = (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
+    logits = torch.randn(num_tokens, NUM_EXPERTS, generator=generator).bfloat16().cuda()
+    values, ids = logits.float().softmax(-1).topk(top_k, dim=-1)
+    ids = ids.int()
+    weights = values.bfloat16()
+
+    def apply(finalize):
+        return impl._flashinfer_trtllm_nvfp4_moe_apply(
+            x,
+            w,
+            router_logits=logits,
+            topk_weights=weights,
+            topk_ids=ids,
+            do_finalize=finalize,
+            enable_pdl=enable_pdl,
+            routed=routed,
+            activation_type=ActivationType.Situ,
+            output=None,
+        )
+
+    class ObserveMap(TorchDispatchMode):
+        def __init__(self, initialize):
+            super().__init__()
+            self.initialize = initialize
+            self.maps = []
+            self.counts = []
+
+        def __torch_dispatch__(self, func, types, args, kwargs):
+            result = func(*args, **kwargs)
+            if (
+                func == torch.ops.aten.empty.memory_format
+                and isinstance(result, torch.Tensor)
+                and result.is_cuda
+                and result.dtype == torch.int32
+                and result.ndim == 1
+            ):
+                # The native launcher allocates total_num_padded_tokens before
+                # the map; its other scalar, num_non_exiting_ctas, follows it.
+                if result.numel() == 1 and not self.maps:
+                    self.counts.append(result)
+                # Native expert tiles are multiples of eight, plus one guard.
+                # All other workspace sizes for these geometries are even or
+                # smaller than the expanded assignment count.
+                if result.numel() > num_tokens * top_k and result.numel() % 8 == 1:
+                    if self.initialize:
+                        result.zero_()
+                    self.maps.append(result)
+            return result
+
+    def check_map(observer, expanded, poison):
+        assert len(observer.maps) == len(observer.counts) == 1
+        route_map = observer.maps[0]
+        padded_count = observer.counts[0].item()
+        assert 0 <= padded_count < route_map.numel()
+        inverse = expanded.long().flatten()
+        live = inverse >= 0
+        assert (inverse[live] < padded_count).all()
+        expected = torch.full_like(route_map[:padded_count], -1)
+        tokens = torch.arange(num_tokens, device="cuda").repeat_interleave(top_k)
+        expected[inverse[live]] = tokens[live].int()
+        torch.testing.assert_close(route_map[:padded_count], expected, rtol=0, atol=0)
+        assert (route_map[padded_count:] == poison).all()
+        if routed:
+            local = (ids >= local_offset) & (ids < local_offset + local_count)
+            torch.testing.assert_close(live.view_as(ids), local, rtol=0, atol=0)
+
+    # Warm both module/tactic paths before capture. No initialization or JIT is
+    # allowed to rely on capture-time Python during the replay checks below.
+    apply(False)
+    apply(True)
+    observer = ObserveMap(initialize=True)
+    with observer:
+        _, _, expanded = apply(False)
+    check_map(observer, expanded, poison=0)
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    observer = ObserveMap(initialize=False)
+    with torch.cuda.graph(graph), observer:
+        _, _, graph_expanded = apply(False)
+    assert len(observer.maps) == 1
+    route_map = observer.maps[0]
+    output_graph = torch.cuda.CUDAGraph()
+    output_observer = ObserveMap(initialize=False)
+    with torch.cuda.graph(output_graph), output_observer:
+        graph_output = apply(True)
+    assert len(output_observer.maps) == 1
+    for shift, poison in ((0, 0), (3, num_tokens - 1), (7, -1), (0, 0)):
+        # Move between expert distributions, including empty local experts.
+        logits.copy_(logits.roll(shift, dims=-1))
+        next_weights, next_ids = logits.float().softmax(-1).topk(top_k, dim=-1)
+        ids.copy_(next_ids)
+        weights.copy_(next_weights)
+        route_map.fill_(poison)
+        graph.replay()
+        check_map(observer, graph_expanded, poison=poison)
+        actual = apply(True)
+        output_observer.maps[0].fill_(poison)
+        output_graph.replay()
+        torch.testing.assert_close(graph_output, actual, rtol=0, atol=0)
+        with monkeypatch.context() as context:
+            context.setattr(
+                impl,
+                "tokenspeed_trtllm_fp4_block_scale_moe",
+                core.trtllm_fp4_block_scale_moe,
+            )
+            context.setattr(
+                impl,
+                "tokenspeed_trtllm_fp4_block_scale_routed_moe",
+                core.trtllm_fp4_block_scale_routed_moe,
+            )
+            reference = apply(True)
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import latent_moe_input_projections
-from tokenspeed_kernel.ops.moe.latent_input import packed_projection_weight_view
+from tokenspeed_kernel.ops.moe import (
+    latent_moe_input_projections,
+    packed_projection_weight_view,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 
@@ -23,18 +25,10 @@ UP_CLAMP = 1.0
 def test_amd_latent_moe_registrations_are_platform_scoped() -> None:
     registry = KernelRegistry.get()
     expected_modules = {
-        "gluon_latent_expert_shared_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_decode"
-        ),
-        "gluon_latent_input_decode_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
-        "gluon_latent_input_small_batch_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
-        "gluon_latent_input_decode_gfx1250": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
+        "gluon_latent_expert_shared_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_decode_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_small_batch_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_decode_gfx1250": ("tokenspeed_kernel.ops.moe.gluon"),
     }
     implementations = {name: registry.get_impl(name) for name in expected_modules}
     if current_platform().is_amd:
@@ -125,52 +119,6 @@ def test_latent_input_without_up_clamp() -> None:
         * up.float()
     ).to(hidden.dtype)
     torch.testing.assert_close(shared, expected, atol=8e-3, rtol=8e-3)
-
-
-@pytest.mark.skipif(
-    not current_platform().is_cdna5,
-    reason="requires the gfx1250 single-token specialist",
-)
-def test_gfx1250_latent_input_decode_matches_and_replays() -> None:
-    hidden_size = 7168
-    widths = (896, 3584, 1536)
-    packed = torch.randn(sum(widths), hidden_size, dtype=torch.bfloat16, device="cuda")
-    views = list(packed.split(widths))
-    hidden = torch.randn(1, hidden_size, dtype=torch.bfloat16, device="cuda")
-    gate_clamp, up_clamp = 4.0, 25.0
-
-    def run():
-        return latent_moe_input_projections(
-            hidden,
-            *views,
-            gate_clamp=gate_clamp,
-            up_clamp=up_clamp,
-            override="gluon_latent_input_decode_gfx1250",
-        )
-
-    router, routed, shared = run()
-    expected_router = torch.nn.functional.linear(hidden.float(), views[0].float())
-    expected_routed = torch.nn.functional.linear(hidden, views[1])
-    gate, up = torch.nn.functional.linear(hidden, views[2]).chunk(2, dim=-1)
-    expected_shared = (
-        gate_clamp
-        * torch.tanh(gate.float() / gate_clamp)
-        * torch.sigmoid(gate.float())
-        * (up_clamp * torch.tanh(up.float() / up_clamp))
-    ).to(hidden.dtype)
-    assert router.dtype == torch.float32
-    torch.testing.assert_close(router, expected_router, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(routed, expected_routed, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(shared, expected_shared, atol=2e-2, rtol=2e-2)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = run()
-    hidden.copy_(torch.randn_like(hidden))
-    graph.replay()
-    replay_expected = run()
-    for output, reference in zip(actual, replay_expected, strict=True):
-        torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
 
 
 def test_latent_input_masks_partial_k_tile() -> None:

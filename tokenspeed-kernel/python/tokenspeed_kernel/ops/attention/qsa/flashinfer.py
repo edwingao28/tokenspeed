@@ -55,7 +55,11 @@ def _prepare_flashinfer_qsa_metadata_kernel(
     WIDTH: tl.constexpr,
     PACKED_WIDTH: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     byte_offsets = tl.program_id(1) * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
     bit_offsets = tl.arange(0, 8)
@@ -67,9 +71,11 @@ def _prepare_flashinfer_qsa_metadata_kernel(
         other=-1,
     ).to(tl.int32)
     valid = column_mask & (slots > 0)
+    # Padding writes can leave NaN in slot 0. Slot 1 is the finite read
+    # target; validity still comes from the original selected slots.
     tl.store(
         indices + row * stride_i_n + columns,
-        tl.where(valid, slots, 0),
+        tl.where(valid, slots, 1),
         mask=column_mask,
     )
     packed = tl.sum(valid.to(tl.int32) << bit_offsets[None, :], axis=1)
@@ -121,6 +127,7 @@ def _prepare_flashinfer_qsa_metadata(
         WIDTH=width,
         PACKED_WIDTH=packed_width,
         BLOCK_BYTES=block_bytes,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         num_stages=1,
         **pdl_kwargs,
@@ -199,7 +206,6 @@ if _IS_NVIDIA:
             "value_head_dim": _SUPPORTED_HEAD_DIMS,
         },
         priority=Priority.PERFORMANT,
-        tags={"fallback", "fa2", "fp8", "sparse"},
     )(flashinfer_fa2_qsa_sparse_attention)
     register_kernel(
         "attention",
@@ -216,7 +222,6 @@ if _IS_NVIDIA:
             "value_head_dim": _SUPPORTED_HEAD_DIMS,
         },
         priority=Priority.PERFORMANT,
-        tags={"fallback", "fa2", "sparse"},
     )(flashinfer_fa2_qsa_sparse_attention)
     __all__ = ["flashinfer_fa2_qsa_sparse_attention"]
 else:

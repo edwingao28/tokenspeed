@@ -26,16 +26,20 @@ from collections.abc import Sequence
 
 import pytest
 import torch
-from tokenspeed_kernel import (
-    gated_residual_combine,
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
-    gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.residual import (
+    gated_residual_combine,
+    gated_residual_mix,
+    pad_gated_residual_projection_weight,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.registry import KernelRegistry
+from utils import assert_no_triton_compile, is_cdna4
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="a CUDA/ROCm device is required"
@@ -45,6 +49,18 @@ HC_COUNT = 4
 HIDDEN_SIZE = 2560
 LOWRANK = 320
 WIDE = HC_COUNT * HIDDEN_SIZE
+
+
+def _fused_diagnostic_workspace(device: torch.device, projection_rows: int):
+    from tokenspeed_kernel.ops.residual.cute_fused import _workspace_for_plan
+
+    return _workspace_for_plan(
+        device,
+        projection_rows,
+        1,
+        (projection_rows + 63) // 64,
+        16,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +169,9 @@ def _mix(
         HC_COUNT,
         HIDDEN_SIZE,
         LOWRANK,
+        projection_rows=(
+            LOWRANK if inputs[1].shape[0] == LOWRANK else LOWRANK + HC_COUNT
+        ),
         override=override,
         solution=None,
         projection_scale=projection_scale,
@@ -216,6 +235,144 @@ def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
     _assert_mix_close((actual, actual_inject), (normalized, projection, up), 1.0, 0.03)
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize(
+    ("hc_count", "hidden_size", "lowrank", "has_inject", "dtype", "strided"),
+    [
+        (4, 2560, 320, True, torch.bfloat16, False),
+        (4, 2560, 320, True, torch.float16, False),
+        (4, 2560, 320, True, torch.float32, False),
+        (3, 37, 5, False, torch.bfloat16, False),
+        (3, 37, 5, True, torch.bfloat16, False),
+        (3, 37, 7, True, torch.float16, True),
+        (3, 37, 5, False, torch.float32, False),
+    ],
+)
+def test_general_triton_mix_projection_storage(
+    prepared: bool,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    has_inject: bool,
+    dtype: torch.dtype,
+    strided: bool,
+    monkeypatch,
+) -> None:
+    if dtype is torch.float32:
+        monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
+        monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+    generator = torch.Generator(device="cuda").manual_seed(19)
+    wide = hc_count * hidden_size
+    normalized = torch.randn(17, wide, dtype=dtype, device="cuda", generator=generator)
+    projection = (
+        torch.randn(
+            lowrank + (hc_count if has_inject else 0),
+            wide,
+            dtype=dtype,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.01
+    )
+    if strided:
+        projection = projection.T.contiguous().T
+    projection_rows = projection.shape[0]
+    if prepared:
+        projection = pad_gated_residual_projection_weight(
+            projection, projection_rows=projection_rows
+        )
+    up = (
+        torch.randn(wide, lowrank, dtype=dtype, device="cuda", generator=generator)
+        * 0.01
+    )
+    scale = 1.0 / hc_count
+    linear = torch.nn.functional.linear
+    projection_widths = []
+
+    def record_linear(value, weight, *args, **kwargs):
+        if not projection_widths:
+            assert weight.data_ptr() == projection.data_ptr()
+        projection_widths.append(weight.shape[0])
+        return linear(value, weight, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "linear", record_linear)
+    actual = gated_residual_mix(
+        normalized,
+        projection,
+        up,
+        hc_count,
+        hidden_size,
+        lowrank,
+        projection_rows=projection_rows,
+        projection_scale=scale,
+        weights_independent=False,
+        override="triton_hyperconnection_mix",
+        solution=None,
+    )
+    assert projection_widths[0] == projection.shape[0]
+    if prepared and dtype is not torch.float32:
+        assert projection_widths[0] * projection.element_size() % 16 == 0
+    x = normalized.cpu().double()
+    projected = (x @ projection[:projection_rows].cpu().double().T) * scale
+    gate = torch.nn.functional.silu(projected[:, :lowrank]) @ up.cpu().double().T
+    mixed = (gate.sigmoid() * x).reshape(-1, hc_count, hidden_size).mean(1)
+    inject = projected[:, lowrank:] if has_inject else None
+    expected = tuple(
+        None if value is None else value.to(device="cuda", dtype=dtype)
+        for value in (mixed, inject)
+    )
+    tolerance = {
+        torch.bfloat16: 0.01,
+        torch.float16: 0.002,
+        torch.float32: 1e-5,
+    }[dtype]
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("rows", [8192, 16384])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_general_triton_mix_prefill_projection_padding(
+    rows: int, dtype: torch.dtype
+) -> None:
+    from tokenspeed_kernel.ops.residual.triton import (
+        _mix_epilogue_kernel,
+        _projection_epilogue_kernel,
+    )
+
+    normalized, projection, up = _inputs(rows, dtype, seed=23)
+    projection = pad_gated_residual_projection_weight(
+        projection, projection_rows=LOWRANK + HC_COUNT
+    )
+    scale = 0.25
+    _mix(
+        (normalized[:17], projection, up),
+        override="triton_hyperconnection_mix",
+        projection_scale=scale,
+        weights_independent=False,
+    )
+    capture = ShapeCapture.get()
+    capture.enabled = True
+    with assert_no_triton_compile(_projection_epilogue_kernel, _mix_epilogue_kernel):
+        actual = _mix(
+            (normalized, projection, up),
+            override=None,
+            projection_scale=scale,
+            weights_independent=False,
+        )
+    assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
+    assert actual[0].shape == (rows, HIDDEN_SIZE)
+    assert actual[1].shape == (rows, HC_COUNT)
+    # Check the first, middle and final rows without a full prefill CPU GEMM.
+    indices = torch.linspace(0, rows - 1, 17, device="cuda").long()
+    expected = _mix_reference(
+        normalized[indices], projection[: LOWRANK + HC_COUNT], up, scale
+    )
+    sampled = tuple(value[indices] for value in actual)
+    tolerance = 0.01 if dtype is torch.bfloat16 else 0.002
+    torch.testing.assert_close(sampled, expected, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize(
     (
         "rows",
@@ -234,6 +391,7 @@ def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
     ],
 )
 def test_fused_cute_mix_matches_fp64_and_graph(
+    padded: bool,
     rows: int,
     dtype: torch.dtype,
     has_inject: bool,
@@ -257,6 +415,13 @@ def test_fused_cute_mix_matches_fp64_and_graph(
 
     tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
     expected = _mix_reference(normalized, projection, up, projection_scale)
+    if padded:
+        projection = pad_gated_residual_projection_weight(
+            projection, projection_rows=projection.shape[0]
+        )
+        # Padding never contributes to down or inject outputs. CuTe should
+        # expose only logical rows to its TMA descriptor.
+        projection[LOWRANK + (HC_COUNT if has_inject else 0) :].fill_(float("nan"))
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -540,6 +705,8 @@ def test_grouped_gemma_rmsnorm_validates_out_for_zero_rows() -> None:
         (8, True, "triton_hyperconnection_mix"),
         (4, False, "cute_fused_hyperconnection_mix"),
         (16, True, "cute_fused_hyperconnection_mix"),
+        (33, True, "cute_fused_hyperconnection_mix"),
+        (1024, True, "cute_fused_hyperconnection_mix"),
     ],
 )
 def test_hc_full_chain_cuda_graph_replays(
@@ -574,7 +741,7 @@ def test_hc_full_chain_cuda_graph_replays(
         return normalized, mixed, inject, combined
 
     assert pdl_enabled(enable_pdl) is enable_pdl
-    # Compile every PDL variant and populate the stream-private workspace.
+    # Compile every PDL variant and populate the shared layout workspace.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -638,6 +805,8 @@ def test_hc_mix_has_only_fused_and_general_implementations() -> None:
     expected = {"triton_hyperconnection_mix"}
     if cute_fused._AVAILABLE:
         expected.add("cute_fused_hyperconnection_mix")
+    if current_platform().is_amd:
+        expected.add("gluon_hyperconnection_mix_gfx950")
     kernels = KernelRegistry.get().list_kernels("residual", "hyperconnection_mix")
     assert {kernel.name for kernel in kernels} == expected
 
@@ -659,7 +828,14 @@ def test_unsupported_fused_contract_uses_general_fallback(monkeypatch, reason) -
     capture = ShapeCapture.get()
     capture.enabled = True
     actual = _mix(values, override=None, projection_scale=1.0, weights_independent=True)
-    assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
+    # GFX950 serves contiguous 16-bit decode batches with its own two-launch
+    # mix; every other platform or contract takes the GEMM-plus-epilogue path.
+    gfx950_mix = reason in ("capacity", "unavailable") and is_cdna4()
+    assert capture._records[-1].kernel_name == (
+        "gluon_hyperconnection_mix_gfx950"
+        if gfx950_mix
+        else "triton_hyperconnection_mix"
+    )
     _assert_mix_close(actual, values, 1.0, 0.04)
 
 
@@ -686,9 +862,14 @@ def _publish_mix_inputs_kernel(
 @pytest.mark.parametrize(
     ("rows", "dtype", "has_inject", "backend", "weights_independent", "scale"),
     [
+        (17, torch.bfloat16, True, "triton", False, 0.25),
         (4, torch.bfloat16, True, "cute_fused", False, 0.25),
         (1, torch.float16, False, "cute_fused", True, 0.25),
         (16, torch.bfloat16, True, "cute_fused", True, 0.25),
+        (33, torch.bfloat16, True, "cute_fused", False, 0.25),
+        (33, torch.bfloat16, True, "cute_fused", True, 0.25),
+        (1024, torch.bfloat16, True, "cute_fused", False, 0.25),
+        (1024, torch.bfloat16, True, "cute_fused", True, 0.25),
     ],
 )
 def test_mix_prefetch_observes_pdl_producer_updates(
@@ -707,6 +888,11 @@ def test_mix_prefetch_observes_pdl_producer_updates(
     x_source, projection_source, up_source = _inputs(rows, dtype, seed=139 + rows)
     if not has_inject:
         projection_source = projection_source[:LOWRANK]
+    logical_rows = projection_source.shape[0]
+    if backend == "triton":
+        projection_source = pad_gated_residual_projection_weight(
+            projection_source, projection_rows=logical_rows
+        )
     projection_source.mul_(2.0)
     up_source.mul_(4.0)
     normalized = torch.full_like(x_source, float("nan"))
@@ -765,7 +951,9 @@ def test_mix_prefetch_observes_pdl_producer_updates(
             projection.fill_(float("nan"))
             up.fill_(float("nan"))
         graph.replay()
-        expected = _mix_reference(x_source, projection_source, up_source, scale)
+        expected = _mix_reference(
+            x_source, projection_source[:logical_rows], up_source, scale
+        )
         tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
         for actual in outputs:
             torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
@@ -792,7 +980,7 @@ def test_fused_cute_dispatch_requires_explicit_weight_contract(
     )
     expected_name = (
         "cute_fused_hyperconnection_mix"
-        if weights_independent and rows <= 16
+        if weights_independent
         else "triton_hyperconnection_mix"
     )
     assert capture._records[-1].kernel_name == expected_name
@@ -822,9 +1010,7 @@ def test_fused_cute_dispatch_checks_all_tma_alignments(input_index, offset):
 
 
 @pytest.mark.parametrize("has_inject", [False, True])
-def test_fused_cute_graphs_share_only_stream_private_generations(has_inject):
-    from tokenspeed_kernel.ops.residual.cute_fused import _persistent_workspace
-
+def test_fused_cute_graphs_share_ordered_generations(has_inject):
     _require_fused_hc()
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     graphs = []
@@ -835,7 +1021,7 @@ def test_fused_cute_graphs_share_only_stream_private_generations(has_inject):
     projection_rows = LOWRANK + (HC_COUNT if has_inject else 0)
     clusters = (projection_rows + 63) // 64
     # Graphs with odd call counts, mixed rows and retained outputs exercise the
-    # runtime wrapper's workspace key and on-device generation selection.
+    # shared workspace key and on-device generation selection.
     for index, stream in enumerate(streams):
         values = [
             _inputs(rows, dtype, seed=4800 + index * 100 + rows)
@@ -857,7 +1043,9 @@ def test_fused_cute_graphs_share_only_stream_private_generations(has_inject):
                     projection_scale=1.0,
                     weights_independent=True,
                 )
-            raw, count = _persistent_workspace(values[0][0].device, projection_rows)
+            raw, count = _fused_diagnostic_workspace(
+                values[0][0].device, projection_rows
+            )
             generation = 2**32 - 1
             # All consumed projection elements must be overwritten even when
             # the workspace is uninitialized and row counts change in a graph.
@@ -880,15 +1068,22 @@ def test_fused_cute_graphs_share_only_stream_private_generations(has_inject):
         outputs.append(result)
         expected.append([_mix_reference(x, w, u, 1.0) for x, w, u in values])
         counters.append(count)
-    assert counters[0].data_ptr() != counters[1].data_ptr()
+    assert counters[0].data_ptr() == counters[1].data_ptr()
     for _ in range(5):
         for stream, graph in zip(streams, graphs):
             with torch.cuda.stream(stream):
                 graph.replay()
+            # The shared persistent epochs require an ordering edge between
+            # streams, matching the runtime's single model execution lane.
+            stream.synchronize()
     torch.cuda.synchronize()
-    for results, refs, counter in zip(outputs, expected, counters):
+    for results, refs in zip(outputs, expected):
         torch.testing.assert_close(results, refs, rtol=0.04, atol=0.04)
-        assert counter.cpu().tolist() == [generation + 15] * clusters
+    counter = counters[0]
+    assert counter[:clusters].cpu().tolist() == [generation + 30] * clusters
+    # Single-microtile invocations do not recycle their slot, so the separate
+    # consumer-completion epochs remain untouched.
+    assert counter[clusters:].cpu().tolist() == [generation] * clusters
 
 
 @pytest.mark.parametrize(("rows", "dtype"), [(4, torch.bfloat16), (16, torch.float16)])
@@ -922,8 +1117,24 @@ def test_fused_cluster_split_k_does_not_exceed_sixteen():
     _require_fused_hc()
     from tokenspeed_kernel.thirdparty.cute_dsl.hc_fused import FusedGatedResidualKernel
 
-    with pytest.raises(ValueError, match="split-K=16"):
-        FusedGatedResidualKernel(4, 324, 32, True, 1.0, True)
+    with pytest.raises(ValueError, match="split-K"):
+        FusedGatedResidualKernel(
+            projection_tile=64,
+            token_tile=8,
+            projection_rows=324,
+            split_k=32,
+            projection_tiles=1,
+            batch_tiles=1,
+            workers=1,
+            stages=2,
+            final_tile=32,
+            rounds=1,
+            use_pdl=True,
+            scale=1.0,
+            weights_independent=True,
+            single_tile=True,
+            full_tiles=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -939,24 +1150,27 @@ def test_fused_down_consumes_every_k128_stage_on_graph_replay(
     rows, dtype, has_inject, down_stages, monkeypatch
 ):
     from tokenspeed_kernel.ops.residual import cute_fused
-    from tokenspeed_kernel.ops.residual.cute_fused import _persistent_workspace
 
     _require_fused_hc()
-
-    class StagedKernel(cute_fused.FusedGatedResidualKernel):
-        def __init__(
-            self, rows, projection_rows, split_k, use_pdl, scale, weights_independent
-        ):
-            super().__init__(
-                rows, projection_rows, split_k, use_pdl, scale, weights_independent
-            )
-            self.down_stages = down_stages
 
     # Two buffers must recycle and wrap their phases while consuming all five
     # K128 tiles; five buffers must consume the same data without recycling.
     # Isolate compilation because the public dispatch key fixes the tactic.
-    monkeypatch.setattr(cute_fused, "FusedGatedResidualKernel", StagedKernel)
-    monkeypatch.setattr(cute_fused, "_COMPILED", {})
+    monkeypatch.setattr(
+        cute_fused,
+        "_tactic",
+        lambda rows, projection_rows: (
+            16,
+            64,
+            8 if rows <= 8 else 16,
+            1,
+            1,
+            down_stages,
+            32,
+        ),
+    )
+    monkeypatch.setattr(cute_fused, "_PLANS", {})
+    monkeypatch.setattr(cute_fused, "_CAPACITIES", {})
     x, w, u = _inputs(rows, dtype, seed=6023 + rows)
     if not has_inject:
         w = w[:LOWRANK]
@@ -982,7 +1196,7 @@ def test_fused_down_consumes_every_k128_stage_on_graph_replay(
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         call()
-        storage, _ = _persistent_workspace(x.device, w.shape[0])
+        storage, _ = _fused_diagnostic_workspace(x.device, w.shape[0])
     stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
@@ -1026,8 +1240,6 @@ def test_fused_down_consumes_every_k128_stage_on_graph_replay(
 def test_fused_distributed_reduce_applies_activation_after_complete_sum(
     rows, dtype, has_inject
 ):
-    from tokenspeed_kernel.ops.residual.cute_fused import _persistent_workspace
-
     _require_fused_hc()
     x, w, u = _inputs(rows, dtype, seed=5711 + rows)
     if not has_inject:
@@ -1045,7 +1257,7 @@ def test_fused_distributed_reduce_applies_activation_after_complete_sum(
     w[:, ::640] = columns[:, None] * pattern[None, :]
     scale = 0.25
     pdl_enabled(True)
-    storage, epochs = _persistent_workspace(x.device, w.shape[0])
+    storage, epochs = _fused_diagnostic_workspace(x.device, w.shape[0])
     storage.fill_(-1)
     actual = _mix(
         (x, w, u),
@@ -1063,5 +1275,6 @@ def test_fused_distributed_reduce_applies_activation_after_complete_sum(
     tolerance = 0.04 if dtype == torch.bfloat16 else 0.008
     torch.testing.assert_close(actual[0], expected[0], rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(actual[1], expected[1], rtol=0.0, atol=0.0)
-    assert epochs.numel() == (w.shape[0] + 63) // 64
-    assert len(set(epochs.cpu().tolist())) == 1
+    assert epochs.numel() == 2 * ((w.shape[0] + 63) // 64)
+    clusters = (w.shape[0] + 63) // 64
+    assert len(set(epochs[:clusters].cpu().tolist())) == 1

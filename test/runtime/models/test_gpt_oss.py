@@ -20,7 +20,6 @@ import subprocess
 import sys
 import time
 import unittest
-from typing import Optional
 
 import requests
 
@@ -57,6 +56,7 @@ def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
         "-m",
         "tokenspeed.cli",
         "serve",
+        "--disable-autotune",
         "--model",
         MODEL,
         "--host",

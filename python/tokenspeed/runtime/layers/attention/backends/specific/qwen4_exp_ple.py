@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.kda.triton import (
+    commit_state_pages,
     verify_state_blocks,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -36,14 +37,15 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     CudaGraphSupport,
+    reject_bounded_replay,
+    reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
-    gather_verified_state_blocks,
-    verified_state_block_slots,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
@@ -79,32 +81,30 @@ class PLEForwardMetadata:
 class Qwen4ExpPLEBackend(AttentionBackend):
     """Bind PLE cache fields and own their metadata and verify workspace."""
 
-    cache_consumer_families = frozenset({"state"})
-    # Prefill graph buckets pad tokens; PLE's request-shaped updates must stay
-    # eager so padding cannot advance n-gram or short-convolution state.
-    cuda_graph_support = CudaGraphSupport(prefill_graph=False)
+    cache_consumer_attn_kinds = frozenset({"state"})
+    # The PLE layer's break runs request-shaped state updates eagerly, using
+    # live query lengths to exclude padded rows from state writes.
+    cuda_graph_support = CudaGraphSupport(prefill_graph=True)
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)
         self.forward_metadata: PLEForwardMetadata | None = None
         self._context_field_id: str | None = None
         self._conv_field_ids: tuple[str, ...] = ()
-        self._checkpoint_granularity = 1
         self._ple_verify_scratch: dict[str, torch.Tensor] = {}
         self._ple_verify_tables: dict | None = None
         self._ple_commit_rows: torch.Tensor | None = None
         self._verify_commit_ctx: tuple[torch.Tensor, int, int] | None = None
         self._decode_input_blocks: torch.Tensor | None = None
         self._decode_output_blocks: torch.Tensor | None = None
-        self._decode_committed: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, PLEForwardMetadata] = {}
 
     def _cache_fields(
         self, cache_pool: CachePool
-    ) -> tuple[str | None, tuple[str, ...], int]:
+    ) -> tuple[str | None, tuple[str, ...]]:
         """Validate the local PLE fields before the backend tree publishes a pool."""
         if self.is_draft:
-            return None, (), 1
+            return None, ()
         fields = tuple(
             field
             for field in cache_pool.arena.plan.fields
@@ -117,7 +117,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             if cache_field_plane(field.field_id) == "qwen4_exp.ple.conv"
         )
         if not conv_fields:
-            return None, (), 1
+            return None, ()
         context_fields = tuple(
             field.field_id
             for field in fields
@@ -136,22 +136,15 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             ),
             None,
         )
-        if (
-            group is None
-            or group.family != "state"
-            or group.checkpoint_granularity is None
-        ):
-            raise RuntimeError("PLE requires a checkpoint-shaped state cache group")
+        if group is None or group.attn_kind != "state":
+            raise RuntimeError("PLE requires a state cache group")
         return (
             context_fields[0],
             tuple(sorted(conv_fields, key=cache_field_layer_id)),
-            int(group.checkpoint_granularity),
         )
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
-        if self.cache_pool is not None and self.cache_pool is not cache_pool:
-            raise RuntimeError("PLE backend cannot be rebound to another cache pool")
         self._cache_fields(cache_pool)
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
@@ -159,11 +152,11 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         super()._publish_cache_pool(cache_pool)
         if already_bound:
             return
-        (
-            self._context_field_id,
-            self._conv_field_ids,
-            self._checkpoint_granularity,
-        ) = self._cache_fields(cache_pool)
+        self._context_field_id, self._conv_field_ids = self._cache_fields(cache_pool)
+        # The commit tables point into the old arena; preallocation rebuilds them.
+        self._ple_verify_tables = None
+        self._ple_commit_rows = None
+        self._verify_commit_ctx = None
 
     def _block_rows(self, block_tables: Mapping[str, torch.Tensor]) -> torch.Tensor:
         rows = block_tables.get(QWEN4_EXP_PLE_CACHE_GROUP)
@@ -181,9 +174,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             (max_bs,), -1, dtype=torch.int32, device=self.device
         )
         self._decode_output_blocks = torch.full_like(self._decode_input_blocks, -1)
-        self._decode_committed = torch.empty(
-            max_bs, dtype=torch.int64, device=self.device
-        )
 
     def _decode_view(self, bs: int) -> PLEForwardMetadata:
         if (
@@ -217,13 +207,19 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
+        reject_query_shard(query_shard, "Qwen4ExpPLEBackend")
+        reject_bounded_replay(extend_replay_lens_cpu, "Qwen4ExpPLEBackend")
         del (
             req_pool_indices,
             extend_seq_lens,
             extend_prefix_lens_cpu,
+            extend_prompt_lens_cpu,
             extend_with_prefix,
             kwargs,
         )
@@ -248,9 +244,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         )
         input_blocks, output_blocks = compute_state_block_indices(
             self._block_rows(block_tables),
-            self._checkpoint_granularity,
             before,
-            after,
             validate=cache_debug_enabled(),
             group_id=QWEN4_EXP_PLE_CACHE_GROUP,
         )
@@ -294,23 +288,14 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 if self._ple_commit_rows is None:
                     raise RuntimeError("PLE verify workspace was not preallocated")
                 verify_state_blocks(
-                    seq_lens,
-                    rows,
-                    batch_size=actual_bs,
-                    draft_tokens=metadata.verify_width,
-                    granularity=self._checkpoint_granularity,
-                    pages_out=metadata.input_blocks,
-                    committed_out=self._decode_committed,
+                    rows, batch_size=actual_bs, pages_out=metadata.input_blocks
                 )
                 if forward_mode.is_decode():
                     self._verify_commit_ctx = (rows, actual_bs, metadata.verify_width)
             else:
-                after = seq_lens[:actual_bs]
                 input_blocks, output_blocks = compute_state_block_indices(
                     rows,
-                    self._checkpoint_granularity,
-                    after - 1,
-                    after,
+                    seq_lens[:actual_bs] - 1,
                     validate=cache_debug_enabled(),
                     group_id=QWEN4_EXP_PLE_CACHE_GROUP,
                 )
@@ -401,7 +386,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                     f"{self._conv_field_ids[0]} {conv_dst_stride}"
                 )
         device = context_field.device
-        tables = {
+        return {
             "context_src": self._u64([context_scratch.data_ptr()], device),
             "context_dst": self._u64([context_field.data_ptr()], device),
             "context_src_stride": self._i64([row_stride_i32(context_scratch)], device),
@@ -418,10 +403,9 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             "conv_dst_stride": self._i64([conv_dst_stride] * len(conv_fields), device),
             "conv_row_bytes": conv_fields[0][0].numel() * conv_fields[0].element_size(),
         }
-        return tables
 
     def commit_verified_state(self, accepted_lengths: torch.Tensor) -> None:
-        """Commit one completed decode verification's accepted PLE checkpoint."""
+        """Commit the accepted PLE checkpoint with a fused page resolve."""
         context = self._verify_commit_ctx
         if context is None:
             return
@@ -436,19 +420,27 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         row_count = bs * num_layers
         if rows is None or rows.shape[1] < row_count:
             raise RuntimeError("PLE commit rows exceed the preallocated capacity")
-        steps = accepted_lengths.to(torch.int64).clamp(min=1, max=width)
-        slots = verified_state_block_slots(
-            self._decode_committed, steps, self._checkpoint_granularity
+        pages, steps = torch.empty(
+            (2, bs), dtype=torch.int32, device=accepted_lengths.device
+        ).unbind(0)
+        commit_state_pages(
+            accepted_lengths,
+            rows_table,
+            batch_size=bs,
+            draft_tokens=width,
+            pages_out=pages.unsqueeze(0),
+            out_row=0,
+            steps_out=steps,
         )
-        pages = gather_verified_state_blocks(rows_table, slots)
         src_rows, dst_rows = rows[0, :row_count], rows[1, :row_count]
         state_verify_commit_rows(
-            accepted_lengths,
+            steps,
             pages,
             src_rows,
             dst_rows,
             verify_width=width,
             num_layers=num_layers,
+            group_indices=None,
         )
         tables = self._ple_verify_tables
         if tables["context_row_bytes"]:

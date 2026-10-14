@@ -28,6 +28,8 @@ from typing import List, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.activation.triton import silu_and_mul
+from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
@@ -824,7 +826,6 @@ def triton_scaled_mm(
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
 )
 def triton_mm_fp8_blockscale(
     A: torch.Tensor,
@@ -954,7 +955,6 @@ def _w8a8_block_fp8_bmm(
         "out_inner_stride_one": frozenset({True}),
     },
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
 )
 def triton_bmm_fp8_blockscale(
     A: torch.Tensor,
@@ -1035,28 +1035,13 @@ def triton_bmm_fp8_blockscale(
     return C
 
 
-def _triton_dsv4_grouped_output_projection_weights(
-    *,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    num_groups: int,
-    output_dim: int,
-    input_dim: int,
-    block_size: tuple[int, int],
-    recipe: tuple[int, int, int],
-) -> torch.Tensor:
-    del weight, recipe
-    block_n, block_k = block_size
-    expected_shape = (
-        num_groups * (output_dim // block_n),
-        input_dim // block_k,
+_TRITON_GROUPED_OUTPUT_SIGNATURES = frozenset(
+    format_signature(
+        attention=dense_tensor_format(input_dtype),
+        weight=dense_tensor_format(_fp8_dtype),
     )
-    if tuple(weight_scale.shape) != expected_shape:
-        raise ValueError(
-            "grouped output projection scale shape mismatch: "
-            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
-        )
-    return weight_scale
+    for input_dtype in (torch.float16, torch.bfloat16)
+)
 
 
 @register_kernel(
@@ -1065,17 +1050,9 @@ def _triton_dsv4_grouped_output_projection_weights(
     name="triton_dsv4_grouped_output_projection",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=frozenset(
-        format_signature(
-            attention=dense_tensor_format(input_dtype),
-            weight=dense_tensor_format(_fp8_dtype),
-        )
-        for input_dtype in (torch.float16, torch.bfloat16)
-    ),
+    signatures=_TRITON_GROUPED_OUTPUT_SIGNATURES,
     traits={},
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
-    weight_preprocessor=_triton_dsv4_grouped_output_projection_weights,
 )
 def triton_dsv4_grouped_output_projection(
     *,
@@ -1090,13 +1067,8 @@ def triton_dsv4_grouped_output_projection(
     nope_dim: int,
     rope_dim: int,
     block_size: tuple[int, int],
-    tma_aligned_scales: bool,
-    recipe: tuple[int, int, int],
 ) -> torch.Tensor:
     """Run V4's grouped output projection with canonical scales and Triton BMM."""
-    del recipe
-    if tma_aligned_scales:
-        raise ValueError("the portable projection requires canonical scales")
     from tokenspeed_kernel.ops.attention.dsv4.triton import (
         dsv4_fused_inv_rope_fp8_quant,
     )
@@ -1144,19 +1116,21 @@ def _mxfp4_mm_kernel(
     A_scales,
     B_scales,
     C,
-    M: tl.constexpr,
+    # Activation-side geometry follows the batch and stays runtime; the
+    # weight-side geometry is fixed for the process lifetime.
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
-    stride_am: tl.constexpr,
-    stride_ak: tl.constexpr,
+    stride_am,
+    stride_ak,
     stride_bn: tl.constexpr,
     stride_bk: tl.constexpr,
-    stride_asm: tl.constexpr,
-    stride_asg: tl.constexpr,
+    stride_asm,
+    stride_asg,
     stride_bsn: tl.constexpr,
     stride_bsg: tl.constexpr,
-    stride_cm: tl.constexpr,
-    stride_cn: tl.constexpr,
+    stride_cm,
+    stride_cn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -1217,7 +1191,7 @@ def _mxfp4_mm_kernel(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=_MXFP4_FORMAT_SIGNATURES,
-    traits={"quant": frozenset({"mxfp4"})},
+    traits={},
     priority=Priority.PORTABLE,
 )
 def triton_mm_mxfp4(
@@ -1272,6 +1246,65 @@ def triton_mm_mxfp4(
     return C
 
 
+# ---- Dense MXFP4 linears with dynamic MXFP4 activations ------------------
+
+# Weight stored in checkpoint order: packed E2M1 [N, K/2] plus UE8M0 [N, K/32].
+MXFP4_LINEAR_LINEAR_LAYOUT = "linear"
+MXFP4_LINEAR_SIGNATURE = format_signature(
+    x=dense_tensor_format(torch.bfloat16),
+    weight=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
+)
+MXFP4_LINEAR_SIGNATURES = frozenset({MXFP4_LINEAR_SIGNATURE})
+
+
+@register_kernel(
+    "gemm",
+    "mxfp4_linear",
+    name="triton_mxfp4_linear",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=MXFP4_LINEAR_SIGNATURES,
+    traits={"weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT})},
+    priority=Priority.PORTABLE,
+)
+def triton_mxfp4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """``mxfp4(x) @ W.T``: quantize ``x`` to MXFP4, then the MXFP4 GEMM."""
+    x_fp4, x_scale = mxfp4_quantize(x)
+    return triton_mm_mxfp4(x_fp4, weight, x_scale, weight_scale, x.dtype, out=out)
+
+
+@register_kernel(
+    "gemm",
+    "mxfp4_swiglu_linear",
+    name="triton_mxfp4_swiglu_linear",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=MXFP4_LINEAR_SIGNATURES,
+    traits={"weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT})},
+    priority=Priority.PORTABLE,
+)
+def triton_mxfp4_swiglu_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """``silu(gate) * up`` of ``mxfp4(x) @ W.T`` with stacked [gate; up] rows."""
+    gate_up = triton_mxfp4_linear(x, weight, weight_scale, out=None)
+    if out is None:
+        out = torch.empty(
+            (x.shape[0], weight.shape[0] // 2), dtype=x.dtype, device=x.device
+        )
+    return silu_and_mul(gate_up, out)
+
+
 # ---- Triton scaled FP8 ----------------------------------------------------
 
 
@@ -1281,15 +1314,17 @@ def triton_mm_mxfp4(
     name="triton_mm_fp8_scaled",
     solution="triton",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
+        vendors=frozenset({"nvidia", "amd"}),
+        vendor_min_arch_versions={
+            "nvidia": ArchVersion(10, 0),
+            "amd": ArchVersion(9, 5),
+        },
     ),
     signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"KN"}),
     },
     priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
 )
 def triton_mm_fp8_scaled(
     A: torch.Tensor,
@@ -1303,6 +1338,22 @@ def triton_mm_fp8_scaled(
     bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """FP8 E4M3 GEMM with per-token/per-tensor A and per-channel/per-tensor B scales.
+
+    Args:
+        A: ``[M, K]`` FP8 activations.
+        B: ``[K, N]`` FP8 weights (a transposed ``[N, K]`` view is accepted).
+        A_scales: FP32 ``[M, 1]`` per-token or ``[1, 1]`` per-tensor scales.
+        B_scales: FP32 ``[N, 1]`` per-channel or ``[1, 1]`` per-tensor scales.
+        out_dtype: Output dtype.
+        alpha: Unused; accepted for the ``gemm.mm`` calling convention.
+        block_size: Unused; accepted for the ``gemm.mm`` calling convention.
+        bias: Optional ``[N]`` bias added in the epilogue.
+        out: Optional ``[M, N]`` output buffer.
+
+    Returns:
+        ``[M, N]`` tensor ``(A * A_scales) @ (B * B_scales^T)`` in ``out_dtype``.
+    """
     return triton_scaled_mm(
         A,
         B,
@@ -1312,3 +1363,73 @@ def triton_mm_fp8_scaled(
         bias=bias,
         out=out,
     )
+
+
+# ---- AMD gfx950 skinny MXFP8 ----------------------------------------------
+
+
+if Platform.get().is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.skinny import (
+        launch_triton_mm_mxfp8_skinny_gfx950 as _mm_mxfp8_skinny_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.skinny import (
+        supports_mxfp8_skinny_shape as _supports_mxfp8_skinny_shape,
+    )
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="triton_mm_mxfp8_skinny_gfx950",
+        solution="triton",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    a=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_SCALE),
+                    b=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_SCALE),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mxfp8_skinny_shape}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
+            "out_dtype": frozenset({torch.bfloat16, torch.float16}),
+            "out_inner_stride_one": frozenset({True}),
+        },
+    )
+    def triton_mm_mxfp8_skinny_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if A_scales is None or B_scales is None or block_size is None:
+            raise ValueError("gfx950 skinny MXFP8 GEMM requires scales and block_size")
+        return _mm_mxfp8_skinny_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            out=out,
+        )
+
+else:
+
+    def triton_mm_mxfp8_skinny_gfx950(**kwargs):
+        raise ImportError(
+            "triton_mm_mxfp8_skinny_gfx950 requires tokenspeed-kernel-amd"
+        )

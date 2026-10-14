@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <span>
+#include <unordered_set>
 
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
@@ -30,6 +31,11 @@
 #include "utils.h"
 
 namespace tokenspeed {
+
+inline bool PrefixKeyIsHit(const PrefixCacheIndex& index, const BlockPool& pool, const CacheKey& key,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) {
+    return index.Contains(pool, key) || (extra_hits != nullptr && extra_hits->contains(key));
+}
 
 // Per-attention-kind prefix-match policy. A matcher only reads the group's
 // PrefixCacheIndex; it never touches allocation or physical placement.
@@ -44,8 +50,13 @@ public:
     virtual std::int32_t BoundaryLookbackPages() const = 0;
     // Probes keys[begin_blocks, begin_blocks + max_blocks) against the index.
     // probe.hits[i] marks keys[begin_blocks + i]; holes are 0.
+    // extra_hits is the L3 storage index (keys known to exist below Host).
+    // Pass nullptr when L3 is unset; omitting it would silently skip L3 hits.
+    // The page walk of the probe's aligned phase; a matcher the coordinator
+    // judges per candidate boundary alone has no walk.
     virtual GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                                   std::int32_t begin_blocks, std::int32_t max_blocks) const = 0;
+                                   std::int32_t begin_blocks, std::int32_t max_blocks,
+                                   const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const = 0;
 };
 
 // Full attention: a hit is a contiguous run with no holes, so both the device
@@ -56,12 +67,13 @@ public:
     std::int32_t BoundaryLookbackPages() const override { return 0; }
 
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                           std::int32_t begin_blocks, std::int32_t max_blocks) const override {
+                           std::int32_t begin_blocks, std::int32_t max_blocks,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         GroupPrefixProbe probe;
         for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
-            if (!index.Contains(pool, keys[static_cast<std::size_t>(j)])) {
+            if (!PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(j)], extra_hits)) {
                 break;
             }
             probe.hits.push_back(1);
@@ -70,9 +82,26 @@ public:
     }
 };
 
-// Sliding window (and, with window == 2, mamba state snapshots): non-closed --
-// shortening a match can cut its trailing run below the window, so match
-// bound-first.
+// A State group holds whole recurrent states at the boundaries requests
+// published them (prompt end, finish, retraction, a junction cut): one key per
+// boundary, no lookback, no run. The coordinator tests each candidate
+// boundary's key directly and never walks a State group's pages.
+class StateMatcher : public PrefixMatcher {
+public:
+    bool IsPrefixClosed() const override { return false; }
+    std::int32_t BoundaryLookbackPages() const override { return 0; }
+
+    GroupPrefixProbe Probe(const PrefixCacheIndex& /*index*/, const BlockPool& /*pool*/,
+                           std::span<const CacheKey> /*keys*/, std::int32_t /*begin_blocks*/,
+                           std::int32_t /*max_blocks*/,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* /*extra_hits*/) const override {
+        FatalCheck(false, "a State group's boundaries are judged per candidate, never walked");
+        return {};
+    }
+};
+
+// Sliding window: non-closed -- shortening a match can cut its trailing run
+// below the window, so match bound-first.
 class SwaMatcher : public PrefixMatcher {
 public:
     SwaMatcher(std::int32_t block_granularity, std::int32_t sliding_window)
@@ -86,7 +115,8 @@ public:
 
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                           std::int32_t begin_blocks, std::int32_t max_blocks) const override {
+                           std::int32_t begin_blocks, std::int32_t max_blocks,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         GroupPrefixProbe probe;
@@ -99,8 +129,8 @@ public:
             return probe;
         }
         const auto [boundary, hits_begin] = findResumableBoundary(
-            [&](std::int32_t i) { return index.Contains(pool, keys[static_cast<std::size_t>(i)]); }, begin_blocks,
-            end_blocks);
+            [&](std::int32_t i) { return PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(i)], extra_hits); },
+            begin_blocks, end_blocks);
         if (boundary == begin_blocks) {
             return probe;
         }

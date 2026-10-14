@@ -233,10 +233,11 @@ def _select_pools_chunked_gluon(
 ) -> torch.Tensor:
     """Score bounded windows and select candidates with stable short rows.
 
-    Short selections that fit in one normalized window use logical head
-    accumulation and deterministic sorting. Longer or split selections retain
-    the faster balanced reduction and radix selection. Query rows are tiled so
-    the fused path honors the runtime's temporary-workspace cap.
+    Short selections that fit in one normalized window require logical head
+    accumulation and use deterministic sorting. Longer or split selections use
+    radix selection and let the scorer pick its fastest head reduction. Query
+    rows are tiled so the fused path honors the runtime's temporary-workspace
+    cap.
     """
     plan_parts = (pool_workspace_slots, row_starts, row_ends)
     has_prefill_plan = all(part is not None for part in plan_parts)
@@ -644,9 +645,10 @@ def _kpool_prefill_topk_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select KPool candidates with the production hybrid Gluon path.
 
-    Short selections of at most 2048 pools use ordered head accumulation when
-    they fit in one normalized scoring window. Longer or split selections keep
-    the balanced reduction.
+    Short selections of at most 2048 pools require ordered head accumulation
+    when they fit in one normalized scoring window. Longer or split selections
+    let the scorer pick its fastest head reduction: balanced on gfx950, while
+    gfx1250 always accumulates heads in order.
     """
     return _kpool_prefill_topk_fp8(
         q,
@@ -715,15 +717,14 @@ if _IS_AMD:
         traits={
             "index_heads": frozenset({32}),
             "head_dim": frozenset({128}),
-            "pool_size": frozenset({4}),
             "page_size": frozenset({16}),
+            "pool_size": frozenset({4}),
             "topk_pools": frozenset({512}),
+            "has_prefill_plan": frozenset({False, True}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "score_activation": frozenset({"relu"}),
             "topk_layout": frozenset({"global_slots"}),
-            "prefill_plan": frozenset({False, True}),
         },
-        tags={"amd", "gfx950", "hybrid", "kpool", "mfma-score", "radix-topk"},
     )(gluon_kpool_prefill_topk_fp8_gfx950)
     register_kernel(
         "attention",
@@ -740,21 +741,13 @@ if _IS_AMD:
         traits={
             "index_heads": frozenset({32}),
             "head_dim": frozenset({128}),
-            "pool_size": frozenset({4}),
             "page_size": frozenset({16}),
+            "pool_size": frozenset({4}),
             "topk_pools": frozenset({512}),
+            "has_prefill_plan": frozenset({False, True}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "score_activation": frozenset({"relu"}),
             "topk_layout": frozenset({"global_slots"}),
-            "prefill_plan": frozenset({False, True}),
-        },
-        tags={
-            "amd",
-            "gfx1250",
-            "hybrid",
-            "kpool",
-            "wave32-wmma-score",
-            "wave32-radix-topk",
         },
     )(gluon_kpool_prefill_topk_fp8_gfx1250)
     __all__ = [

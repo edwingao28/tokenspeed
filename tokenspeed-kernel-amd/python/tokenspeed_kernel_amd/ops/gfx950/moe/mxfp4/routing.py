@@ -426,7 +426,7 @@ def invoke_sigmoid_bias_topk_route_gluon(
 # Large-M package prefill routing: one independent CTA per token.
 # ---------------------------------------------------------------------------
 @gluon.jit
-def _sigmoid_bias_topk_route_prefill_kernel(
+def gluon_sigmoid_bias_topk_gfx950(
     logits_ptr,
     bias_ptr,
     topk_ids_ptr,
@@ -489,6 +489,8 @@ def _sigmoid_bias_topk_route_prefill_kernel(
         selected_weights = selected_weights.to(gl.float32) * (
             ROUTED_SCALING_FACTOR / denominator
         )
+    else:
+        selected_weights *= ROUTED_SCALING_FACTOR
 
     topk_mask = topk_lane < TOPK
     cdna4.buffer_store(
@@ -537,7 +539,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
         (tokens, topk), dtype=torch.float32, device=router_logits.device
     )
     num_warps = 1
-    _sigmoid_bias_topk_route_prefill_kernel[(tokens,)](
+    gluon_sigmoid_bias_topk_gfx950[(tokens,)](
         router_logits,
         correction_bias,
         topk_ids,

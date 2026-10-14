@@ -10,11 +10,18 @@ the exact set of checkpoint keys the loader must route, skip, or reject.
 from __future__ import annotations
 
 import copy
+import os
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
@@ -150,8 +157,12 @@ def test_non_yarn_rope_yields_no_scaling() -> None:
 
 
 def test_tap_count_must_match_num_target_layers() -> None:
-    with pytest.raises(ValueError, match="context_proj expects"):
-        validate_k3_dspark_config(make_config(target_layer_ids=[2, 23, 47]))
+    with pytest.raises(
+        ValueError, match="target_layer_ids has 3 entries but num_target_layers=5"
+    ):
+        validate_k3_dspark_config(
+            make_config(target_layer_ids=[2, 23, 47]), target_config=None
+        )
 
 
 def test_taps_must_be_ascending() -> None:
@@ -362,3 +373,86 @@ def test_every_remaining_checkpoint_key_has_a_destination() -> None:
         routed.add(target)
 
     assert routed == expected_params
+
+
+@pytest.mark.parametrize(
+    "stream,layer,expected",
+    [
+        ("prefix", 2, 2),
+        ("prefix", 7, 7),
+        ("attn_res", 2, 3),
+        ("attn_res", 7, 7),
+    ],
+)
+def test_k3_tap_ownership_matches_the_stream_producer(stream, layer, expected):
+    assert dspark_model_module._context_tap_owner_layer(layer, 8, stream) == expected
+
+
+@pytest.mark.parametrize("capture_idx", [0, 2])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_k3_per_tap_projection_uses_local_checkpoint_columns(capture_idx, with_norm):
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(target_hidden_size=3)
+    model.local_tap_indices = (0, 2)
+    model.context_proj = torch.nn.Linear(6, 4, bias=False)
+    model.context_proj.weight.data.copy_(torch.arange(24).reshape(4, 6) / 24)
+    model.fc_norm = (
+        torch.nn.ModuleList([torch.nn.RMSNorm(3, eps=1e-5) for _ in range(2)])
+        if with_norm
+        else None
+    )
+    hidden = torch.tensor([[1.0, 2.0, 4.0], [3.0, -1.0, 2.0]])
+    local_idx = (0, 2).index(capture_idx)
+    reference = hidden
+    if with_norm:
+        for index, norm in enumerate(model.fc_norm):
+            norm.weight.data.copy_(torch.arange(3) + index + 1)
+        reference = torch.nn.functional.rms_norm(
+            hidden, (3,), model.fc_norm[local_idx].weight, 1e-5
+        )
+    expected = torch.nn.functional.linear(
+        reference, model.context_proj.weight[:, local_idx * 3 : (local_idx + 1) * 3]
+    )
+    torch.testing.assert_close(model.project_target_tap(capture_idx, hidden), expected)
+    with pytest.raises(ValueError):
+        model.project_target_tap(1, hidden)
+
+
+def test_context_kv_write_respects_dcp_ownership():
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+    slots = torch.tensor([0, 128, 129, 256, 384, 512, 896, 1024, -1])
+    latent = torch.arange(slots.numel() * 6).reshape(-1, 6).float()
+    attn = SimpleNamespace(
+        attn_mqa=object(),
+        kv_lora_rank=4,
+        project_latent_kv=lambda hidden: hidden,
+        apply_latent_rope=lambda positions, hidden: hidden,
+    )
+    model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
+    owner_counts = torch.zeros_like(slots)
+    for rank in range(4):
+
+        def write(layer, local, key, rope, *, write_mask):
+            expected = (
+                (slots >= 128) & (slots < 1024) & (((slots // 128 - 1) % 4) == rank)
+            )
+            torch.testing.assert_close(write_mask, expected)
+            expected_local = ((slots // 128 - 1) // 4 + 1) * 128 + slots % 128
+            torch.testing.assert_close(local[expected], expected_local[expected])
+            torch.testing.assert_close(torch.cat((key, rope), dim=-1), latent)
+            owner_counts.add_(write_mask)
+
+        backend = SimpleNamespace(
+            cache_placement=lambda layer: CachePlacement(128, 8, (0, 1, 2, 3), rank)
+        )
+        K3DSparkModel.write_context_kv(
+            model,
+            latent,
+            torch.arange(slots.numel()),
+            slots,
+            SimpleNamespace(set_mla_kv_buffer=write),
+            attn_backend=backend,
+        )
+    torch.testing.assert_close(owner_counts, ((slots >= 128) & (slots < 1024)).long())

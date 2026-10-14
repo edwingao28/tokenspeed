@@ -42,11 +42,6 @@ class MooncakeKVSender:
         self.bootstrap_server_url = bootstrap_addr
         self.bootstrap_room = bootstrap_room
         self.kv_mgr.begin_room(bootstrap_room)
-        logger.info(
-            "[MooncakeKVSender.__init__] bootstrap_room=%s bootstrap_addr=%s status=Bootstrapping",
-            bootstrap_room,
-            bootstrap_addr,
-        )
 
         # inner state
         self.init_time = time.time()
@@ -71,13 +66,6 @@ class MooncakeKVSender:
         if not is_last:
             raise ValueError("CachePD full-manifest transfer must be final")
 
-        logger.info(
-            "[MooncakeKVSender.send] bootstrap_room=%s is_last=%s bootstrap_token=%s",
-            self.bootstrap_room,
-            is_last,
-            bootstrap_token,
-        )
-
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             True,
@@ -101,14 +89,6 @@ class MooncakeKVSender:
             self._layerwise_final_chunk_submitted or is_last
         )
 
-        logger.info(
-            "[MooncakeKVSender.send_layerwise] bootstrap_room=%s "
-            "is_last=%s begin_cache_step=%s interval=%s",
-            self.bootstrap_room,
-            is_last,
-            begin_cache_step,
-            layerwise_interval,
-        )
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             is_last,
@@ -134,6 +114,9 @@ class MooncakeKVSender:
                             "Some requests timed out when bootstrapping, "
                             "which means prefill instances fail to receive the cache manifest from the decode instance of this request. "
                             "If a greater mean TTFT is acceptable, you can 'export TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+                        )
+                        self.kv_mgr.kv_transfer_metrics.record_kv_transfer_timeout(
+                            "bootstrapping"
                         )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,

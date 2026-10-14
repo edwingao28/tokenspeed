@@ -34,22 +34,25 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
+    gdn_tree_verify_needs_node_states,
 )
-from tokenspeed_kernel.ops.attention.gdn.triton import fused_qkv_split_gdn_prefill
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    fused_qkv_split_gdn_prefill,
+    pack_gdn_projection,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_update,
 )
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
-from tokenspeed.runtime.models.qwen3_5 import fused_qkvzba_split_reshape_cat_contiguous
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, suite="runtime-1gpu")
+register_cuda_ci(est_time=180, suite="runtime-1gpu")
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_hopper_plus, reason="PDL requires NVIDIA SM90+"
@@ -121,16 +124,53 @@ def restore_pdl():
         pdl_enabled(previous)
 
 
+@pytest.fixture
+def forbid_cake_backend(request, monkeypatch):
+    if request.node.callspec.params["solution"] != "flashinfer":
+        yield
+        return
+
+    decode = pytest.importorskip("flashinfer.gdn_decode")
+    prefill = pytest.importorskip("flashinfer.gdn_prefill")
+    from tokenspeed_kernel.ops.attention.gdn._flashinfer import adapter
+
+    def unexpected_cake(*args, **kwargs):
+        pytest.fail("GDN must retain the CuTe implementation wrapped for PDL")
+
+    runners = (adapter._decode_runner, adapter._prefill_runner)
+    for runner in runners:
+        runner.cache_clear()
+    monkeypatch.setattr(decode, "_run_cake_gdn_decode_pretranspose", unexpected_cake)
+    monkeypatch.setattr(prefill, "_run_cake_gdn_prefill", unexpected_cake)
+    try:
+        yield
+    finally:
+        # Private namespaces copied the patched globals; never retain them.
+        for runner in runners:
+            runner.cache_clear()
+
+
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("steps", [1, 4])
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
+@pytest.mark.parametrize("heads,value_heads", [(4, 12), (4, 8)])
+def test_gdn_chain_pdl_toggle(
+    batch,
+    steps,
+    solution,
+    state_dtype,
+    heads,
+    value_heads,
+    restore_pdl,
+    forbid_cake_backend,
+):
     if solution == "flashinfer" and not flashinfer_gdn.is_decode_available():
         pytest.skip("FlashInfer GDN unavailable")
     torch.manual_seed(31)
-    # TP4 Qwen3.8 uses 4 QK / 12 V heads; MTP with 3 draft steps verifies T=4.
-    heads, value_heads, dim = 4, 12, 128
+    # TP4 Qwen3.8 uses 4 QK / 12 V heads; 4 / 8 also covers Cake-admitted
+    # head grouping. MTP with 3 draft steps verifies T=4.
+    dim = 128
     rows = batch * steps
     qkv_width = (2 * heads + value_heads) * dim
     qkvz_width = qkv_width + value_heads * dim
@@ -160,14 +200,13 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
             BLOCK=1024,
             launch_pdl=True,
         )
-        qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
-            projection[:, :qkvz_width],
-            projection[:, qkvz_width:],
-            heads,
-            value_heads,
-            dim,
-            dim,
+        # Row-strided views of the projection, as the Qwen3.5 layer hands them on.
+        qkv, z = projection[:, :qkvz_width].split(
+            [qkv_width, value_heads * dim], dim=-1
         )
+        b, a = projection[:, qkvz_width:].split(value_heads, dim=-1)
+        # A chain or plain decode packs them for the dense kernels, as GdnAttnBackend does.
+        qkv, a, b = pack_gdn_projection(qkv, a, b)
         causal_conv1d_update(
             qkv.view(batch, steps, qkv_width).transpose(1, 2),
             conv,
@@ -181,6 +220,7 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
             output_state_indices=writes,
             pad_slot_id=-1,
             validate_data=False,
+            parent_indices=None,
         )
         if steps == 1:
             # Actual decode uses packed, strided Q/K/V views.
@@ -220,15 +260,17 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
                 disable_state_update=False,
                 output_state_indices=writes,
                 intermediate_states_buffer=None,
+                tree_ancestors=None,
             )
         return rmsnorm_fn(
-            out.reshape(-1, dim),
+            out.reshape(rows, -1),
             norm_weight,
-            z=z.reshape(-1, dim),
+            z=z,
             eps=1e-6,
-            group_size=None,
+            group_size=dim,
             norm_before_gate=True,
             sigmoid_gate=False,
+            weights_independent=True,
         )
 
     # Return to false after true to exercise both upstream and private caches.
@@ -240,7 +282,7 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
         with torch.cuda.graph(graph):
             actual = forward()
         names, edges = _graph_kernel_edges(graph)
-        stages = ("fused_qkvzba", "causal_conv1d", "gdn", "rms_norm")
+        stages = ("pack_gdn", "causal_conv1d", "gdn", "rms_norm")
         for stage in stages:
             assert any(stage in name for name in names.values()), names
         if steps > 1:
@@ -255,6 +297,7 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
             pdl_enabled(False)
             expected = forward().clone()
             expected_conv, expected_state = conv.clone(), state.clone()
+            projection.fill_(float("nan"))
             pdl_enabled(not enabled)
             graph.replay()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -262,24 +305,157 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
             torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("width", [2, 4])
+def test_tree_conv_waits_for_initial_windows(width, restore_pdl):
+    # Under ReplaySSM the seed copy writes the initial windows right before the first layer's tree conv.
+    torch.manual_seed(width)
+    bs, dim, t = 4, 1024, 6
+    x = torch.randn(bs, t, dim, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    weight = torch.randn(dim, width, device="cuda", dtype=x.dtype)
+    conv = torch.zeros(1 + bs * (t + 1), dim, width - 1, device="cuda", dtype=x.dtype)
+    windows = torch.empty(bs, dim, width - 1, device="cuda", dtype=x.dtype)
+    base = torch.arange(1, bs + 1, device="cuda", dtype=torch.int32)
+    out_rows = torch.arange(
+        bs + 1, conv.shape[0], device="cuda", dtype=torch.int32
+    ).view(bs, t)
+    parents = torch.tensor(
+        [[-1, 0, 0, 1, -1, 4]] * bs, device="cuda", dtype=torch.int32
+    )
+
+    def forward():
+        _delayed_projection[(triton.cdiv(windows.numel(), 1024),)](
+            windows, conv[1 : bs + 1], N=windows.numel(), BLOCK=1024, launch_pdl=True
+        )
+        return causal_conv1d_update(
+            x,
+            conv,
+            weight,
+            bias=None,
+            activation="silu",
+            conv_state_indices=base,
+            output_state_indices=out_rows,
+            parent_indices=parents,
+        )
+
+    pdl_enabled(True)
+    forward()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        actual = forward()
+    _, edges = _graph_kernel_edges(graph)
+    assert [kind for _, target, kind in edges if "causal_conv1d" in target] == [1]
+    for _ in range(4):
+        windows.normal_()
+        conv.zero_()
+        pdl_enabled(False)
+        expected = forward().clone()
+        expected_conv = conv.clone()
+        conv.zero_()
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("target", ["rows", "mask", "reads", "A_log", "dt_bias"])
+@pytest.mark.parametrize("nodes", [7, 14])
+def test_gdn_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl):
+    # A ReplaySSM tree verify, step by step at 7 nodes and chunked at 14, reads nothing the kernel before it writes until its PDL wait.
+    torch.manual_seed(nodes)
+    bs, heads, value_heads, dim = 2, 4, 12, 128
+    qk_width = heads * dim
+    v_end = 2 * qk_width + value_heads * dim
+    projection = torch.randn(
+        bs * nodes, v_end + 2 * value_heads, device="cuda", dtype=torch.bfloat16
+    )
+    state = torch.randn(bs, value_heads, dim, dim, device="cuda") * 0.02
+    A_log = torch.randn(value_heads, device="cuda")
+    dt_bias = torch.randn(value_heads, device="cuda")
+    reads = torch.arange(bs, device="cuda", dtype=torch.int32)
+    chain = torch.tensor([[(2 << t) - 1 for t in range(nodes)]] * bs, device="cuda")
+    states = None
+    if gdn_tree_verify_needs_node_states(nodes):
+        states = torch.empty(bs, nodes, value_heads, dim, dim, device="cuda")
+    written = {
+        "rows": projection,
+        "mask": chain,
+        "reads": reads,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+    }[target]
+    source = written.clone()
+    poison = {"mask": 0, "reads": -1}.get(target, float("nan"))
+
+    def forward():
+        _delayed_projection[(triton.cdiv(source.numel(), 1024),)](
+            source, written, N=source.numel(), BLOCK=1024, launch_pdl=True
+        )
+        rows = projection.view(bs, nodes, -1)
+        return gdn_decode_mtp(
+            q=rows[..., :qk_width].unflatten(-1, (heads, dim)),
+            k=rows[..., qk_width : 2 * qk_width].unflatten(-1, (heads, dim)),
+            v=rows[..., 2 * qk_width : v_end].unflatten(-1, (value_heads, dim)),
+            a=rows[..., v_end : v_end + value_heads],
+            b=rows[..., v_end + value_heads :],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=state,
+            initial_state_indices=reads,
+            scale=dim**-0.5,
+            use_qk_l2norm=True,
+            disable_state_update=True,
+            intermediate_states_buffer=states,
+            output_state_indices=None,
+            tree_ancestors=chain,
+            solution="triton",
+            override=None,
+        )
+
+    pdl_enabled(True)
+    forward()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        actual = forward()
+    _, edges = _graph_kernel_edges(graph)
+    verify = "_gdn_tree_verify_chunked_kernel"
+    if states is not None:
+        verify = "_fused_gdn_decode_update_kernel"
+    assert edges == [("_delayed_projection", verify, 1)]
+    for _ in range(2):
+        if target == "rows":
+            source.normal_()
+        pdl_enabled(False)
+        expected = forward().clone()
+        written.fill_(poison)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
-def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
+@pytest.mark.parametrize("heads,value_heads", [(4, 8), (16, 32), (16, 64)])
+def test_gdn_prefill_pdl_toggle(
+    solution, heads, value_heads, restore_pdl, forbid_cake_backend
+):
     if solution == "flashinfer" and not flashinfer_gdn.is_supported(
-        128, torch.bfloat16, 4, 8
+        128, torch.bfloat16, heads, value_heads
     ):
         pytest.skip("FlashInfer SM100 prefill unavailable")
     torch.manual_seed(41)
     q, k = [
-        torch.randn(1, 130, 4, 128, device="cuda", dtype=torch.bfloat16)
+        torch.randn(1, 130, heads, 128, device="cuda", dtype=torch.bfloat16)
         for _ in range(2)
     ]
-    v = torch.randn(1, 130, 8, 128, device="cuda", dtype=q.dtype)
-    gate = -torch.rand(1, 130, 8, device="cuda")
-    beta = torch.rand(1, 130, 8, device="cuda", dtype=q.dtype)
-    state = torch.randn(2, 8, 128, 128, device="cuda")
+    v = torch.randn(1, 130, value_heads, 128, device="cuda", dtype=q.dtype)
+    gate = -torch.rand(1, 130, value_heads, device="cuda")
+    beta = torch.rand(1, 130, value_heads, device="cuda", dtype=q.dtype)
+    state = torch.randn(2, value_heads, 128, 128, device="cuda")
     cu = torch.tensor([0, 65, 130], device="cuda", dtype=torch.int32)
 
+    query_source = q.clone()
+
     def forward():
+        _delayed_projection[(triton.cdiv(q.numel(), 1024),)](
+            query_source, q, N=q.numel(), BLOCK=1024, launch_pdl=True
+        )
         return gdn_chunk_prefill(
             q,
             k,
@@ -310,6 +486,12 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
         with torch.cuda.graph(graph):
             result = forward()
         names, edges = _graph_kernel_edges(graph)
+        if solution == "flashinfer":
+            gdn_nodes = {name for name in names.values() if "gdn" in name.lower()}
+            assert gdn_nodes, names
+            gdn_edges = [edge for edge in edges if edge[1] in gdn_nodes]
+            assert gdn_edges, edges
+            assert all(edge_type == int(enabled) for _, _, edge_type in gdn_edges)
         custom = (
             "l2norm",
             "chunk_",
@@ -325,7 +507,7 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
                 assert edge_type == int(enabled), (target, edges)
                 checked += 1
         assert checked >= 2, names
-        q.normal_()
+        query_source.normal_()
         k.normal_()
         v.normal_()
         pdl_enabled(False)
@@ -335,6 +517,51 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
         torch.testing.assert_close(
             result.final_state, reference.final_state, rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("weights_independent", [False, True])
+@pytest.mark.parametrize("weight_stride", [1, 2])
+@pytest.mark.parametrize("sigmoid_gate", [False, True])
+def test_gdn_norm_weight_readiness(
+    weights_independent, weight_stride, sigmoid_gate, restore_pdl
+):
+    torch.manual_seed(47)
+    dim = 128
+    source = torch.randn(3, dim * weight_stride, device="cuda", dtype=torch.bfloat16)
+    projection = torch.empty_like(source)
+    weights = (source if weights_independent else projection)[2, ::weight_stride]
+
+    def forward():
+        _delayed_projection[(1,)](
+            source,
+            projection,
+            N=source.numel(),
+            BLOCK=triton.next_power_of_2(source.numel()),
+            launch_pdl=True,
+        )
+        return rmsnorm_fn(
+            projection[0:1, :dim],
+            weights,
+            z=projection[1:2, :dim],
+            eps=1e-6,
+            group_size=None,
+            norm_before_gate=True,
+            sigmoid_gate=sigmoid_gate,
+            weights_independent=weights_independent,
+        )
+
+    pdl_enabled(True)
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = forward()
+    for _ in range(3):
+        source.normal_()
+        pdl_enabled(False)
+        expected = forward().clone()
+        projection.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,
@@ -98,7 +98,7 @@ def test_the_block_lands_at_this_rank_s_columns(tp: int, rank: int, m: int) -> N
     shard = LATENT // tp
     start = rank * shard
     written = published[0, :m, start : start + shard]
-    torch.testing.assert_close(written.float(), reference, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(written.float(), reference, rtol=1e-2, atol=2e-2)
 
     untouched = published.clone()
     untouched[0, :m, start : start + shard] = MARK
@@ -162,7 +162,7 @@ def test_the_gather_re_arms_the_rows_it_consumed(m: int) -> None:
     torch.cuda.synchronize(device)
 
     torch.testing.assert_close(
-        out[:, :SHARD].float(), hidden.float() @ weight.float().T, rtol=2e-2, atol=2e-2
+        out[:, :SHARD].float(), hidden.float() @ weight.float().T, rtol=1e-2, atol=2e-2
     )
     consumed = mailbox[0, :m].reshape(-1).view(torch.int32)
     assert torch.equal(consumed, torch.full_like(consumed, DOWN_EMPTY))
@@ -244,7 +244,7 @@ def test_the_widths_this_file_parametrizes_still_select_three_stores() -> None:
 # a gather that does NOT finish, which needs its own process to bound.
 _WAITER = """
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,
@@ -337,7 +337,7 @@ def test_the_gather_waits_for_every_word_of_a_fragment(word: int) -> None:
 # not a failure a pytest process can report, so this runs in a bounded child.
 _CROSS = """
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,

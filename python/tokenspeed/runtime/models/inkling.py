@@ -86,7 +86,6 @@ from tokenspeed_kernel.ops.attention.rmha.triton import (
 )
 from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -362,11 +361,13 @@ def _sconv_apply(
 
     ``weight`` is ``[dim, W]``; ``channel_offset``/``dim`` select the state
     channels in the layer's conv pool buffer. Fusing adjacent streams (K+V)
-    is just a wider ``dim`` with concatenated weights. The paged bridges are
-    mandatory and fused: extend chunks tap the checkpoint at their aligned
+    is just a wider ``dim`` with concatenated weights. The checkpoint bridges
+    are mandatory and fused: extend chunks tap the input checkpoint at their
     start (the prefill kernel never reads the ring), decode rounds tap the
-    ring (the decode kernel never reads the checkpoint blocks), and both publish
-    every covered boundary in-kernel.
+    ring (the decode kernel never reads the checkpoint blocks), and the
+    chunk-end window is published to the live slot in-kernel whenever the
+    chunk ends at the committed frontier -- a target verify publishes its
+    accepted window after acceptance instead.
     """
     backend = ctx.attn_backend
     # Same routing as the dense metadata: prefill-family forwards read the
@@ -406,7 +407,7 @@ def _sconv_apply(
             md,
             checkpoint_group,
         )
-    y = inkling_ring_sconv(
+    return inkling_ring_sconv(
         x,
         weight,
         state,
@@ -419,18 +420,10 @@ def _sconv_apply(
         checkpoint_buffers[0],
         checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
         num_extends=md.num_extends,
-        page_size=backend.conv_columns["block_tokens"],
+        publish_live=(
+            md.num_extends > 0 or backend.conv_spec_num_tokens == 1 or backend.is_draft
+        ),
     )
-    if md.num_extends > 0 and backend.conv_columns.get("pd_endpoint_snapshots", False):
-        # The fused kernel already publishes aligned boundaries. CachePD also
-        # needs the exact prompt endpoint, which may lie inside the last page.
-        backend.publish_shortconv_endpoint(
-            state,
-            checkpoint_buffers,
-            md,
-            checkpoint_group,
-        )
-    return y
 
 
 class InklingRelLogitsProj(nn.Module):
@@ -562,6 +555,8 @@ class InklingAttention(nn.Module):
                 if is_local
                 else -1
             ),
+            rotary_emb=None,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
         self.q_size = self.head_dim * self.num_tp_heads
@@ -620,20 +615,13 @@ class InklingAttention(nn.Module):
                 )
             k = kv[:, : self.kv_size]
             v = kv[:, self.kv_size :]
+            # Norm and KV store hide under the rel_logits branch; only attention waits for the join.
+            prepared = self.attn.prologue(q, k, v, None, ctx)
 
-            # Fused q/k RMSNorm returns contiguous q/k; v stays a strided view (KV scatter/FA4 allow it).
-            q, k = qk_rmsnorm(
-                q,
-                k,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.q_norm.variance_epsilon,
-            )
-
-        attn_output = self.attn(
-            q,
-            k,
-            v,
+        attn_output = self.attn.attend(
+            prepared.q,
+            prepared.k,
+            prepared.v,
             ctx,
             rel_logits=rel_logits,
             log_scaling_tau=None if self.is_local else log_scaling_tau,
@@ -706,7 +694,7 @@ class InklingGate(nn.Module):
     thus compete for probability mass without entering top-k (a "sink").
 
     Selection and weighting run in one fused Triton kernel
-    (``tokenspeed_kernel.ops.moe.triton.inkling_topk``, reached through
+    (``tokenspeed_kernel.ops.moe._triton.inkling_topk``, reached through
     ``TopK`` / ``select_experts``), which implements the reference's
     deterministic lowest-index tie-breaking and computes the sink
     normalization in linear space (identical to the reference's
@@ -925,7 +913,12 @@ class InklingSparseMoeBlock(nn.Module):
             )
             assert not self.experts.support_routing
         self.comm_manager = CommManager(
-            mapping=mapping, layer_id=layer_id, is_moe=True, prev_is_moe=True
+            mapping=mapping,
+            layer_id=layer_id,
+            is_moe=True,
+            prev_is_moe=True,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         # sconv shifts along the token dim, so this block must return full token rows (no reduce-scatter).
         assert self.comm_manager.use_all_reduce(is_moe=True), (
@@ -1602,6 +1595,7 @@ class InklingForConditionalGeneration(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_input_embeddings(self):
@@ -2087,9 +2081,8 @@ class InklingForConditionalGeneration(nn.Module):
 
         if dropped:
             logger.warning(
-                "Inkling load_weights dropped %d checkpoint tensors (first: %s)",
-                len(dropped),
-                dropped[:8],
+                f"Inkling load_weights dropped {len(dropped):d} checkpoint tensors "
+                f"(first: {dropped[:8]!s})",
             )
         if not loaded:
             raise RuntimeError("Inkling load_weights consumed no checkpoint tensors")

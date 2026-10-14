@@ -19,7 +19,7 @@ DECODE_DIST_INIT_ADDR=${DECODE_DIST_INIT_ADDR:-127.0.0.1:13580}
 LB_HOST=${LB_HOST:-0.0.0.0}
 LB_PORT=${LB_PORT:-18345}
 PROMETHEUS_PORT=${PROMETHEUS_PORT:-18422}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 WORLD_SIZE=${WORLD_SIZE:-2}
@@ -86,6 +86,7 @@ echo "[pd-1p1d] prefill=${PREFILL_GPUS}/${PREFILL_PORT}/${PREFILL_BOOTSTRAP_PORT
 echo "[pd-1p1d] world_size=$WORLD_SIZE enable_mtp=$ENABLE_MTP moe_backend=$MOE_BACKEND attention_backend=$ATTENTION_BACKEND"
 
 pids=()
+logs=()
 cleanup() {
   local code=$?
   trap - EXIT INT TERM
@@ -141,7 +142,6 @@ COMMON_ARGS=(
   --served-model-name "$SERVED_MODEL_NAME"
   --host 127.0.0.1
   --world-size "$WORLD_SIZE"
-  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --trust-remote-code
   --moe-backend "$MOE_BACKEND"
   --attention-backend "$ATTENTION_BACKEND"
@@ -155,6 +155,9 @@ COMMON_ARGS=(
   --disaggregation-transfer-backend mooncake
   --disaggregation-layerwise-interval 0
 )
+if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
+  COMMON_ARGS+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+fi
 
 if [[ "$ENABLE_MTP" == "1" ]]; then
   COMMON_ARGS+=(
@@ -188,6 +191,7 @@ start_worker() {
       --disaggregation-mode "$role"
   ) >"$log" 2>&1 &
   pids+=("$!")
+  logs+=("$log")
 }
 
 # Each engine reserves a small control-plane port cluster around its
@@ -222,8 +226,13 @@ python3 -m smg launch \
   --prometheus-port "$PROMETHEUS_PORT" \
   >"$LOG_DIR/lb.log" 2>&1 &
 pids+=("$!")
+logs+=("$LOG_DIR/lb.log")
 
 wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" 600
 echo "[pd-1p1d] serving on http://127.0.0.1:${LB_PORT}/v1"
 
-wait -n "${pids[@]}"
+# A worker's failure status must not end the script (set -e) before the
+# report names it; the cleanup trap then exits with that status.
+wait -n "${pids[@]}" || status=$?
+report_exited_workers "pd-1p1d" logs pids
+exit "${status:-0}"

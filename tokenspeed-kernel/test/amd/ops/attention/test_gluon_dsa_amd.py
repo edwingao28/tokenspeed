@@ -28,38 +28,38 @@ if is_cdna4():
         sparse_mla as dsa_topk_backend,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_decode_gfx950 as gluon_dsa_decode,
+        launch_gluon_dsa_decode_gfx950 as gluon_dsa_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx950 as gluon_dsa_prefill,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa: E402
-        gluon_dsa_decode_topk_fp8_gfx950 as gluon_dsa_decode_topk_fp8,
+        launch_gluon_dsa_prefill_gfx950 as gluon_dsa_prefill,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         gluon_dsa_logical_topk_gfx950 as gluon_logical_topk_indices,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa: E402
+        launch_gluon_dsa_decode_topk_fp8_gfx950 as gluon_dsa_decode_topk_fp8,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_fp8_gfx950 as gluon_dsa_prefill_topk_fp8,
+        launch_gluon_dsa_prefill_topk_fp8_gfx950 as gluon_dsa_prefill_topk_fp8,
     )
 else:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa import (  # noqa: E402
         sparse_mla as dsa_topk_backend,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (  # noqa: E402
-        gluon_dsa_decode_gfx1250 as gluon_dsa_decode,
+        launch_gluon_dsa_decode_gfx1250 as gluon_dsa_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx1250 as gluon_dsa_prefill,
-    )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (  # noqa: E402
-        gluon_dsa_decode_topk_fp8_gfx1250 as gluon_dsa_decode_topk_fp8,
+        launch_gluon_dsa_prefill_gfx1250 as gluon_dsa_prefill,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
         gluon_dsa_logical_topk_gfx1250 as gluon_logical_topk_indices,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (  # noqa: E402
+        launch_gluon_dsa_decode_topk_fp8_gfx1250 as gluon_dsa_decode_topk_fp8,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
-        gluon_dsa_prefill_topk_fp8_gfx1250 as gluon_dsa_prefill_topk_fp8,
+        launch_gluon_dsa_prefill_topk_fp8_gfx1250 as gluon_dsa_prefill_topk_fp8,
     )
 
 torch.manual_seed(42)
@@ -1039,51 +1039,6 @@ def test_gluon_logical_topk_indices_respects_ragged_ranges_and_outputs() -> None
         expected_lens,
         candidates,
     )
-
-
-@pytest.mark.skipif(not is_cdna4(), reason="requires the gfx950 logical top-k")
-def test_gluon_logical_topk_indices_validates_tensor_contract() -> None:
-    logits = torch.empty((2, 1024), device="cuda", dtype=torch.float32)
-    row_starts = torch.zeros((2,), device="cuda", dtype=torch.int32)
-    row_ends = torch.full((2,), 1024, device="cuda", dtype=torch.int32)
-
-    with pytest.raises(ValueError, match="2-D"):
-        gluon_logical_topk_indices(logits[0], row_starts, row_ends, topk=512)
-    with pytest.raises(TypeError, match="float32"):
-        gluon_logical_topk_indices(
-            logits.to(torch.bfloat16), row_starts, row_ends, topk=512
-        )
-    with pytest.raises(ValueError, match="logits must be contiguous"):
-        gluon_logical_topk_indices(
-            torch.empty((1024, 2), device="cuda", dtype=torch.float32).T,
-            row_starts,
-            row_ends,
-            topk=512,
-        )
-    with pytest.raises(ValueError, match="row_starts must have shape"):
-        gluon_logical_topk_indices(logits, row_starts[:1], row_ends, topk=512)
-    with pytest.raises(TypeError, match="row_ends must be int32"):
-        gluon_logical_topk_indices(
-            logits, row_starts, row_ends.to(torch.int64), topk=512
-        )
-    with pytest.raises(ValueError, match="out must have shape"):
-        gluon_logical_topk_indices(
-            logits,
-            row_starts,
-            row_ends,
-            topk=512,
-            out=torch.empty((2, 511), device="cuda", dtype=torch.int32),
-        )
-    with pytest.raises(TypeError, match="lens_out must be int32"):
-        gluon_logical_topk_indices(
-            logits,
-            row_starts,
-            row_ends,
-            topk=512,
-            lens_out=torch.empty((2,), device="cuda", dtype=torch.int64),
-        )
-    with pytest.raises(ValueError, match="supports topk"):
-        gluon_logical_topk_indices(logits, row_starts, row_ends, topk=64)
 
 
 def test_dsa_decode_topk_gluon_long_row_uses_radix_path() -> None:

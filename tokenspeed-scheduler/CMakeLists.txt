@@ -43,7 +43,10 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/fsm/pd_events.cpp
 
     csrc/scheduler/operations/forward.cpp
+    csrc/scheduler/operations/group_demands.cpp
+    csrc/scheduler/operations/prefill_chunk.cpp
 
+    csrc/scheduler/capacity_model.cpp
     csrc/scheduler/kv_cache_events.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/types.cpp
@@ -107,21 +110,27 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_prefix_index.cpp
+        tests/cpp/test_tail_table.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_group.cpp
         tests/cpp/test_swa_group.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
+        tests/cpp/test_state_checkpoints.cpp
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp
+        tests/cpp/test_prefill_chunk.cpp
+        tests/cpp/test_group_demands.cpp
         tests/cpp/test_forward_batch.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp
         tests/cpp/test_cache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
+        tests/cpp/test_token_level_hits.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_cache_operations.cpp
         tests/cpp/test_req_pool_allocator.cpp
+        tests/cpp/test_capacity_model.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests

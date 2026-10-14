@@ -1,4 +1,6 @@
+import json
 import re
+import runpy
 import subprocess
 import textwrap
 from contextlib import nullcontext
@@ -25,6 +27,7 @@ from pipeline import (
     get_excluded_runner_labels,
     get_jit_cache_env,
     get_runner_specific_env,
+    get_stage_command_env,
     get_stage_commands,
     is_amd_runner,
     is_cpu_only_runner,
@@ -165,6 +168,15 @@ def test_amd_gpu_runner_reclaims_stale_vram(capsys, tmp_path):
     )
 
     assert "cleanup_amd_gpu_state.sh" in capsys.readouterr().out
+
+
+def test_ci_setup_only_refreshes_apt_when_ninja_is_missing(capsys, tmp_path):
+    setup_runner("amd-mi35x-4gpu-test", {}, tmp_path, dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "if ! command -v ninja >/dev/null 2>&1; then" in output
+    assert output.count("sudo apt-get -o Acquire::Retries=5 update -q") == 1
+    assert "&& sudo apt-get install -y ninja-build; fi" in output
 
 
 @pytest.mark.parametrize(
@@ -587,6 +599,27 @@ def test_skipping_top_level_install_keeps_eval_install():
     assert [name for name, _ in stages] == ["server", "eval.install", "eval"]
 
 
+@pytest.mark.parametrize("stage_name", ["eval.install", "perf.install"])
+def test_eval_and_perf_install_use_dedicated_persistent_uv_cache(stage_name):
+    env = {
+        "UV_CACHE_DIR": "/work/.uv-cache",
+        "EVALSCOPE_UV_CACHE_DIR": "/cache/uv/evalscope",
+    }
+
+    install_env = get_stage_command_env(stage_name, env)
+
+    assert install_env is not env
+    assert install_env["UV_CACHE_DIR"] == "/cache/uv/evalscope"
+    assert get_stage_command_env("eval", env) is env
+    assert env["UV_CACHE_DIR"] == "/work/.uv-cache"
+
+
+def test_eval_install_keeps_job_uv_cache_without_persistent_cache():
+    env = {"UV_CACHE_DIR": "/work/.uv-cache"}
+
+    assert get_stage_command_env("eval.install", env) is env
+
+
 def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
     task = {
         "name": "slurm-unit-test",
@@ -680,6 +713,73 @@ def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
     assert captured["env"]["CI_RUNNER_LABEL"] == "gb300-1gpu"
     assert captured["env"]["SM"] == "sm103"
     assert captured["env"]["LOGICAL_RUNNER_ENV"] == "preserved"
+
+
+@pytest.mark.parametrize(
+    ("task_type", "inherited", "task_env", "expected"),
+    [
+        ("eval", None, {}, "error"),
+        ("perf", None, {}, "error"),
+        ("server_smoke", None, {}, "error"),
+        ("eval", None, {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("eval", "off", {}, "error"),
+        ("perf", "off", {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("ut", None, {}, None),
+        ("ut", "warn", {}, "warn"),
+    ],
+)
+def test_b200v2_tasks_set_cache_and_jit_check_defaults(
+    monkeypatch, tmp_path, task_type, inherited, task_env, expected
+):
+    cache_env = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
+    monkeypatch.delenv(cache_env, raising=False)
+    monkeypatch.delenv("CI_CACHE_ROOT", raising=False)
+    monkeypatch.delenv("RUNNER_NAME", raising=False)
+    cache_root = tmp_path / "persistent cache"
+    monkeypatch.setenv("FLASHINFER_CACHE_DIR", str(cache_root / "flashinfer"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "ephemeral-home" / ".cache"))
+    if inherited is None:
+        monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", inherited)
+    task = {
+        "name": "jit-check",
+        "type": task_type,
+        "runner": {"labels": ["b200v2-1gpu"]},
+        "env": task_env,
+        "ut": {"commands": ["run test"]},
+    }
+    captured = {}
+
+    class FakeProcessGroupManager:
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            return None
+
+    def capture_setup(runner, env, cwd, dry_run, reuse_state, setup_mode):
+        captured.update(env=env.copy())
+        return env, FakeProcessGroupManager()
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "setup_runner", capture_setup)
+    monkeypatch.setattr(pipeline, "get_stage_commands", lambda task: [])
+
+    pipeline.execute_task(
+        config="task.yaml",
+        runner="b200v2-1gpu",
+        runner_override=None,
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=None,
+        setup_mode="ci",
+    )
+    assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
+    assert captured["env"][cache_env] == str(
+        cache_root / "tokenspeed" / "flashinfer-autotune"
+    )
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
@@ -794,25 +894,73 @@ attn_tp4_moe_tp4,16,30.0,24000.0,82.5,3.1
 """
 
 
-def test_extract_perf_summary_rows_parses_csv_block():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_extract_perf_summary_rows_parses_csv_block(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     assert rows is not None
     assert len(rows) == 5
     assert rows[0]["Conc."] == "1"
     assert rows[-1]["Latency (tps/user)"] == "30.0"
-    assert rows[-1]["Throughput (tps/gpu)"] == "24000.0"
+    assert rows[-1][throughput_metric] == "24000.0"
 
 
 def test_extract_perf_summary_rows_returns_none_when_missing():
     assert extract_perf_summary_rows("nothing relevant here") is None
 
 
+@pytest.mark.parametrize(
+    "invalid_values",
+    [{}, {"Output Throughput (tok/s)": "nan"}, {"Failed Requests": 1}],
+)
+def test_qwen_output_throughput_is_reported_per_minute_per_gpu(
+    tmp_path, invalid_values
+):
+    run_dir = tmp_path / "attn_tp4_moe_ep4" / "parallel_1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "benchmark_summary.json").write_text(
+        json.dumps(
+            {
+                "Concurrency": 1,
+                "TPOT (ms)": 10.0,
+                "Total Throughput (tok/s)": 4000.0,
+                "Output Throughput (tok/s)": 120.0,
+                "KV Cache Hit Rate (%)": 0.0,
+                "Failed Requests": 0,
+                **invalid_values,
+            }
+        ),
+        encoding="utf-8",
+    )
+    collector = runpy.run_path(
+        str(
+            Path(__file__).resolve().parents[1]
+            / "agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/collect_outputs.py"
+        )
+    )
+
+    if invalid_values:
+        with pytest.raises(ValueError):
+            collector["collect"](tmp_path, expected_concurrencies=[1])
+        return
+
+    rows = collector["collect"](tmp_path, expected_concurrencies=[1])
+
+    assert rows[0]["Output Throughput (tok/min/gpu)"] == 1800.0
+
+
 def _command_results_with(rows):
     return [{"perf_summary_rows": rows}]
 
 
-def test_check_perf_reference_passes_when_actual_meets_floor():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_check_perf_reference_passes_when_actual_meets_floor(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     task = {
         "perf_threshold": 0.9,
         "perf_reference": {16: [33.0, 26000.0]},
@@ -821,18 +969,28 @@ def test_check_perf_reference_passes_when_actual_meets_floor():
     assert result is not None
     assert result["passed"] is True
     assert result["failures"] == []
+    assert result["checks"][0][throughput_metric]["actual"] == 24000.0
+    for formatter in (
+        format_perf_reference_table,
+        format_perf_reference_markdown_table,
+    ):
+        assert "24000.00" in "\n".join(formatter(result["checks"]))
 
 
-def test_check_perf_reference_fails_when_metric_below_floor():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_check_perf_reference_fails_when_metric_below_floor(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     task = {
         "perf_threshold": 0.9,
-        "perf_reference": {16: [40.0, 26000.0]},
+        "perf_reference": {16: [33.0, 30000.0]},
     }
     result = check_perf_reference(task, _command_results_with(rows), ["perf"])
     assert result is not None
     assert result["passed"] is False
-    assert any("Latency (tps/user)" in f for f in result["failures"])
+    assert any(throughput_metric in failure for failure in result["failures"])
 
 
 def test_check_perf_reference_reports_missing_row():
@@ -863,7 +1021,7 @@ def test_check_perf_reference_raises_when_no_rows_found():
 def test_check_perf_reference_raises_on_malformed_pair():
     rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
     task = {"perf_reference": {16: [40.0]}}
-    with pytest.raises(ValueError, match=r"\[tps_user, tps_gpu\]"):
+    with pytest.raises(ValueError, match=r"\[tps_user, throughput_per_gpu\]"):
         check_perf_reference(task, _command_results_with(rows), ["perf"])
 
 
@@ -1043,6 +1201,76 @@ def _default_body(name: str, labels: list[str], extra: str = "") -> str:
     if extra:
         body += extra
     return body
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        (None, ["a", "a", "b"]),
+        ("", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n", ["a", "a"]),
+        ("test/ci/old.yaml\ntest/ci/a.yaml\n", ["a", "a"]),
+        ("test/ci/deleted.yaml\n", []),
+        ("test/ci/a.yaml\npython/model.py\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n.github/workflows/a.yaml\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n test/ci/b.yaml\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\ntest/ci/b.yaml \n", ["a", "a", "b"]),
+        ("\n".join(f"test/ci/{i}.yaml" for i in range(300)), ["a", "a", "b"]),
+    ],
+)
+def test_scan_filters_task_yaml_only_changes(
+    changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    for name, labels in [("a", ["b200-4gpu", "gb200-4gpu"]), ("b", ["b200-4gpu"])]:
+        _write_task_yaml(root, f"{name}.yaml", _default_body(name, labels))
+    argv = ["scan", "--repo-root", str(tmp_path)]
+    if changed is not None:
+        changed_file = tmp_path / "changed.txt"
+        changed_file.write_text(changed)
+        argv += ["--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        ("tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n", ["bench"]),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "test/ci/ut.yaml\n",
+            ["bench", "ut"],
+        ),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/harness.py\n",
+            ["bench", "ut"],
+        ),
+    ],
+)
+def test_scan_runs_only_kernel_benchmarks_for_suite_only_changes(
+    changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    _write_task_yaml(root, "ut.yaml", _default_body("ut", ["amd-mi350-1gpu"]))
+    bench = _default_body("bench", ["amd-mi350-1gpu-bench"])
+    bench = bench.replace("type: ut", "type: perf").replace(
+        "workflow_stage: unit-test", "workflow_stage: kernel-benchmark"
+    )
+    _write_task_yaml(root, "bench.yaml", bench + "perf:\n  command: true\n")
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text(changed)
+    argv = ["scan", "--repo-root", str(tmp_path), "--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
 
 
 def test_validate_task_accepts_known_priorities(tmp_path):
@@ -1234,6 +1462,22 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     ]
     assert all(e["priority"] == "normal" for e in matrix["include"])
     assert all(e["optional"] is False for e in matrix["include"])
+
+
+def test_build_matrix_post_submit_also_selects_per_commit_tasks(tmp_path):
+    _write_task_yaml(tmp_path, "a.yaml", _default_body("pr", ["b200-1gpu"]))
+    _write_task_yaml(
+        tmp_path,
+        "b.yaml",
+        _default_body("push", ["b200-1gpu"]).replace("per-commit", "post-submit"),
+    )
+
+    def names(trigger):
+        matrix = build_matrix(tmp_path, tmp_path, trigger=trigger)
+        return [entry["name"] for entry in matrix["include"]]
+
+    assert names("per-commit") == ["pr"]
+    assert names("post-submit") == ["pr", "push"]
 
 
 def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):

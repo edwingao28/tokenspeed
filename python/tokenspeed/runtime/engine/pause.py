@@ -101,8 +101,13 @@ class PauseState(enum.IntEnum):
 def scheduler_drained(scheduler) -> bool:
     """True when the scheduler holds no requests that need a forward pass.
 
-    Covers every state that still needs a forward pass. Submitted and Retracted
-    requests are both included in waiting_size.
+    Covers every state that still needs a forward pass. Submitted,
+    Prefetching, Retracted and Restoring requests are all included in
+    waiting_size, so a request suspended with a retraction image holds the
+    drain until it is restored and finishes (a weight update therefore never
+    flushes an image of old-weight KV that a later restore would resume under
+    new weights), and one waiting on its L3 prefetch holds it until that
+    prefetch lands and it runs.
     Post-finish writeback states are async teardown and do not block a drain.
     """
     return (
@@ -397,7 +402,7 @@ class PauseHooks:
                 if self._reap_or_keep_buffered_spec(spec)
             ]
             if specs:
-                loop.scheduler.submit_requests(specs)
+                loop._submit_scheduler_requests(specs)
 
     def _reap_or_keep_buffered_spec(self, spec) -> bool:
         """Resolve a buffered spec on resume; return True if it should be admitted.
@@ -444,13 +449,13 @@ class PauseHooks:
             return False
         if admitted_specs and not pause_blocked_before:
             logger.warning(
-                "Pause engaged in the same recv batch as %d generate "
-                "request(s) (rids=%s); their FIFO order relative to the "
+                f"Pause engaged in the same recv batch as {len(admitted_specs):d} "
+                "generate "
+                f"request(s) (rids={[spec.request_id for spec in admitted_specs]!s}); "
+                "their FIFO order relative to the "
                 "pause is not preserved, so a pre-pause request may be "
                 "buffered as post-pause work and run only after resume. "
                 "See TODO(pause-fifo).",
-                len(admitted_specs),
-                [spec.request_id for spec in admitted_specs],
             )
         self._pause.buffer_specs(admitted_specs)
         return True

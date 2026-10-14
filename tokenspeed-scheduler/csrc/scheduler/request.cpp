@@ -22,6 +22,7 @@
 
 #include <stdexcept>
 
+#include "cache/prefix/prefix_hasher.h"
 #include "fsm/forward_events.h"
 
 namespace tokenspeed {
@@ -31,6 +32,7 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
+      max_cached_prefix_tokens_{spec.max_cached_prefix_tokens},
       prefix_granularity_{prefix_granularity},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
@@ -51,21 +53,36 @@ PrefillInfo Request::CurrentPrefillInfo() const {
         state_);
 }
 
-std::int32_t Request::MaterializedStateBoundaryTokens() const {
-    // Feedback contains accepted tokens plus one not-yet-computed token.
-    // Admission subtracts the whole verify width for conservative retention;
-    // that frontier is not an exact recurrent-state endpoint.
-    std::int32_t endpoint = 0;
-    if (Is<fsm::Decoding>()) {
-        endpoint = TokenSize() - 1;
-    } else if (Is<fsm::PrefillDone>()) {
-        const PrefillInfo info = CurrentPrefillInfo();
-        endpoint = info.already_scheduled_len + info.extend_len;
+std::optional<TailPublication> Request::TailPublicationAt(std::int32_t num_computed_tokens,
+                                                          const std::string& prior) const {
+    _assert(num_computed_tokens >= 0 && num_computed_tokens <= TokenSize(),
+            "the computed frontier lies inside the request's tokens");
+    const std::int32_t tail_tokens = num_computed_tokens % prefix_granularity_;
+    if (tail_tokens == 0) {
+        return std::nullopt;
     }
-    if (endpoint > 0 && endpoint % prefix_granularity_ == 0) {
-        return endpoint;
-    }
-    return forwardResources("MaterializedStateBoundaryTokens").cache_progress.materialized_state_boundary_tokens;
+    return TailPublication{
+        .tail_tokens = tail_tokens,
+        .hash = HashPrefixPage(TokenSlice(num_computed_tokens - tail_tokens, tail_tokens), prior),
+    };
+}
+
+std::int32_t Request::NumComputedTokens() const {
+    return std::visit(
+        Overloaded{
+            [](const fsm::Prefilling& state) { return state.window.begin + state.window.size; },
+            [](const fsm::PrefillDone& state) { return state.window.begin + state.window.size; },
+            // Every token but the last is computed; the last is the sampled
+            // token no landed forward consumed.
+            [this](const fsm::Decoding&) { return TokenSize() - 1; },
+            [this](const fsm::Finishing&) { return TokenSize() - 1; },
+            [this](const auto&) -> std::int32_t {
+                throw std::logic_error(
+                    "Request::NumComputedTokens: expected Prefilling, PrefillDone, Decoding or Finishing; got " +
+                    StateName());
+            },
+        },
+        state_);
 }
 
 fsm::ForwardResources& Request::forwardResources(const char* operation) {

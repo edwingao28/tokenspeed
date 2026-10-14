@@ -78,10 +78,6 @@ public:
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         return allocator_.BlockTablePageIds(table);
     }
-    void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
-                             std::vector<BlockTransfer>& load_pairs) {
-        allocator_.AppendHostExtension(pool, table, std::move(host_block_refs), load_pairs);
-    }
 
     // --- retention (token API, policy converted through GroupGeometry) ---
     void ReclaimExpired(BlockPool& pool, BlockTable& table, std::int32_t num_computed_tokens) {
@@ -103,9 +99,9 @@ public:
                            std::int32_t max_blocks) const {
         if (sliding_window_ > 0) {
             return SwaMatcher(geometry_.BlockGranularity(), sliding_window_)
-                .Probe(index_, pool, keys, begin_blocks, max_blocks);
+                .Probe(index_, pool, keys, begin_blocks, max_blocks, /*extra_hits=*/nullptr);
         }
-        return FullAttnMatcher{}.Probe(index_, pool, keys, begin_blocks, max_blocks);
+        return FullAttnMatcher{}.Probe(index_, pool, keys, begin_blocks, max_blocks, /*extra_hits=*/nullptr);
     }
 
     PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
@@ -165,7 +161,7 @@ private:
         if (sliding_window_ == 0) {
             return 0;
         }
-        const CacheGroupSpec spec{.kind = AttnKind::kSlidingWindow,
+        const CacheGroupSpec spec{.attn_kind = AttnKind::kSlidingWindow,
                                   .sliding_window = sliding_window_,
                                   .block_granularity = geometry_.BlockGranularity()};
         return geometry_.ExpiredBlocksAt(spec, num_computed_tokens);

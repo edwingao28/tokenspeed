@@ -26,8 +26,81 @@ from tokenspeed_kernel.platform import current_platform
 
 _is_nvidia = current_platform().is_nvidia
 
-_RADIX_TOPK_MIN_COLS = 65536
+_RADIX_TOPK_MIN_COLS = 32768
 _RADIX_TOPK_BLOCK_N = 4096
+
+
+@triton.jit
+def _mark_forced_initial_local_logits_kernel(
+    logits_ptr,
+    logits_row_stride,
+    causal_lens_ptr,
+    # Candidate width follows the batch; runtime so every batch shape shares
+    # one binary.
+    num_cols,
+    initial_tokens: tl.constexpr,
+    local_tokens: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    causal_len = tl.load(causal_lens_ptr + row).to(tl.int32)
+    initial_end = tl.minimum(causal_len, initial_tokens)
+    local_start = tl.maximum(initial_end, causal_len - local_tokens)
+    forced = (cols < initial_end) | ((cols >= local_start) & (cols < causal_len))
+    tl.store(
+        logits_ptr + row * logits_row_stride + cols,
+        float("inf"),
+        mask=(cols < num_cols) & forced,
+    )
+
+
+def mark_forced_initial_local_logits(
+    logits: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    initial_tokens: int,
+    local_tokens: int,
+) -> None:
+    """Force sequence-start and causal-tail candidates into the top-k.
+
+    LongCat's DSA selection always keeps the first ``initial_tokens`` and the
+    last ``local_tokens`` visible positions; marking their logits +inf makes
+    any top-k over the marked logits include them.
+
+    Args:
+        logits: ``[rows, candidates]`` scores, unit column stride; mutated.
+        causal_lens: ``[rows]`` visible candidate count per row.
+        initial_tokens: Sequence-start candidates to force.
+        local_tokens: Causal-tail candidates to force.
+    """
+    if logits.dim() != 2 or logits.stride(1) != 1:
+        raise ValueError("logits must be a 2-D tensor with unit column stride")
+    if causal_lens.shape != (logits.shape[0],):
+        raise ValueError(
+            f"causal_lens must have shape ({logits.shape[0]},), got "
+            f"{tuple(causal_lens.shape)}"
+        )
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if logits.numel() == 0 or initial_tokens + local_tokens == 0:
+        return
+    causal_lens = causal_lens.to(device=logits.device, dtype=torch.int32).contiguous()
+    block = 256
+    _mark_forced_initial_local_logits_kernel[
+        (logits.shape[0], triton.cdiv(logits.shape[1], block))
+    ](
+        logits,
+        logits.stride(0),
+        causal_lens,
+        num_cols=logits.shape[1],
+        initial_tokens=int(initial_tokens),
+        local_tokens=int(local_tokens),
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
 
 
 @triton.jit
@@ -41,7 +114,9 @@ def _local_topk_to_global_slots_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    block_table_cols: tl.constexpr,
+    # Block-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    block_table_cols,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     has_seq_lens: tl.constexpr,
@@ -354,7 +429,15 @@ def combine_topk_weights(
         raise ValueError("combine_topk_weights expects unit-stride weights rows")
     if q_scale.dtype != torch.float32:
         raise TypeError(f"q_scale must be fp32, got {q_scale.dtype}")
-    q_scale = q_scale.reshape(tokens * heads)
+    # The quantizer may pad the per-row scale vector (an alignment multiple of
+    # its launch width); real rows lead, padding trails. 16-head indexers hit
+    # this on every odd token count.
+    q_scale = q_scale.reshape(-1)
+    if q_scale.numel() < tokens * heads:
+        raise ValueError(
+            f"q_scale has {q_scale.numel()} entries for {tokens * heads} rows"
+        )
+    q_scale = q_scale[: tokens * heads]
     out = torch.empty(tokens, heads, dtype=torch.float32, device=weights.device)
     numel = tokens * heads
     if numel == 0:
@@ -386,6 +469,10 @@ def _dsa_decode_logits_fp8_kernel(
     logits,
     block_table_stride,
     logits_stride,
+    query_requests,
+    EXPLICIT_ROWS: tl.constexpr,
+    INITIAL_TOKENS: tl.constexpr,
+    LOCAL_TOKENS: tl.constexpr,
     page_size: tl.constexpr,
     row_bytes: tl.constexpr,
     page_stride_bytes: tl.constexpr,
@@ -400,56 +487,83 @@ def _dsa_decode_logits_fp8_kernel(
 ):
     token = tl.program_id(0)
     block_id = tl.program_id(1)
-    req = token // q_len_per_req
     offsets = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
-    base = tl.load(seq_lens + req).to(tl.int32)
-    seq_len = base - (q_len_per_req - 1) + (token % q_len_per_req)
+    if EXPLICIT_ROWS:
+        # seq_lens is per token here; indexing it by req would read past the
+        # buffer whenever a request ID exceeds the query-tile length.
+        req = tl.load(query_requests + token)
+        seq_len = tl.load(seq_lens + token)
+    else:
+        req = token // q_len_per_req
+        base = tl.load(seq_lens + req).to(tl.int32)
+        seq_len = base - (q_len_per_req - 1) + (token % q_len_per_req)
     seq_len = tl.maximum(seq_len, 0)
     valid = offsets < seq_len
     block_idx = offsets // page_size
     block_offset = offsets - block_idx * page_size
     valid = valid & (offsets < max_seq_len)
-    page = tl.load(
-        block_table + req * block_table_stride + block_idx,
-        mask=valid,
-        other=0,
-    ).to(tl.int64)
-    fp8_base = page * page_stride_bytes + block_offset * head_dim
-    scale_base = (
-        page * (page_stride_bytes // 4)
-        + (page_size * head_dim) // 4
-        + block_offset * num_groups
-    )
-    scores = tl.zeros((BLOCK_N,), tl.float32)
-
-    dim_offsets = tl.arange(0, BLOCK_D)
-    for head in tl.static_range(0, num_heads):
-        head_weight = tl.load(weights + token * num_heads + head).to(tl.float32)
-        head_score = tl.zeros((BLOCK_N,), tl.float32)
-        for dim_start in tl.static_range(0, head_dim, BLOCK_D):
-            dims = dim_start + dim_offsets
-            q_vals = tl.load(
-                q + (token * num_heads + head) * head_dim + dims,
-                mask=dims < head_dim,
-                other=0.0,
-            ).to(tl.float32)
-            k_vals = tl.load(
-                index_k_fp8 + fp8_base[:, None] + dims[None, :],
-                mask=valid[:, None] & (dims[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            k_scale = tl.load(
-                index_k_scale + scale_base + dim_start // 128,
-                mask=valid,
-                other=0.0,
-            ).to(tl.float32)
-            head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += (
-            tl.maximum(head_score, 0.0, propagate_nan=tl.PropagateNan.ALL) * head_weight
+    if page_size % BLOCK_N == 0:
+        # An aligned tile fits within one page, so its ownership is uniform.
+        start = block_id * BLOCK_N
+        page = tl.load(
+            block_table + req * block_table_stride + start // page_size,
+            mask=(start < seq_len) & (start < max_seq_len),
+            other=-1,
+        ).to(tl.int64)
+        has_valid = page >= 0
+    else:
+        page = tl.load(
+            block_table + req * block_table_stride + block_idx,
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+        has_valid = tl.max((valid & (page >= 0)).to(tl.int32), axis=0) > 0
+    valid = valid & (page >= 0)
+    # Foreign pages and capacity beyond the causal length can leave a whole
+    # tile empty. Skip Q/K scoring, but still overwrite its logits for Top-K.
+    scores = tl.full((BLOCK_N,), -float("inf"), tl.float32)
+    if has_valid:
+        fp8_base = page * page_stride_bytes + block_offset * head_dim
+        scale_base = (
+            page * (page_stride_bytes // 4)
+            + (page_size * head_dim) // 4
+            + block_offset * num_groups
         )
+        scores = tl.zeros((BLOCK_N,), tl.float32)
 
-    scores *= softmax_scale
-    scores = tl.where(valid, scores, -float("inf"))
+        dim_offsets = tl.arange(0, BLOCK_D)
+        for head in tl.static_range(0, num_heads):
+            head_weight = tl.load(weights + token * num_heads + head).to(tl.float32)
+            head_score = tl.zeros((BLOCK_N,), tl.float32)
+            for dim_start in tl.static_range(0, head_dim, BLOCK_D):
+                dims = dim_start + dim_offsets
+                q_vals = tl.load(
+                    q + (token * num_heads + head) * head_dim + dims,
+                    mask=dims < head_dim,
+                    other=0.0,
+                ).to(tl.float32)
+                k_vals = tl.load(
+                    index_k_fp8 + fp8_base[:, None] + dims[None, :],
+                    mask=valid[:, None] & (dims[None, :] < head_dim),
+                    other=0.0,
+                ).to(tl.float32)
+                k_scale = tl.load(
+                    index_k_scale + scale_base + dim_start // 128,
+                    mask=valid,
+                    other=0.0,
+                ).to(tl.float32)
+                head_score += tl.sum(
+                    k_vals * k_scale[:, None] * q_vals[None, :], axis=1
+                )
+            scores += (
+                tl.maximum(head_score, 0.0, propagate_nan=tl.PropagateNan.ALL)
+                * head_weight
+            )
+
+        scores *= softmax_scale
+        forced = (offsets < INITIAL_TOKENS) | (offsets >= seq_len - LOCAL_TOKENS)
+        scores = tl.where(forced, float("inf"), scores)
+        scores = tl.where(valid & (scores == scores), scores, -float("inf"))
     tl.store(
         logits + token * logits_stride + offsets,
         scores,
@@ -496,6 +610,7 @@ def _dsa_prefill_logits_fp8_kernel(
     ).to(tl.int64)
     page = slots // page_size
     block_offset = slots - page * page_size
+    valid = valid & (page >= 0)
     fp8_base = page * page_stride_bytes + block_offset * head_dim
     scale_base = (
         page * (page_stride_bytes // 4)
@@ -933,10 +1048,11 @@ def _topk_with_padding(
     if rows == 0 or cols == 0:
         return torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
     logits = logits.contiguous()
-    if cols >= _RADIX_TOPK_MIN_COLS:
+    n_cols_padded = _next_power_of_2(max(cols, topk))
+    # Unrolled sort cost follows the padded width, including speculative KV padding.
+    if n_cols_padded >= _RADIX_TOPK_MIN_COLS:
         return _radix_topk(logits, topk)
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
-    n_cols_padded = _next_power_of_2(max(cols, topk))
     block_n = min(n_cols_padded, 2048)
     block_n = max(block_n, topk)
     if n_cols_padded % block_n != 0:
@@ -1063,6 +1179,10 @@ def dsa_decode_topk_fp8(
         logits,
         block_table.stride(0),
         logits.stride(0),
+        None,
+        EXPLICIT_ROWS=False,
+        INITIAL_TOKENS=0,
+        LOCAL_TOKENS=0,
         page_size=int(page_size),
         row_bytes=row_bytes,
         page_stride_bytes=page_stride_bytes,
@@ -1249,8 +1369,6 @@ def _triton_dsa_prefill_topk_fp8_impl(
     softmax_scale: float,
     index_k_cache: torch.Tensor | None = None,
     page_size: int | None = None,
-    index_k_fp8: torch.Tensor | None = None,
-    index_k_scale: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
@@ -1283,5 +1401,6 @@ __all__ = [
     "dsa_prefill_topk_fp8",
     "triton_topk_from_logits",
     "local_topk_to_global_slots",
+    "mark_forced_initial_local_logits",
     "workspace_topk_to_global_slots",
 ]

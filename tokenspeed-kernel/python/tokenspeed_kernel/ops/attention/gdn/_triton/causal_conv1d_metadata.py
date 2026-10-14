@@ -28,31 +28,116 @@ from tokenspeed_kernel._triton import tl, triton
 CAUSAL_CONV1D_BLOCK_M = 8
 
 
+@triton.jit
+def _refresh_conv_capacity_kernel(
+    boundaries,
+    batches,
+    offsets,
+    # Chunk and sequence counts follow the batch; runtime so every batch shape
+    # shares one binary.
+    CHUNKS,
+    SEQUENCES,
+    BLOCK_M: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    chunk = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    cursor = tl.full((), 0, tl.int32)
+    request = tl.full((BLOCK,), -1, tl.int32)
+    local = tl.full((BLOCK,), 0, tl.int32)
+    for row in range(SEQUENCES):
+        length = tl.load(boundaries + row + 1) - tl.load(boundaries + row)
+        count = tl.cdiv(length, BLOCK_M).to(tl.int32)
+        live = (chunk >= cursor) & (chunk < cursor + count)
+        request = tl.where(live, row, request)
+        local = tl.where(live, chunk - cursor, local)
+        cursor += count
+    tl.store(batches + chunk, request, chunk < CHUNKS)
+    tl.store(offsets + chunk, local, chunk < CHUNKS)
+
+
+def refresh_causal_conv1d_capacity_metadata(query_start_loc, metadata, token_capacity):
+    """Refresh fixed-capacity conv maps once for all layers in a forward.
+
+    Args:
+        query_start_loc: Live device packed boundaries [sequences+1].
+        metadata: Writable graph-owned maps with
+            ceil(token_capacity / block_m) + sequences - 1 entries each.
+        token_capacity: Total packed token capacity, not capacity per sequence.
+
+    Returns:
+        None. Inactive programs receive PAD_SLOT_ID (-1), causing the existing
+        convolution kernel to exit before its unmasked history loads.
+    """
+    sequences = query_start_loc.numel() - 1
+    chunks = triton.cdiv(token_capacity, metadata.block_m) + sequences - 1
+    if (
+        metadata.batch_indices.numel() != chunks
+        or metadata.chunk_offsets.numel() != chunks
+    ):
+        raise ValueError("Conv capacity map extent differs from planning capacity")
+    _refresh_conv_capacity_kernel[(triton.cdiv(chunks, 256),)](
+        query_start_loc,
+        metadata.batch_indices,
+        metadata.chunk_offsets,
+        CHUNKS=chunks,
+        SEQUENCES=sequences,
+        BLOCK_M=metadata.block_m,
+        BLOCK=256,
+    )
+
+
 @dataclass(frozen=True)
 class CausalConv1dPrefillMetadata:
-    """Read-only program-to-request and program-to-chunk maps for one forward."""
+    """Program-to-request/chunk maps, read-only while layers consume them.
+
+    Ordinary maps belong to one forward. Capacity maps belong to the graph
+    owner and are refreshed in consumer-stream order before the next replay.
+    Frozen fields prevent rebinding, not mutation of the tensors' contents.
+    """
 
     batch_indices: torch.Tensor
     chunk_offsets: torch.Tensor
     block_m: int
 
 
-@triton.jit
+def build_causal_conv1d_capacity_metadata(
+    query_start_loc: torch.Tensor, token_capacity: int, block_m: int
+) -> CausalConv1dPrefillMetadata:
+    """Allocate and initialize a compact, replay-stable convolution schedule.
+
+    Device boundaries partition at most token_capacity tokens. Each request
+    can contribute one partial block, so ceil(capacity / block_m) + N - 1
+    slots bound the sum of per-request block counts. Unused slots are inert.
+    Returns graph-owned maps refreshed in place before each forward.
+    """
+    sequences = query_start_loc.numel() - 1
+    if token_capacity <= 0 or block_m <= 0 or sequences <= 0:
+        raise ValueError(
+            "Conv capacity requires positive tokens, block size and requests"
+        )
+    count = triton.cdiv(token_capacity, block_m) + sequences - 1
+    indices = torch.empty((2, count), dtype=torch.int32, device=query_start_loc.device)
+    metadata = CausalConv1dPrefillMetadata(indices[0], indices[1], block_m)
+    refresh_causal_conv1d_capacity_metadata(query_start_loc, metadata, token_capacity)
+    return metadata
+
+
+@triton.jit(do_not_specialize_on_alignment=["chunk_offsets"])
 def _build_causal_conv1d_metadata_kernel(
     query_start_loc,
     batch_indices,
     chunk_offsets,
-    num_requests,
     BLOCK_M: tl.constexpr,
     REQUEST_BLOCK: tl.constexpr,
     STORE_BLOCK: tl.constexpr,
 ):
     request = tl.program_id(0)
-    rows = tl.arange(0, REQUEST_BLOCK)
-    starts = tl.load(query_start_loc + rows, mask=rows < num_requests, other=0)
-    ends = tl.load(query_start_loc + rows + 1, mask=rows < num_requests, other=0)
-    chunks = tl.cdiv(ends - starts, BLOCK_M)
-    first_chunk = tl.sum(tl.where(rows < request, chunks, 0))
+    first_chunk = tl.zeros((), query_start_loc.dtype.element_ty)
+    for base in range(0, request, REQUEST_BLOCK):
+        rows = base + tl.arange(0, REQUEST_BLOCK)
+        starts = tl.load(query_start_loc + rows, mask=rows < request, other=0)
+        ends = tl.load(query_start_loc + rows + 1, mask=rows < request, other=0)
+        first_chunk += tl.sum(tl.cdiv(ends - starts, BLOCK_M))
     start = tl.load(query_start_loc + request)
     end = tl.load(query_start_loc + request + 1)
     count = tl.cdiv(end - start, BLOCK_M)
@@ -119,9 +204,8 @@ def build_causal_conv1d_prefill_metadata(
             query_start_loc,
             metadata.batch_indices,
             metadata.chunk_offsets,
-            len(lengths),
             BLOCK_M=block_m,
-            REQUEST_BLOCK=triton.next_power_of_2(len(lengths)),
+            REQUEST_BLOCK=128,
             STORE_BLOCK=256,
         )
     else:

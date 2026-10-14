@@ -20,7 +20,6 @@ Runs on the released config (layer-truncated, experts shrunk; see
 ``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
 """
 
-import math
 import os
 import sys
 import unittest
@@ -213,6 +212,7 @@ class TestInklingReferenceParity(unittest.TestCase):
         from tokenspeed.runtime.entrypoints.engine import Engine
 
         engine = Engine(
+            disable_autotune=True,
             model=INKLING_BF16,
             hf_overrides=truncation_hf_overrides(),
             load_format="dummy",

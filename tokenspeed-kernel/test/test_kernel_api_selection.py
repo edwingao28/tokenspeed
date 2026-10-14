@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Golden selection tests for top-level tokenspeed-kernel public APIs.
+"""Golden selection tests for tokenspeed-kernel operator APIs.
 
-Each case invokes a real public API (``mm``, ``moe_plan``/``moe_apply``,
-attention, sampling) with :class:`SelectedKernel` calls intercepted by a spy,
+Each case invokes a real API or an internal registry facade used by an operator
+API with :class:`SelectedKernel` calls intercepted by a spy,
 and asserts the auto-selected kernel name.  Cases run on every host: the
 platform each case targets is injected via ``Platform.override`` with the
 fixture platforms from ``conftest.py``, so an NVIDIA CI machine also checks
@@ -31,15 +31,16 @@ import-guarded on missing optional backend packages are skipped.
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import inspect
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
@@ -52,6 +53,9 @@ import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
+import tokenspeed_kernel.ops.attention.dsv41 as _attention_dsv41_pkg
+import tokenspeed_kernel.ops.attention.dsv41.gluon as _attention_gluon_dsv41
+import tokenspeed_kernel.ops.attention.dsv41.triton as _attention_triton_dsv41
 import tokenspeed_kernel.ops.attention.gdn as _attention_gdn_pkg
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg
@@ -68,31 +72,26 @@ import tokenspeed_kernel.ops.attention.mla as _attention_mla_pkg
 import tokenspeed_kernel.ops.attention.mla.cuda as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.mla.gluon as _attention_gluon_mla
 import tokenspeed_kernel.ops.attention.mla.triton as _attention_triton_mla
+import tokenspeed_kernel.ops.attention.qsa.gluon as _attention_gluon_qsa
+import tokenspeed_kernel.ops.attention.qsa.triton as _attention_triton_qsa
 import tokenspeed_kernel.ops.attention.rmha as _attention_rmha_pkg
 import tokenspeed_kernel.ops.attention.rmha.cuda as _attention_cuda_rmha
 import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
 import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
-import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
-import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
+import tokenspeed_kernel.ops.moe.deep_ep as _moe_deep_ep
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
-import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
-import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
-import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
-import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
-import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
-import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
+import tokenspeed_kernel.ops.moe.marlin as _moe_marlin
+import tokenspeed_kernel.ops.moe.native as _moe_native
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
-import tokenspeed_kernel.ops.moe.triton.dsv4 as _moe_triton_dsv4
-import tokenspeed_kernel.ops.moe.triton.softmax_topk as _moe_triton_softmax_topk
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
@@ -107,6 +106,9 @@ import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
+import tokenspeed_kernel.ops.transform as _transform_pkg
+import tokenspeed_kernel.ops.transform.gluon as _transform_gluon
+import tokenspeed_kernel.ops.transform.triton as _transform_triton
 import torch
 from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
@@ -114,29 +116,30 @@ from tokenspeed_kernel.ops.attention.gdn import GdnChunkPrefillResult
 from tokenspeed_kernel.ops.attention.gdn import triton as _attention_triton_gdn
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel_mha
-from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8 as _moe_deep_gemm_deepep_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import (
-    cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
+from tokenspeed_kernel.ops.gemm import bmm as kernel_bmm
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32 as kernel_dsv4_linear_fp32
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
+from tokenspeed_kernel.ops.moe import moe_topk as kernel_moe_topk
+from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
+from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.residual import mhc_apply_pre as kernel_mhc_apply_pre
+from tokenspeed_kernel.ops.residual import mhc_mixes as kernel_mhc_mixes
+from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
+from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
+from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
+from tokenspeed_kernel.ops.transform import (
+    hadamard_transform as kernel_hadamard_transform,
 )
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mxint4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
-from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
-from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
-from tokenspeed_kernel.ops.moe.triton import (
-    decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
-)
-from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
 from tokenspeed_kernel.selection import (
     SelectedKernel,
     select_kernel,
+    spec_matches_shape_traits,
     spec_matches_traits,
 )
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -144,8 +147,10 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 _ATTENTION_GLUON_MODULES = [
     _attention_gluon_dsa,
     _attention_gluon_dsv4,
+    _attention_gluon_dsv41,
     _attention_gluon_kda,
     _attention_gluon_mha,
+    _attention_gluon_qsa,
     _attention_gluon_mla,
     _attention_gluon_rmha,
 ]
@@ -170,10 +175,12 @@ _RELOAD_MODULES = [
     *_ATTENTION_GLUON_MODULES,
     _attention_triton_mha,
     _attention_triton_mla,
+    _attention_triton_qsa,
     _attention_triton_kpool,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
     _attention_triton_dsv4,
+    _attention_triton_dsv41,
     _attention_triton_dsa,
     _attention_triton_gdn,
     # Variant packages own public result classes imported by other test modules.
@@ -181,7 +188,6 @@ _RELOAD_MODULES = [
     # GEMM registration modules.
     _gemm_reference,
     _gemm_cuda,
-    _gemm_deep_gemm,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
@@ -197,30 +203,11 @@ _RELOAD_MODULES = [
     _residual_pkg,
     # MoE registration modules.
     _moe_cuda,
-    _moe_deep_gemm_deepep_fp8,
-    _moe_deep_gemm,
-    _moe_cutedsl_deepep_nvfp4,
-    _moe_cutlass_fp8,
-    _moe_cutlass_nvfp4,
-    _moe_cutlass_unquant,
-    _moe_trtllm_fp8,
-    _moe_trtllm_mxfp4,
-    _moe_trtllm_mxint4,
-    _moe_trtllm_nvfp4,
-    _moe_trtllm_unquant,
+    _moe_deep_ep,
     _moe_flashinfer,
-    _moe_gluon_dsv4,
-    _moe_gluon_fp8,
-    _moe_gluon_mxfp4,
-    _moe_sigmoid_topk,
-    _moe_softmax_topk,
-    _moe_gluon_sigmoid_topk,
     _moe_gluon,
-    _moe_triton_bf16,
-    _moe_triton_decode_sigmoid_topk,
-    _moe_triton_dsv4,
-    _moe_triton_mxfp4,
-    _moe_triton_softmax_topk,
+    _moe_marlin,
+    _moe_native,
     _moe_triton,
     _moe_pkg,
     # Quantization registration modules.
@@ -232,8 +219,10 @@ _RELOAD_MODULES = [
     _sampling_cute_dsl,
     _sampling_gluon,
     _sampling_pkg,
-    # Top-level public API re-exports.
-    tokenspeed_kernel,
+    # Transform registration modules.
+    _transform_gluon,
+    _transform_triton,
+    _transform_pkg,
 ]
 
 
@@ -246,9 +235,59 @@ def _kernel_registry(fresh_registry):
 
 def test_attention_api_ownership_and_result_type_identity_are_stable():
     assert _attention_pkg.__all__ == ["attn_merge_state"]
-    assert tokenspeed_kernel.attn_merge_state is _attention_pkg.attn_merge_state
     assert _attention_gdn_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
     assert _attention_kda_pkg.KdaPrefillResult is KdaPrefillResult
+
+
+@pytest.mark.parametrize("platform_fixture", ["h100_platform", "mi350_platform"])
+def test_hadamard_gluon_registration_uses_amd_backend_only(
+    platform_fixture: str,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _transform_gluon.__file__.endswith("/transform/gluon.py")
+    assert _transform_triton.__file__.endswith("/transform/triton.py")
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    host_registry = KernelRegistry.get()
+    imports = []
+    calls = []
+    real_import = builtins.__import__
+
+    def launch(x, *, scale):
+        calls.append((x, scale))
+        return x
+
+    def import_backend(name, *args, **kwargs):
+        if name == "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard":
+            imports.append(name)
+            assert platform.is_amd
+            return SimpleNamespace(launch_gluon_hadamard_transform_128_gfx950=launch)
+        return real_import(name, *args, **kwargs)
+
+    try:
+        Platform.override(platform)
+        KernelRegistry.reset()
+        with monkeypatch.context() as patch:
+            patch.setattr(builtins, "__import__", import_backend)
+            importlib.reload(_transform_gluon)
+            implementation = KernelRegistry.get().get_impl(
+                "gluon_hadamard_transform_128_gfx950"
+            )
+            if platform.is_amd:
+                x = torch.empty((1, 128), dtype=torch.bfloat16, device="meta")
+                assert implementation(x, scale=0.25) is x
+                assert calls == [(x, 0.25)]
+                assert imports == [
+                    "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard"
+                ]
+            else:
+                assert implementation is None
+                assert not imports
+    finally:
+        Platform.override(host_platform)
+        KernelRegistry._instance = host_registry
+        importlib.reload(_transform_gluon)
 
 
 def test_residual_family_exports_and_modes():
@@ -257,17 +296,14 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd_available",
         "gated_residual_combine",
         "gated_residual_mix",
+        "mhc_apply_pre",
         "mhc_fused_hc",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "pad_gated_residual_projection_weight",
     }
     assert set(_residual_pkg.__all__) == expected_exports
-    assert all(
-        getattr(tokenspeed_kernel, name) is getattr(_residual_pkg, name)
-        for name in expected_exports
-    )
-
     residual_modes = {
         mode
         for family, mode in KernelRegistry.get().list_operators()
@@ -277,6 +313,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "mhc_apply_pre",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -303,7 +340,12 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     registry = KernelRegistry.get()
     expected_offsets = {
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
+        # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
+        "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 1,
+        "gluon_petit_mxfp4_megamoe_apply": Priority.SPECIALIZED + 3,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
+        # Prefer packed routing while keeping overlapping Gluon selectable.
+        "triton_kimi3_packed_sigmoid_bias_topk_gfx1250": Priority.SPECIALIZED + 1,
     }
     actual_offsets = {
         spec.name: spec.priority
@@ -339,7 +381,7 @@ def test_dsv4_padded_heads_platform_policy(
 def test_moe_process_weights_returns_for_no_preprocessing_plan():
     module = torch.nn.Module()
 
-    result = tokenspeed_kernel.moe_process_weights(
+    result = kernel_moe_process_weights(
         {"weight_preprocessor": None},
         module,
     )
@@ -356,7 +398,7 @@ def test_moe_process_weights_dispatches_plan_preprocessor_callable():
     module = torch.nn.Module()
     plan = {"weight_preprocessor": preprocess}
 
-    result = tokenspeed_kernel.moe_process_weights(plan, module)
+    result = kernel_moe_process_weights(plan, module)
 
     assert result is None
     assert calls == [(plan, module)]
@@ -386,10 +428,6 @@ def _is_blackwell_sm100(platform: PlatformInfo) -> bool:
 
 def _is_blackwell_sm103(platform: PlatformInfo) -> bool:
     return platform.is_blackwell and platform.arch_version == ArchVersion(10, 3)
-
-
-def _is_blackwell_non_sm100(platform: PlatformInfo) -> bool:
-    return platform.is_blackwell and platform.arch_version != ArchVersion(10, 0)
 
 
 def _is_blackwell_plus(platform: PlatformInfo) -> bool:
@@ -438,50 +476,63 @@ def _fp8_dtype() -> torch.dtype:
 
 def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
-    return tokenspeed_kernel.quantize_mxfp8(x)
+    return kernel_quantize_mxfp8(x)
 
 
-def _fp8_quantize_dequantize() -> torch.Tensor:
+def _quantize_fp8() -> torch.Tensor:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
-    return tokenspeed_kernel.fp8_quantize_dequantize(
+    output, _ = kernel_quantize_fp8(
         x,
+        granularity="token_group",
         group_size=128,
         scale_encoding="ue8m0",
-        override=None,
-        solution=None,
+        dequantize=True,
     )
+    return output
 
 
 def _mm_dense() -> torch.Tensor:
     a = torch.empty((4, 16), dtype=torch.bfloat16)
     b = torch.empty((32, 16), dtype=torch.bfloat16)
-    return tokenspeed_kernel.mm(a, b)
+    return kernel_mm(a, b)
+
+
+def _hadamard_transform(
+    *,
+    contiguous: bool,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if contiguous:
+        x = torch.empty((8_192, 32, 128), dtype=dtype, device="meta")
+    else:
+        x = torch.empty((8_192, 32, 256), dtype=dtype, device="meta")[..., ::2]
+    return kernel_hadamard_transform(x, scale=128**-0.5)
 
 
 def _mm_dense_cdna4_aligned() -> torch.Tensor:
     a = torch.empty((16, 64), dtype=torch.bfloat16)
     b = torch.empty((128, 64), dtype=torch.bfloat16)
-    return tokenspeed_kernel.mm(a, b)
+    return kernel_mm(a, b)
 
 
 def _bmm_dense() -> torch.Tensor:
     a = torch.empty((4, 2, 16), dtype=torch.bfloat16)
     b = torch.empty((4, 32, 16), dtype=torch.bfloat16)
-    return tokenspeed_kernel.bmm(a, b)
+    return kernel_bmm(a, b)
 
 
 def _dsv4_linear_fp32() -> torch.Tensor:
     hidden_states = torch.empty((2, 4096), dtype=torch.bfloat16)
     weight = torch.empty((256, 4096), dtype=torch.bfloat16)
-    return tokenspeed_kernel.dsv4_linear_fp32(hidden_states, weight)
+    return kernel_dsv4_linear_fp32(hidden_states, weight)
 
 
-def _mm_mxfp8() -> torch.Tensor:
-    a = torch.empty((4, 128), dtype=_fp8_dtype())
+def _mm_mxfp8(m: int) -> torch.Tensor:
+    a = torch.empty((m, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
-    a_scales = torch.empty((4, 1), dtype=torch.float32)
+    a_scales = torch.empty((m, 1), dtype=torch.float32)
     b_scales = torch.empty((1, 1), dtype=torch.float32)
-    return tokenspeed_kernel.mm(
+    return kernel_mm(
         a,
         b,
         A_scales=a_scales,
@@ -490,6 +541,41 @@ def _mm_mxfp8() -> torch.Tensor:
         block_size=[128, 128],
         quant="mxfp8",
     )
+
+
+def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
+    """True MXFP8: E4M3 operands with one UE8M0 scale byte per 32 K values."""
+    a = torch.empty((m, k), dtype=_fp8_dtype())
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    a_scales = torch.empty((m, k // 32), dtype=torch.uint8)
+    b_scales = torch.empty((n, k // 32), dtype=torch.uint8)
+    return kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[1, 32],
+        quant="mxfp8",
+    )
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.uint8])
+@pytest.mark.parametrize("batched", [False, True])
+def test_mxfp8_online_scale_signature_matches_weight_encoding(
+    scale_dtype: torch.dtype, batched: bool
+) -> None:
+    batch = (2,) if batched else ()
+    signature = _gemm_pkg._gemm_format_signature(
+        torch.empty((*batch, 4, 128), dtype=torch.bfloat16),
+        torch.empty((*batch, 128, 128), dtype=_fp8_dtype()),
+        None,
+        torch.empty((*batch, 128, 4), dtype=scale_dtype),
+        torch.bfloat16,
+        "mxfp8",
+        [1, 32],
+    )
+    assert signature.format_for("a").scale.storage_dtype == scale_dtype
 
 
 def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
@@ -517,6 +603,106 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
     assert b_format.scale is not None
     assert a_format.scale.block_shape == (128, 128)
     assert b_format.scale.block_shape == (128, 128)
+
+
+@pytest.mark.parametrize(
+    "contract,online,expected_name",
+    [
+        ("ue8m0", False, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", True, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("fp32", False, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", True, "gluon_mm_fp8_blockscale_gfx1250"),
+    ],
+)
+def test_public_mm_selects_gfx1250_decode_kernel(
+    contract: str,
+    online: bool,
+    expected_name: str,
+    mi450_platform: PlatformInfo,
+    monkeypatch,
+    selected_kernel_spy,
+) -> None:
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(expected_name)
+    if expected_spec is None:
+        assert not host_platform.is_cdna5
+        pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
+    assert expected_spec.capability.satisfied_by(mi450_platform)
+
+    m, n, k = 1, 128, 256
+    a_dtype = torch.bfloat16 if online else _fp8_dtype()
+    a = torch.empty((m, k), dtype=a_dtype)
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    if contract == "ue8m0":
+        block_size = [1, 32]
+        scale_dtype = torch.uint8
+        a_scales = torch.empty((m, k // 32), dtype=scale_dtype)
+        b_scales = torch.empty((n, k // 32), dtype=scale_dtype)
+    else:
+        block_size = [128, 128]
+        scale_dtype = torch.float32
+        a_scales = torch.empty((m, k // 128), dtype=scale_dtype)
+        b_scales = torch.empty((n // 128, k // 128), dtype=scale_dtype)
+    if online:
+        a_scales = None
+
+        def fake_online_quantize_mxfp8(
+            activation: torch.Tensor,
+            selected_block_size: list[int],
+            scale_encoding: str,
+            enable_pdl: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            assert selected_block_size == block_size
+            assert scale_encoding == ("ue8m0" if contract == "ue8m0" else "float32")
+            assert not enable_pdl
+            return (
+                torch.empty_like(activation, dtype=_fp8_dtype()),
+                torch.empty(
+                    (m, k // block_size[1]),
+                    dtype=scale_dtype,
+                    device=activation.device,
+                ),
+            )
+
+        monkeypatch.setattr(
+            _gemm_pkg,
+            "_online_quantize_mxfp8",
+            fake_online_quantize_mxfp8,
+        )
+
+    case = _case(
+        _is_cdna5,
+        "cdna5",
+        "gemm",
+        "mm",
+        expected_name,
+        lambda: None,
+        id_suffix=f"{contract}-{'online' if online else 'prequantized'}",
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    try:
+        Platform.override(mi450_platform)
+        monkeypatch.setattr(_gemm_pkg, "_platform", mi450_platform)
+        registry.clear_cache()
+        actual = kernel_mm(
+            a,
+            b,
+            A_scales=a_scales,
+            B_scales=b_scales,
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=block_size,
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+    assert calls == [expected_name]
+    kernel_name = calls[0]
+    assert kernel_name == expected_name
+    assert actual.shape == (m, n)
 
 
 def test_bmm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
@@ -576,7 +762,7 @@ def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
         + 0.01
     )
 
-    out = tokenspeed_kernel.mm(
+    out = kernel_mm(
         a,
         b,
         B_scales=b_scales,
@@ -696,7 +882,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     block_a_scales = torch.ones((4, 1), dtype=torch.float32)
     block_b_scales = torch.ones((1, 1), dtype=torch.float32)
 
-    blockscale = tokenspeed_kernel.mm(
+    blockscale = kernel_mm(
         a,
         b,
         A_scales=block_a_scales,
@@ -709,7 +895,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert blockscale.shape == (4, 128)
     assert blockscale.dtype == torch.bfloat16
 
-    online_blockscale = tokenspeed_kernel.mm(
+    online_blockscale = kernel_mm(
         a_bf16,
         b,
         B_scales=block_b_scales,
@@ -721,7 +907,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert online_blockscale.shape == (4, 128)
     assert online_blockscale.dtype == torch.bfloat16
 
-    tensor_scaled = tokenspeed_kernel.mm(
+    tensor_scaled = kernel_mm(
         a,
         b,
         A_scales=tensor_scales,
@@ -732,6 +918,27 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     )
     assert tensor_scaled.shape == (4, 128)
     assert tensor_scaled.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("b_layout", ["KN", "NK"])
+def test_mm_fp8_reference_selection_follows_b_layout(b_layout) -> None:
+    gen = torch.Generator().manual_seed(0)
+    a = torch.randn((4, 256), generator=gen).to(_fp8_dtype())
+    b_kn = torch.randn((256, 128), generator=gen).to(_fp8_dtype())
+    b = b_kn if b_layout == "KN" else b_kn.t().contiguous()
+    scale = torch.ones((1,), dtype=torch.float32)
+
+    out = kernel_mm(
+        a,
+        b,
+        A_scales=scale,
+        B_scales=scale,
+        out_dtype=torch.float32,
+        quant="fp8",
+        solution="reference",
+    )
+
+    torch.testing.assert_close(out, a.float() @ b_kn.float())
 
 
 def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
@@ -745,7 +952,7 @@ def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     block_a_scales = torch.ones((2, 4, 1), dtype=torch.float32)
     block_b_scales = torch.ones((2, 1, 1), dtype=torch.float32)
 
-    blockscale = tokenspeed_kernel.bmm(
+    blockscale = kernel_bmm(
         a,
         b,
         A_scales=block_a_scales,
@@ -758,7 +965,7 @@ def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert blockscale.shape == (2, 4, 128)
     assert blockscale.dtype == torch.bfloat16
 
-    online_blockscale = tokenspeed_kernel.bmm(
+    online_blockscale = kernel_bmm(
         a_bf16,
         b,
         B_scales=block_b_scales,
@@ -770,7 +977,7 @@ def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert online_blockscale.shape == (2, 4, 128)
     assert online_blockscale.dtype == torch.bfloat16
 
-    tensor_scaled = tokenspeed_kernel.bmm(
+    tensor_scaled = kernel_bmm(
         a,
         b,
         A_scales=tensor_scales,
@@ -782,7 +989,7 @@ def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert tensor_scaled.shape == (2, 4, 128)
     assert tensor_scaled.dtype == torch.bfloat16
 
-    channel_scaled = tokenspeed_kernel.bmm(
+    channel_scaled = kernel_bmm(
         a,
         b,
         A_scales=channel_a_scales,
@@ -830,20 +1037,20 @@ def test_mm_non_native_out_kernel_copies_to_out(monkeypatch) -> None:
 
     monkeypatch.setattr(_gemm_pkg, "select_kernel", select_copy_out_kernel)
 
-    actual = tokenspeed_kernel.mm(a, b, out=out, override="test_mm_copy_out_kernel")
+    actual = kernel_mm(a, b, out=out, override="test_mm_copy_out_kernel")
     expected = a @ b.T
 
     assert actual is out
     torch.testing.assert_close(out, expected)
 
 
-def _mm_nvfp4() -> torch.Tensor:
-    a = torch.empty((4, 64), dtype=torch.uint8)
-    b = torch.empty((128, 64), dtype=torch.uint8)
-    a_scales = torch.empty((4, 1), dtype=torch.float32)
-    b_scales = torch.empty((128, 1), dtype=torch.float32)
+def _mm_nvfp4(m: int, n: int, k_packed: int) -> torch.Tensor:
+    a = torch.empty((m, k_packed), dtype=torch.uint8)
+    b = torch.empty((n, k_packed), dtype=torch.uint8)
+    a_scales = torch.empty((m, 1), dtype=torch.float32)
+    b_scales = torch.empty((n, 1), dtype=torch.float32)
     alpha = torch.empty((), dtype=torch.float32)
-    return tokenspeed_kernel.mm(
+    return kernel_mm(
         a,
         b,
         A_scales=a_scales,
@@ -914,7 +1121,7 @@ def _mm_nvfp4_a16() -> torch.Tensor:
     a = torch.empty((4, 128), dtype=torch.bfloat16)
     b = torch.empty((128, 64), dtype=torch.uint8)
     b_scales = _nvfp4_a16_prepared_scales(128, 128)
-    return tokenspeed_kernel.mm(
+    return kernel_mm(
         a,
         b,
         B_scales=b_scales,
@@ -970,11 +1177,11 @@ def test_gemm_nvfp4_a16_square_weight_uses_weight_rows_for_n(monkeypatch) -> Non
         return torch.empty((A.shape[0], B.shape[0]), dtype=out_dtype)
 
     def select_nvfp4_a16(*args, traits, **kwargs) -> SelectedKernel:
-        assert traits["n_align_16"] is True
+        assert (traits["m"], traits["n"], traits["k"]) == (4, 144, 144)
         return SelectedKernel("test_nvfp4_a16_shape", kernel)
 
     monkeypatch.setattr(_gemm_pkg, "select_kernel", select_nvfp4_a16)
-    actual = tokenspeed_kernel.mm(
+    actual = kernel_mm(
         a,
         b,
         B_scales=b_scales,
@@ -989,7 +1196,7 @@ def _mm_mxfp4() -> torch.Tensor:
     b = torch.empty((128, 32), dtype=torch.uint8)
     a_scales = torch.empty((4, 2), dtype=torch.uint8)
     b_scales = torch.empty((128, 2), dtype=torch.uint8)
-    return tokenspeed_kernel.mm(
+    return kernel_mm(
         a,
         b,
         A_scales=a_scales,
@@ -1072,6 +1279,39 @@ def _attention_mla_decode(
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         override=override,
+    )
+
+
+def _attention_mla_prefill(
+    dtype: torch.dtype, batch_size: int, q_len: int, kv_len: int, num_heads: int
+) -> object:
+    return _attention_mla_prefill_ragged(
+        dtype, q_len, (kv_len,) * batch_size, num_heads
+    )
+
+
+def _attention_mla_prefill_ragged(
+    dtype: torch.dtype, q_len: int, kv_lens: tuple[int, ...], num_heads: int
+) -> object:
+    # Selection reads the problem size from tensor shapes only, so stride-0
+    # views stand in for full-size inputs.
+    def tokens(count: int, dim: int) -> torch.Tensor:
+        return torch.empty((1, num_heads, dim), dtype=dtype).expand(count, -1, -1)
+
+    batch_size = len(kv_lens)
+    lens_kv = torch.tensor(kv_lens, dtype=torch.int32)
+    cu_seqlens_kv = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens_kv[1:] = lens_kv.cumsum(0)
+    return _attention_mla_pkg.mla_prefill(
+        q=tokens(batch_size * q_len, 192),
+        k=tokens(sum(kv_lens), 192),
+        v=tokens(sum(kv_lens), 128),
+        cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32) * q_len,
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=q_len,
+        max_seqlen_kv=max(kv_lens),
+        softmax_scale=1.0,
+        is_causal=True,
     )
 
 
@@ -1368,6 +1608,7 @@ def _attention_dsa_decode() -> object:
     topk_slots = torch.empty((2, 512), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1571,6 +1812,7 @@ def _attention_dsa_decode_fp8_dense_rank128_q4(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1598,6 +1840,7 @@ def _attention_dsa_decode_fp8_dense_rank512(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1625,6 +1868,7 @@ def _attention_dsa_decode_fp8_sparse_rank512(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1650,6 +1894,7 @@ def _attention_dsa_decode_glm53_flash_bf16_dense() -> object:
     topk_slots = torch.empty((4, 2051), dtype=torch.int32)
     topk_lens = torch.empty((4,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1678,6 +1923,7 @@ def _attention_dsa_prefill() -> object:
     topk_slots = torch.empty((2, 512), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1698,6 +1944,7 @@ def _attention_dsa_prefill_glm53_flash_bf16_dense() -> object:
     topk_slots = torch.empty((1, 2051), dtype=torch.int32)
     topk_lens = torch.empty((1,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1720,6 +1967,7 @@ def _attention_dsa_prefill_glm53_flash_fp8_dense(
     topk_slots = torch.empty((1, 2051), dtype=torch.int32)
     topk_lens = torch.empty((1,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1746,6 +1994,7 @@ def _attention_dsa_prefill_fp8_dense(
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1770,6 +2019,7 @@ def _attention_dsa_decode_fp8_dense_rank128() -> object:
     topk_slots = torch.empty((2, 2048), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1790,6 +2040,7 @@ def _attention_dsa_prefill_bf16_dense_rank128() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1810,6 +2061,7 @@ def _attention_dsa_prefill_fp8_dense_rank128() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1830,6 +2082,7 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1841,6 +2094,28 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
+    )
+
+
+def _attention_dsv41_index_topk(
+    heads: int, process_group: object, row_bytes: int
+) -> object:
+    q = torch.empty((2, heads, 128), dtype=torch.bfloat16)
+    return _attention_dsv41_pkg.index_topk(
+        q,
+        torch.empty((2, heads), dtype=torch.bfloat16),
+        torch.empty((4, 64, row_bytes), dtype=torch.uint8),
+        torch.zeros((2, 4), dtype=torch.int32),
+        torch.tensor([64, 32], dtype=torch.int32),
+        None,
+        512,
+        0,
+        8,
+        2,
+        64,
+        process_group,
+        None,
+        None,
     )
 
 
@@ -1911,7 +2186,9 @@ def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) ->
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k,
+        slot_order="selection",
     )
 
 
@@ -1929,9 +2206,11 @@ def _attention_dsa_decode_topk_logical() -> object:
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
         topk_layout="logical_offsets",
         block_table_base_offsets=torch.tensor([3, 5], dtype=torch.int32),
+        slot_order="selection",
     )
 
 
@@ -1956,10 +2235,12 @@ def _attention_dsa_prefill_topk(
         row_ends,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k,
         page_size=page_size,
         solution=solution,
         override=override,
+        slot_order="selection",
     )
 
 
@@ -2042,8 +2323,10 @@ def _attention_dsa_decode_topk_standard(
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k_cache,
         q_scales=q_scales,
+        slot_order="selection",
     )
 
 
@@ -2071,9 +2354,11 @@ def _attention_dsa_prefill_topk_standard(
         torch.tensor([8, 16], dtype=torch.int32),
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k_cache,
         page_size=64,
         q_scales=q_scales,
+        slot_order="selection",
     )
 
 
@@ -2116,7 +2401,9 @@ def test_dsa_topk_selection_receives_index_heads(
             page_size=64,
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=index_k_cache,
+            slot_order="selection",
         )
     else:
         _attention_dsa_pkg.dsa_prefill_topk(
@@ -2127,50 +2414,179 @@ def test_dsa_topk_selection_receives_index_heads(
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=index_k_cache,
             page_size=64,
+            slot_order="selection",
         )
 
     assert captured["index_heads"] == index_heads
 
 
-def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("declares_feature", [True, False])
+def test_dsa_prefill_topk_forwards_cpu_candidate_lens_by_registered_feature(
+    fresh_registry, h100_platform, declares_feature: bool
 ) -> None:
-    """The optional host mirror reaches DeepGEMM without affecting selection."""
+    """The optional host mirror reaches exactly the leaves registered with
+    ``CANDIDATE_LENS_CPU_FEATURE``; the facade reads the registration, so a
+    ``*args, **kwargs`` wrapper whose launcher cannot take the keyword never
+    sees it, and selection is unaffected either way."""
+    from tokenspeed_kernel.registry import KernelSpec
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    _ = fresh_registry
     captured: dict[str, object] = {}
+    empty = (
+        torch.full((2, 1), -1, dtype=torch.int32),
+        torch.zeros((2,), dtype=torch.int32),
+    )
 
-    class _SelectedKernel:
-        name = "deep_gemm_dsa_prefill_topk"
+    def launcher(*, q, candidate_lens_cpu=None, **kwargs):
+        captured["candidate_lens_cpu"] = candidate_lens_cpu
+        return empty
 
-        def __call__(self, **kwargs):
-            captured.update(kwargs)
-            return (
-                torch.full((2, 1), -1, dtype=torch.int32),
-                torch.zeros((2,), dtype=torch.int32),
-            )
+    def leaf(*args, **kwargs):
+        # Opaque wrapper, as the AMD gluon registrations are.
+        return launcher(*args, **kwargs)
 
-    monkeypatch.setattr(
-        _attention_dsa_pkg,
-        "select_kernel",
-        lambda *args, **kwargs: _SelectedKernel(),
+    features = {"batch_invariant"}
+    if declares_feature:
+        features.add(_attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE)
+    KernelRegistry.get().register(
+        KernelSpec(
+            name="unit_dsa_prefill_topk",
+            family="attention",
+            mode="dsa_prefill_topk",
+            solution="unit",
+            features=frozenset(features),
+            format_signatures=frozenset(
+                {
+                    format_signature(
+                        q=dense_tensor_format(torch.bfloat16),
+                        weights=dense_tensor_format(torch.float32),
+                    )
+                }
+            ),
+            traits={"index_k_format": frozenset({"fp8_scaled"})},
+        ),
+        leaf,
     )
     candidate_lens_cpu = torch.tensor([8, 16], dtype=torch.int64)
 
-    _attention_dsa_pkg.dsa_prefill_topk(
-        torch.empty((2, 2, 128), dtype=torch.bfloat16),
-        torch.empty((2, 2), dtype=torch.float32),
-        torch.arange(16, dtype=torch.int64),
-        torch.tensor([0, 0], dtype=torch.int32),
-        torch.tensor([8, 16], dtype=torch.int32),
-        topk=1,
-        softmax_scale=1.0,
-        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
-        page_size=64,
-        candidate_lens_cpu=candidate_lens_cpu,
-    )
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    try:
+        _attention_dsa_pkg.dsa_prefill_topk(
+            torch.empty((2, 2, 128), dtype=torch.bfloat16),
+            torch.empty((2, 2), dtype=torch.float32),
+            torch.arange(16, dtype=torch.int64),
+            torch.tensor([0, 0], dtype=torch.int32),
+            torch.tensor([8, 16], dtype=torch.int32),
+            topk=1,
+            softmax_scale=1.0,
+            batch_invariant=True,
+            index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+            page_size=64,
+            candidate_lens_cpu=candidate_lens_cpu,
+            slot_order="selection",
+        )
+    finally:
+        Platform.override(real_platform)
 
-    assert captured["candidate_lens_cpu"] is candidate_lens_cpu
+    if declares_feature:
+        assert captured["candidate_lens_cpu"] is candidate_lens_cpu
+    else:
+        assert captured["candidate_lens_cpu"] is None
+
+
+def test_deep_gemm_prefill_topk_declares_the_candidate_lens_cpu_feature() -> None:
+    """The one in-tree leaf taking the keyword registers the feature; the
+    decode leaf and the opaque gluon wrappers do not."""
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name("deep_gemm_dsa_prefill_topk")
+    if spec is None:
+        pytest.skip("DeepGEMM DSA leaves are not registered on this platform")
+    assert _attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE in spec.features
+    for other in registry.list_kernels("attention", "dsa_prefill_topk"):
+        if other.name != spec.name:
+            assert _attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE not in other.features
+
+
+def test_a_leaf_declares_the_workspace_rows_feature_iff_its_launcher_takes_rows() -> (
+    None
+):
+    """``INDEX_K_WORKSPACE_ROWS_FEATURE`` is the registration's promise that the
+    launcher takes index keys in workspace-row order (``index_k_fp8`` +
+    ``index_k_scale`` or ``index_k_bf16``): every registered prefill top-k
+    leaf declares it exactly when its signature names such a keyword. A
+    plane-only launcher (the portable Triton leaf, the opaque ``**kwargs``
+    gluon wrappers) names none and declares none, so the facade never selects
+    it for rows."""
+    registry = KernelRegistry.get()
+    feature = _attention_dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE
+    row_keywords = {"index_k_fp8", "index_k_scale", "index_k_bf16"}
+    specs = registry.list_kernels("attention", "dsa_prefill_topk")
+    assert specs
+    for spec in specs:
+        named = {
+            name
+            for name, parameter in inspect.signature(
+                registry.get_impl(spec.name)
+            ).parameters.items()
+            if parameter.kind
+            not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        }
+        takes_rows = bool(named & row_keywords)
+        assert (feature in spec.features) == takes_rows, (
+            f"{spec.name}: declares={feature in spec.features}, "
+            f"row keywords={sorted(named & row_keywords)}"
+        )
+
+
+def test_workspace_rows_fail_at_selection_without_a_declaring_leaf(
+    h100_platform,
+) -> None:
+    """Forcing the portable Triton solution (the one an AMD or pre-Hopper
+    platform has) for rows raises ``NoKernelFoundError`` from the facade
+    instead of the leaf's own ``RuntimeError`` mid-forward."""
+    spec = KernelRegistry.get().get_by_name("triton_dsa_prefill_topk_fp8")
+    assert spec is not None
+    assert _attention_dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE not in spec.features
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    try:
+        with pytest.raises(kernel_NoKernelFoundError):
+            _attention_dsa_pkg.dsa_prefill_topk(
+                torch.empty((1, 32, 128), dtype=torch.bfloat16),
+                torch.empty((1, 32), dtype=torch.float32),
+                torch.arange(16, dtype=torch.int64),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([16], dtype=torch.int32),
+                topk=512,
+                softmax_scale=1.0,
+                batch_invariant=False,
+                index_k_fp8=torch.empty((16, 128), dtype=torch.float8_e4m3fn),
+                index_k_scale=torch.ones((16, 1), dtype=torch.float32),
+                solution="triton",
+                slot_order="selection",
+            )
+        with pytest.raises(kernel_NoKernelFoundError):
+            _attention_dsa_pkg.dsa_prefill_topk(
+                torch.empty((1, 32, 128), dtype=torch.bfloat16),
+                torch.empty((1, 32), dtype=torch.float32),
+                torch.arange(16, dtype=torch.int64),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([16], dtype=torch.int32),
+                topk=512,
+                softmax_scale=1.0,
+                batch_invariant=False,
+                index_k_fp8=torch.empty((16, 128), dtype=torch.float8_e4m3fn),
+                index_k_scale=torch.ones((16, 1), dtype=torch.float32),
+                solution="triton",
+                slot_order="selection",
+            )
+    finally:
+        Platform.override(real_platform)
 
 
 def test_deep_gemm_prefill_bound_resolution_preserves_both_host_inputs() -> None:
@@ -2257,7 +2673,9 @@ def test_dsa_topk_selection_receives_cache_layout(
             page_size=64,
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=cache,
+            slot_order="selection",
         )
     else:
         _attention_dsa_pkg.dsa_prefill_topk(
@@ -2268,8 +2686,10 @@ def test_dsa_topk_selection_receives_cache_layout(
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=cache,
             page_size=64,
+            slot_order="selection",
         )
 
     assert captured["index_k_layout"] == expected
@@ -2292,8 +2712,10 @@ def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> Non
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             page_size=64,
             **inputs,
+            slot_order="selection",
         )
 
 
@@ -2315,7 +2737,7 @@ def _mhc_pre() -> object:
     fn = torch.empty((24, 64), dtype=torch.float32)
     hc_scale = torch.empty((3,), dtype=torch.float32)
     hc_base = torch.empty((24,), dtype=torch.float32)
-    return tokenspeed_kernel.mhc_pre(
+    return kernel_mhc_pre(
         residual,
         fn,
         hc_scale,
@@ -2349,7 +2771,7 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
     fn = torch.empty((24, 32), dtype=torch.float32)
     hc_scale = torch.empty(3, dtype=torch.float32)
     hc_base = torch.empty(24, dtype=torch.float32)
-    tokenspeed_kernel.mhc_pre(
+    kernel_mhc_pre(
         residual,
         fn,
         hc_scale,
@@ -2366,8 +2788,55 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
     assert selected["solution"] == "legacy_solution"
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (64, "gluon_mhc_pre_gfx950"),
+        (65, "triton_mhc_pre"),
+        (256, "triton_mhc_pre"),
+        (257, "gluon_mhc_prefill_gfx950"),
+        (1025, "gluon_mhc_prefill_gfx950"),
+        (8193, "gluon_mhc_prefill_gfx950"),
+        (131072, "triton_mhc_pre"),
+    ],
+)
+def test_mhc_prefill_selects_gfx950_projection(
+    mi350_platform: PlatformInfo, num_tokens: int, expected: str
+) -> None:
+    registry = KernelRegistry.get()
+    if registry.get_by_name("gluon_mhc_prefill_gfx950") is None:
+        pytest.skip("optional AMD kernel package is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        selected = select_kernel(
+            "residual",
+            "mhc_pre",
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                fn=dense_tensor_format(torch.float32),
+                hc_scale=dense_tensor_format(torch.float32),
+                hc_base=dense_tensor_format(torch.float32),
+            ),
+            traits={
+                "num_tokens": num_tokens,
+                "buffer_offsets_fit_int32": num_tokens * 4 * 4096 < 2**31,
+                "hc_mult": 4,
+                "hidden_size": 4096,
+                "sinkhorn_iters": 20,
+            },
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert selected.name == expected
+
+
 def test_mhc_normalization_contract_is_explicit() -> None:
-    parameters = inspect.signature(tokenspeed_kernel.mhc_pre).parameters
+    parameters = inspect.signature(kernel_mhc_pre).parameters
 
     for name in ("norm_weight", "norm_eps"):
         assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
@@ -2400,7 +2869,7 @@ def test_mhc_normalization_arguments_must_be_paired(
     with pytest.raises(
         ValueError, match="norm_weight and norm_eps must be provided together"
     ):
-        tokenspeed_kernel.mhc_pre(
+        kernel_mhc_pre(
             residual,
             fn,
             hc_scale,
@@ -2418,7 +2887,29 @@ def _mhc_post() -> object:
     residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
     post = torch.empty((1, 4, 1), dtype=torch.float32)
     comb = torch.empty((1, 4, 4), dtype=torch.float32)
-    return tokenspeed_kernel.mhc_post(hidden_states, residual, post, comb)
+    return kernel_mhc_post(hidden_states, residual, post, comb)
+
+
+def _mhc_mixes() -> object:
+    # The gfx950 projection is specialized to model hidden sizes.
+    residual = torch.empty((1, 4, 4096), dtype=torch.bfloat16)
+    weight = torch.empty((24, 4 * 4096), dtype=torch.float32)
+    scale = torch.empty((3,), dtype=torch.float32)
+    base = torch.empty((24,), dtype=torch.float32)
+    return kernel_mhc_mixes(residual, weight, scale, base, 1e-6, 1e-6, 2)
+
+
+def _mhc_apply_pre() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=None, norm_eps=None)
+
+
+def _mhc_apply_pre_fused_norm() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    norm_weight = torch.empty((16,), dtype=torch.bfloat16)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=1e-6)
 
 
 def _attention_gdn_chunk_prefill() -> object:
@@ -2447,7 +2938,7 @@ def _sampling_argmax() -> object:
     if not torch.cuda.is_available():
         pytest.skip("argmax dispatches through kernel selection only for CUDA tensors")
     logits = torch.empty((4, 4096), dtype=torch.float32, device="cuda")
-    return tokenspeed_kernel.argmax(logits)
+    return kernel_argmax(logits)
 
 
 def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> None:
@@ -2496,7 +2987,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
     try:
         Platform.override(platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             weight_dtype,
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -2505,8 +2996,14 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             ispp=256,
             fp8_scale_block_shape=(128, 128) if weight_dtype == "fp8" else None,
             internal_activation_dtype="input",
-            deepep_group=object(),
+            process_group=object(),
             deepep_mode=deepep_mode,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -2532,7 +3029,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
         Platform.override(b200_platform)
         registry.clear_cache()
         with pytest.raises(ValueError, match="does not support deepep_mode"):
-            tokenspeed_kernel.moe_plan(
+            kernel_moe_plan(
                 "nvfp4",
                 input_dtype=torch.bfloat16,
                 activation="silu",
@@ -2541,12 +3038,49 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 ep_size=2,
                 ispp=256,
                 internal_activation_dtype="input",
-                deepep_group=object(),
+                process_group=object(),
                 deepep_mode=deepep_mode,
+                hidden=None,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+                combine_order="rank",
             )
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
+    h100_platform,
+) -> None:
+    real_platform = Platform.get()
+    try:
+        Platform.override(h100_platform)
+        KernelRegistry.get().clear_cache()
+        with pytest.raises(ValueError, match="does not support persistent workspace"):
+            kernel_moe_plan(
+                "unquant",
+                input_dtype=torch.bfloat16,
+                activation="silu",
+                routing_mode="precomputed_topk",
+                a2a_backend=None,
+                ep_size=1,
+                ispp=128,
+                internal_activation_dtype="input",
+                persistent_max_num_tokens_per_gpu=16,
+                solution="triton",
+                hidden=128,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+                combine_order="rank",
+            )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
 
 
 @pytest.mark.parametrize(
@@ -2576,11 +3110,12 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
     if registry.get_by_name(kernel_name) is None:
         pytest.skip(f"{kernel_name!r} is unavailable (optional backend missing)")
 
+    process_group = object()
     real_platform = Platform.get()
     try:
         Platform.override(b200_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "fp8",
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -2588,20 +3123,27 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             ep_size=2,
             ispp=256,
             fp8_scale_block_shape=(128, 128),
-            deepep_group=object(),
+            process_group=process_group,
             deepep_mode="auto",
             deepep_low_latency_max_num_tokens_per_gpu=256,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
 
+    assert plan["process_group"] is process_group
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] == 256
 
 
 def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -2609,6 +3151,12 @@ def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
         ep_size=1,
         ispp=128,
         solution="triton",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -2625,7 +3173,7 @@ def test_moe_plan_rejects_invalid_deepep_mode(
     deepep_mode: str, a2a_backend: str, match: str
 ) -> None:
     with pytest.raises(ValueError, match=match):
-        tokenspeed_kernel.moe_plan(
+        kernel_moe_plan(
             "fp8",
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -2634,22 +3182,28 @@ def test_moe_plan_rejects_invalid_deepep_mode(
             ispp=256,
             fp8_scale_block_shape=(128, 128),
             deepep_mode=deepep_mode,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
 
 
 def test_gluon_mxfp4_swiglu_args_default_missing_values_to_standard_swiglu() -> None:
-    if not hasattr(_moe_gluon_mxfp4, "_swiglu_args"):
+    if not hasattr(_moe_gluon, "_swiglu_args"):
         pytest.skip("Gluon MXFP4 SwiGLU args are AMD-only")
 
     w = torch.nn.Module()
     w.swiglu_arg = type("SwigluArg", (), {"alpha": None, "limit": None})()
 
-    assert _moe_gluon_mxfp4._swiglu_args(w) == (1.0, 0.0, 0.0)
+    assert _moe_gluon._swiglu_args(w) == (1.0, 0.0, 0.0)
 
     w.swiglu_arg = type("SwigluArg", (), {"alpha": 1.702, "limit": 7.0})()
     w.swiglu_beta = 1.0
 
-    assert _moe_gluon_mxfp4._swiglu_args(w) == (1.702, 7.0, 1.0)
+    assert _moe_gluon._swiglu_args(w) == (1.702, 7.0, 1.0)
 
 
 def test_gluon_dsa_prefill_topk_rejects_unsupported_page_size() -> None:
@@ -2657,7 +3211,9 @@ def test_gluon_dsa_prefill_topk_rejects_unsupported_page_size() -> None:
     if registry.get_by_name("gluon_dsa_prefill_topk_fp8_gfx950") is None:
         pytest.skip("Gluon DSA top-k is AMD-only")
 
-    with pytest.raises(tokenspeed_kernel.NoKernelFoundError, match="traits"):
+    with pytest.raises(kernel_NoKernelFoundError, match="traits"):
+        _attention_dsa_prefill_topk(page_size=32, solution="gluon")
+    with pytest.raises(kernel_NoKernelFoundError, match="traits"):
         _attention_dsa_prefill_topk(page_size=32, solution="gluon")
 
 
@@ -2790,6 +3346,19 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
             signature,
             traits={"tokens": 16, "experts": 896, "topk": 16},
         )
+        forced_gluon = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+            solution="gluon",
+        )
+        past_packed = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 1024, "experts": 896, "topk": 16},
+        )
         other_shape = select_kernel(
             "moe",
             "sigmoid_bias_topk",
@@ -2809,13 +3378,14 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
         registry.clear_cache()
 
     assert decode.name == "triton_decode_sigmoid_bias_topk"
-    assert batched.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert batched.name == "triton_kimi3_packed_sigmoid_bias_topk_gfx1250"
+    assert forced_gluon.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert past_packed.name == "gluon_sigmoid_bias_topk_gfx1250"
     assert other_shape.name == "torch_sigmoid_bias_topk"
     assert reduced_precision.name == "torch_sigmoid_bias_topk"
 
 
 def test_amd_softmax_topk_selects_triton_on_gfx1250(
-    mi350_platform: PlatformInfo,
     mi450_platform: PlatformInfo,
 ) -> None:
     registry = KernelRegistry.get()
@@ -2832,15 +3402,6 @@ def test_amd_softmax_topk_selects_triton_on_gfx1250(
     )
     real_platform = Platform.get()
     try:
-        Platform.override(mi350_platform)
-        registry.clear_cache()
-        gfx950 = select_kernel(
-            "moe",
-            "softmax_topk",
-            bf16_signature,
-            traits={"tokens": 1, "experts": 128, "topk": 4},
-        )
-
         Platform.override(mi450_platform)
         registry.clear_cache()
         standard_shape = select_kernel(
@@ -2859,9 +3420,240 @@ def test_amd_softmax_topk_selects_triton_on_gfx1250(
         Platform.override(real_platform)
         registry.clear_cache()
 
-    assert gfx950.name == "torch_softmax_topk"
     assert standard_shape.name == "triton_softmax_topk_gfx1250"
     assert general_shape.name == "triton_softmax_topk_gfx1250"
+
+
+def test_gfx950_softmax_topk_selects_gluon(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    gluon_spec = registry.get_by_name("gluon_softmax_topk_gfx950")
+    if gluon_spec is None:
+        pytest.skip("gfx950 Gluon softmax top-k is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        selected = {
+            (dtype, tokens): select_kernel(
+                "moe",
+                "softmax_topk",
+                format_signature(router_logits=dense_tensor_format(dtype)),
+                traits={"tokens": tokens, "experts": 512, "topk": 10},
+            ).name
+            # Qwen3.8 MTP draft, verify and prefill token counts.
+            for dtype in (torch.bfloat16, torch.float16, torch.float32)
+            for tokens in (16, 64, 8192)
+        }
+        too_many_experts = select_kernel(
+            "moe",
+            "softmax_topk",
+            format_signature(router_logits=dense_tensor_format(torch.bfloat16)),
+            traits={"tokens": 64, "experts": 2048, "topk": 10},
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert gluon_spec.priority == Priority.SPECIALIZED
+    assert set(selected.values()) == {"gluon_softmax_topk_gfx950"}
+    assert too_many_experts.name == "torch_softmax_topk"
+
+
+def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """Dynamic-MXFP4 SiLU experts take the gfx950 A4W4 kernel; plans it does
+    not cover keep their previous kernels."""
+    if KernelRegistry.get().get_by_name("gluon_mxfp4_a4w4_moe_apply_gfx950") is None:
+        pytest.skip("gfx950 Gluon A4W4 MoE is unavailable")
+
+    def plan(**overrides):
+        # Qwen3.8-Flash-Next TP2 experts.
+        kwargs = dict(
+            input_dtype=torch.bfloat16,
+            activation="silu",
+            routing_mode="precomputed_topk",
+            ispp=320,
+            hidden=2560,
+            internal_activation_dtype="mxfp4",
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=False,
+            combine_order="rank",
+        )
+        return kernel_moe_plan("mxfp4", **{**kwargs, **overrides})
+
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        a4w4 = plan()
+        with_bias = plan(with_bias=True)
+        bf16_activations = plan(internal_activation_dtype="input")
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        a4w4,
+        apply="gluon_mxfp4_a4w4_moe_apply_gfx950",
+        preprocessor="gluon_mxfp4_a4w4_moe_weights_gfx950",
+    )
+    assert with_bias["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
+    assert bf16_activations["apply_kernel_name"] == "gluon_mxfp4_precomputed_moe_apply"
+
+
+def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        return select_kernel(*args, **kwargs).name
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
+def test_gfx950_mxfp4_linear_falls_back_beyond_32bit_weight_offsets(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """The gfx950 MXFP4 linears address weights with 32-bit offsets, so an
+    oversized weight selects the portable kernel instead of failing later."""
+    if KernelRegistry.get().get_by_name("gluon_mxfp4_linear_gfx950") is None:
+        pytest.skip("gfx950 Gluon MXFP4 linear is unavailable")
+    from tokenspeed_kernel.ops.gemm import (
+        MXFP4_LINEAR_SIGNATURE,
+        _mxfp4_linear_traits,
+    )
+
+    def select(mode, n, k):
+        return _select_on(
+            mi350_platform,
+            "gemm",
+            mode,
+            MXFP4_LINEAR_SIGNATURE,
+            traits=_mxfp4_linear_traits(n, k, None),
+        )
+
+    # n * k just below and at 2**31.
+    for mode, kernel in (
+        ("mxfp4_linear", "gluon_mxfp4_linear_gfx950"),
+        ("mxfp4_swiglu_linear", "gluon_mxfp4_swiglu_linear_gfx950"),
+    ):
+        assert select(mode, 640, 2560) == kernel
+        assert select(mode, 2**16, 2**15 - 64) == kernel
+        assert select(mode, 2**16, 2**15) == f"triton_{mode}"
+
+
+def test_qsa_sparse_attention_selects_gluon_on_gfx950(
+    mi350_platform: PlatformInfo,
+    mi450_platform: PlatformInfo,
+) -> None:
+    gluon_spec = KernelRegistry.get().get_by_name("gluon_qsa_sparse_attention_gfx950")
+    if gluon_spec is None:
+        pytest.skip("gfx950 Gluon QSA sparse attention is unavailable")
+
+    def select(platform, is_decode, cache_dtype):
+        return _select_on(
+            platform,
+            "attention",
+            "qsa_sparse_attention",
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                k_cache=dense_tensor_format(cache_dtype),
+                v_cache=dense_tensor_format(cache_dtype),
+            ),
+            # Qwen3.8-Flash-Next TP2: MTP verify rows, or ragged prefill rows.
+            traits={
+                "batch_size": 16,
+                "q_len": 4 if is_decode else 1,
+                "num_q_heads": 12,
+                "num_kv_heads": 1,
+                "head_dim": 256,
+                "value_head_dim": 256,
+                "selected_width": 2051,
+                "is_decode": is_decode,
+            },
+        )
+
+    shapes = [
+        (is_decode, cache_dtype)
+        for is_decode in (True, False)
+        for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    ]
+    assert gluon_spec.priority == Priority.SPECIALIZED
+    assert {select(mi350_platform, *shape) for shape in shapes} == {
+        "gluon_qsa_sparse_attention_gfx950"
+    }
+    assert {select(mi450_platform, *shape) for shape in shapes} == {
+        "triton_qsa_sparse_attention"
+    }
+
+
+def test_qsa_indexer_selects_gluon_on_gfx950(
+    mi350_platform: PlatformInfo,
+    mi450_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    gluon_specs = [
+        registry.get_by_name(name)
+        for name in (
+            "gluon_qsa_block_scores_gfx950",
+            "gluon_qsa_block_topk_select_gfx950",
+        )
+    ]
+    if None in gluon_specs:
+        pytest.skip("gfx950 Gluon QSA indexer kernels are unavailable")
+
+    def select(platform):
+        scores = _select_on(
+            platform,
+            "attention",
+            "qsa_block_scores",
+            format_signature(
+                query=dense_tensor_format(torch.bfloat16),
+                key_cache=dense_tensor_format(torch.bfloat16),
+            ),
+            # Qwen3.8-Flash-Next: 4 index heads of 128, top-2048 blocks.
+            traits={"num_heads": 4, "head_dim": 128},
+        )
+        topk = _select_on(
+            platform,
+            "attention",
+            "qsa_block_topk_select",
+            format_signature(logits=dense_tensor_format(torch.float32)),
+            traits={"topk": 2048},
+        )
+        stream = _select_on(
+            platform,
+            "attention",
+            "qsa_block_topk_stream",
+            format_signature(
+                query=dense_tensor_format(torch.bfloat16),
+                key_cache=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={"num_heads": 4, "head_dim": 128},
+        )
+        return scores, topk, stream
+
+    assert all(spec.priority == Priority.SPECIALIZED for spec in gluon_specs)
+    # Streaming top-k has only the portable implementation.
+    assert select(mi350_platform) == (
+        "gluon_qsa_block_scores_gfx950",
+        "gluon_qsa_block_topk_select_gfx950",
+        "triton_qsa_block_topk_stream",
+    )
+    assert select(mi450_platform) == (
+        "triton_qsa_block_scores",
+        "triton_qsa_block_topk_select",
+        "triton_qsa_block_topk_stream",
+    )
 
 
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
@@ -2883,7 +3675,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="swiglu",
@@ -2892,6 +3684,12 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             internal_activation_dtype="input",
             with_bias=True,
             solution="gluon",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -2915,7 +3713,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="swiglu",
@@ -2923,6 +3721,12 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             ispp=128,
             internal_activation_dtype="input",
             solution="triton",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
         assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     finally:
@@ -2944,15 +3748,15 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             8,
             3072,
             None,
-            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
-            "validate_linear_mxfp4_moe_weights",
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
         (
             8,
             3072,
             "gluon",
-            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
-            "validate_linear_mxfp4_moe_weights",
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
     ],
 )
@@ -2971,7 +3775,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="situ",
@@ -2980,6 +3784,12 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             ispp=ispp,
             internal_activation_dtype="input",
             solution=solution,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3011,7 +3821,7 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="swiglu",
@@ -3020,6 +3830,12 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
             ispp=128,
             internal_activation_dtype="input",
             solution="gluon",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3039,7 +3855,7 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="situ",
@@ -3049,6 +3865,12 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
             internal_activation_dtype="input",
             with_bias=True,
             solution="gluon",
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3084,31 +3906,31 @@ def test_kimi3_a8_plan_preserves_unclipped_a16_decode(
     )
     plan = {"apply_kernel_name": "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"}
     monkeypatch.setattr(
-        _moe_latent_decode,
+        _moe_pkg,
         "select_kernel",
         lambda *_args, **_kwargs: object(),
     )
 
-    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert _moe_pkg.latent_moe_decode_pipeline_available(
         *tensors,
         plan,
         topk=16,
         linear_clamp=None,
     )
-    assert not _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert _moe_pkg.latent_moe_decode_pipeline_available(
         *tensors,
         plan,
         topk=16,
         linear_clamp=25.0,
     )
-    assert not _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert not _moe_pkg.latent_moe_decode_pipeline_available(
         *tensors,
         plan,
         topk=16,
     )
 
     a16_plan = {"apply_kernel_name": "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"}
-    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert _moe_pkg.latent_moe_decode_pipeline_available(
         *tensors,
         a16_plan,
         topk=16,
@@ -3126,7 +3948,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
     try:
         Platform.override(mi450_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="situ",
@@ -3135,6 +3957,12 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
             ispp=384,
             internal_activation_dtype="input",
             solution="gluon",
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3190,7 +4018,7 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
     interval (_DIRECT_DECODE_MAX_M, _PRECOMPUTED_MFMA_MIN_M) silently dropped
     the precomputed top-k and recomputed routing from ``router_logits``.
     """
-    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_dynamic_moe_apply"):
+    if not hasattr(_moe_gluon, "gluon_mxfp4_dynamic_moe_apply"):
         pytest.skip("gluon mxfp4 dynamic apply is AMD-only")
 
     captured: dict[str, object] = {}
@@ -3201,7 +4029,7 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
         return "sentinel"
 
     monkeypatch.setattr(
-        _moe_gluon_mxfp4, "gluon_mxfp_dynamic_mxfp4_fused_moe", fake_fused_moe
+        _moe_gluon, "gluon_mxfp_dynamic_mxfp4_fused_moe", fake_fused_moe
     )
 
     w = _make_fake_gluon_mxfp4_layer(top_k=1)
@@ -3210,7 +4038,7 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
     topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
     topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32)
 
-    out = _moe_gluon_mxfp4.gluon_mxfp4_dynamic_moe_apply(
+    out = _moe_gluon.gluon_mxfp4_dynamic_moe_apply(
         {},
         x,
         w,
@@ -3242,7 +4070,7 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
     expected_decode: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
+    if not hasattr(_moe_gluon, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
         pytest.skip("gfx1250 Gluon MXFP4 apply is AMD-only")
 
     captured: dict[str, object] = {}
@@ -3252,7 +4080,7 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
         return "sentinel"
 
     monkeypatch.setattr(
-        _moe_gluon_mxfp4.fused_mxfp_gfx1250,
+        _moe_gluon.fused_mxfp_gfx1250,
         "gluon_mxfp_precomputed_mxfp4_fused_moe",
         fake_fused_moe,
     )
@@ -3271,7 +4099,7 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
     topk_weights = torch.ones((num_tokens, top_k), dtype=torch.float32)
     topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32)
 
-    out = _moe_gluon_mxfp4.gluon_mxfp4_gfx1250_precomputed_moe_apply(
+    out = _moe_gluon.gluon_mxfp4_gfx1250_precomputed_moe_apply(
         {},
         x,
         w,
@@ -3288,7 +4116,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     apply_name = "gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply"
-    if not hasattr(_moe_gluon_mxfp4, apply_name):
+    if not hasattr(_moe_gluon, apply_name):
         pytest.skip("gfx1250 Gluon MXFP4 SiTU apply is AMD-only")
 
     captured: dict[str, object] = {}
@@ -3298,7 +4126,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
         return "sentinel"
 
     monkeypatch.setattr(
-        _moe_gluon_mxfp4.fused_mxfp_gfx1250,
+        _moe_gluon.fused_mxfp_gfx1250,
         "gluon_mxfp_precomputed_mxfp4_fused_moe",
         fake_fused_moe,
     )
@@ -3320,7 +4148,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
     topk_weights = torch.ones((1, num_experts), dtype=torch.float32)
     topk_ids = torch.arange(num_experts, dtype=torch.int32).view(1, -1)
 
-    apply = getattr(_moe_gluon_mxfp4, apply_name)
+    apply = getattr(_moe_gluon, apply_name)
     out = apply(
         {},
         x,
@@ -3339,7 +4167,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
 
 
 def _moe_apply_unquant_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -3347,6 +4175,12 @@ def _moe_apply_unquant_trtllm() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3355,7 +4189,7 @@ def _moe_apply_unquant_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3364,44 +4198,51 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
-def _dsv4_select_experts_bias(tokens: int) -> object:
+def _moe_topk_bias(tokens: int) -> object:
     """Exercise bias-router selection across specialized and portable batches."""
     router_logits = torch.empty((tokens, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
-    return tokenspeed_kernel.dsv4_select_experts(
+    return kernel_moe_topk(
         router_logits,
-        6,
-        True,
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="topk",
+        renormalize=True,
+        routed_scaling_factor=1.0,
         correction_bias=correction_bias,
-        hash_indices_table=None,
-        input_ids=None,
-        need_scores=False,
-        override=None,
-        solution=None,
     )
 
 
-def _dsv4_select_experts_hash() -> object:
+def _moe_topk_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
     hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
-    return tokenspeed_kernel.dsv4_select_experts(
+    return kernel_moe_topk(
         router_logits,
-        6,
-        True,
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="hash",
+        renormalize=True,
+        routed_scaling_factor=1.0,
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
     )
 
 
 def _moe_apply_unquant_cutlass() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3410,11 +4251,11 @@ def _moe_apply_unquant_cutlass() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_fp8_cutlass() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -3422,6 +4263,12 @@ def _moe_apply_fp8_cutlass() -> object:
         ispp=128,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3430,11 +4277,224 @@ def _moe_apply_fp8_cutlass() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_apply_mxfp4_plan(
+    *,
+    activation: str,
+    ispp: int,
+    internal_activation_dtype: str,
+    solution: str | None,
+    hidden: int = 5120,
+    ep_size: int = 8,
+    swiglu_form: str | None = "standard",
+    activation_clamped: bool = True,
+    expert_id_repeats: bool = False,
+) -> dict:
+    # DeepSeek-V4.1-Flash on one EP8 rank: SwiGLU experts, 5120-wide hidden,
+    # 2304-wide FFN, dense EP (no all-to-all). Kimi-K3 differs by SiTU and a
+    # 3072-wide FFN.
+    return kernel_moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation=activation,
+        routing_mode="precomputed_topk",
+        a2a_backend="none",
+        ep_size=ep_size,
+        ispp=ispp,
+        hidden=hidden,
+        swiglu_form=swiglu_form if activation == "swiglu" else None,
+        activation_clamped=activation_clamped,
+        expert_id_repeats=expert_id_repeats,
+        internal_activation_dtype=internal_activation_dtype,
+        solution=solution,
+        fast_math=True,
+        combine_order="rank",
+    )
+
+
+def _moe_apply_mxfp4_invoke(plan: dict) -> object:
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_apply_mxfp4_cutlass_w4a16() -> object:
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution=None,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_cutlass_mxfp4_w4a16_moe_apply",
+        preprocessor="flashinfer_cutlass_mxfp4_w4a16_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_cutlass_w4a8() -> object:
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="fp8",
+        solution=None,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_cutlass_mxfp4_w4a8_moe_apply",
+        preprocessor="flashinfer_cutlass_mxfp4_w4a8_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_marlin_explicit() -> object:
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution="marlin",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp4_precomputed_moe_apply",
+        preprocessor="marlin_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_misaligned_hidden_auto() -> object:
+    # The cutlass scales are int32 views along K, so a hidden size that is not
+    # a multiple of 128 must be vetoed at plan time, keeping marlin under auto
+    # instead of failing later in weight preprocessing.
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution=None,
+        hidden=2880,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp4_precomputed_moe_apply",
+        preprocessor="marlin_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_generalized_swiglu_auto() -> object:
+    # MiniMax-M3 style SwiGLU (sigmoid alpha, up-branch beta): neither the
+    # cutlass epilogue nor marlin's silu_and_mul implements it, so a TP layout
+    # stays on the Triton kernel under auto instead of failing in preprocessing.
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution=None,
+        ep_size=1,
+        swiglu_form="generalized",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="triton_mxfp4_precomputed_moe_apply",
+        preprocessor="triton_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def _moe_apply_mxfp4_zero_experts_auto() -> object:
+    # LongCat zero experts are rewritten to a placeholder id with weight zero,
+    # so one token may repeat an expert id; FlashInfer's permutation cannot
+    # take that, marlin can.
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="input",
+        solution=None,
+        expert_id_repeats=True,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp4_precomputed_moe_apply",
+        preprocessor="marlin_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
+
+
+def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
+    # Humming's fixed FC2 activation scale needs the SwiGLU clamp; an FP8
+    # activation request for an unclamped layer must fail closed at plan time
+    # rather than saturate FP8 at runtime.
+    if not _is_hopper(Platform.get()):
+        pytest.skip("Hopper registrations only")
+    with pytest.raises(kernel_NoKernelFoundError):
+        _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="fp8",
+            solution=None,
+            activation_clamped=False,
+        )
+    with pytest.raises(kernel_NoKernelFoundError):
+        _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="fp8",
+            solution=None,
+            activation_clamped=False,
+        )
+    plan = _moe_apply_mxfp4_plan(
+        activation="swiglu",
+        ispp=2304,
+        internal_activation_dtype="fp8",
+        solution=None,
+        activation_clamped=True,
+    )
+    assert plan["apply_kernel_name"] == "flashinfer_cutlass_mxfp4_w4a8_moe_apply"
+
+
+def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -> None:
+    # --moe-mxfp4-fp8-activation is not gated by a backend allowlist in
+    # ServerArgs; the plan refuses a backend that has no FP8-activation kernel.
+    if not _is_hopper(Platform.get()):
+        pytest.skip("Hopper registrations only")
+    for solution in ("marlin", "triton"):
+        with pytest.raises(kernel_NoKernelFoundError):
+            _moe_apply_mxfp4_plan(
+                activation="swiglu",
+                ispp=2304,
+                internal_activation_dtype="fp8",
+                solution=solution,
+            )
+        with pytest.raises(kernel_NoKernelFoundError):
+            _moe_apply_mxfp4_plan(
+                activation="swiglu",
+                ispp=2304,
+                internal_activation_dtype="fp8",
+                solution=solution,
+            )
+
+
+def _moe_apply_mxfp4_situ_auto() -> object:
+    # The cutlass epilogue has no SiTU, so Kimi-K3 keeps marlin under auto.
+    plan = _moe_apply_mxfp4_plan(
+        activation="situ",
+        ispp=3072,
+        internal_activation_dtype="input",
+        solution=None,
+    )
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp4_precomputed_moe_apply",
+        preprocessor="marlin_mxfp4_moe_weights",
+    )
+    return _moe_apply_mxfp4_invoke(plan)
 
 
 def _moe_apply_fp8_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -3442,6 +4502,12 @@ def _moe_apply_fp8_trtllm() -> object:
         ispp=128,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3450,11 +4516,11 @@ def _moe_apply_fp8_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_nvfp4_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3462,6 +4528,12 @@ def _moe_apply_nvfp4_trtllm() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3470,7 +4542,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3480,7 +4552,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
 
 
 def _moe_apply_nvfp4_cutlass() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3488,6 +4560,12 @@ def _moe_apply_nvfp4_cutlass() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_cutlass",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3496,11 +4574,11 @@ def _moe_apply_nvfp4_cutlass() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_nvfp4_trtllm_routed() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3509,6 +4587,12 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3520,7 +4604,7 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3534,7 +4618,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
     # No routing_mode requested: the kernel-routing registration must keep
     # winning under solution "flashinfer_trtllm" (its callers pass only
     # router_logits), so the routed variant sits at a lower priority.
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3542,6 +4626,12 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3551,11 +4641,11 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
     assert plan["support_routing"] is True
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_unquant_trtllm_routed() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3564,6 +4654,12 @@ def _moe_apply_unquant_trtllm_routed() -> object:
         ispp=128,
         internal_activation_dtype="input",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3575,7 +4671,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3586,7 +4682,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
 
 
 def _moe_apply_nvfp4_deepep_cutedsl() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -3594,9 +4690,15 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         ep_size=2,
         ispp=128,
         internal_activation_dtype="input",
-        deepep_group=object(),
+        process_group=object(),
         deepep_mode="low_latency",
         solution="flashinfer_cutedsl",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3605,11 +4707,11 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_fp8_deepep_deep_gemm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -3619,8 +4721,14 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         ispp=256,
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
-        deepep_group=object(),
+        process_group=object(),
         solution="deep_gemm",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3632,7 +4740,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3643,7 +4751,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
 
 
 def _moe_apply_mxfp4_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3651,6 +4759,12 @@ def _moe_apply_mxfp4_trtllm() -> object:
         ispp=128,
         internal_activation_dtype="input",
         with_bias=True,
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3659,11 +4773,11 @@ def _moe_apply_mxfp4_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_mxfp4_triton() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3672,6 +4786,12 @@ def _moe_apply_mxfp4_triton() -> object:
         internal_activation_dtype="mxfp4",
         with_bias=False,
         solution="triton",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3682,7 +4802,38 @@ def _moe_apply_mxfp4_triton() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int64)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> object:
+    plan = kernel_moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=1,
+        ispp=ispp,
+        fp8_scale_block_shape=(128, 128),
+        internal_activation_dtype="input",
+        hidden=6144,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+    )
+    _assert_moe_plan(plan, apply=apply, preprocessor=preprocessor)
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3693,7 +4844,7 @@ def _moe_apply_mxfp4_triton() -> object:
 
 
 def _moe_apply_unquant_triton() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3702,6 +4853,12 @@ def _moe_apply_unquant_triton() -> object:
         internal_activation_dtype="input",
         with_bias=False,
         solution="triton",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3712,7 +4869,7 @@ def _moe_apply_unquant_triton() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int64)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3723,13 +4880,19 @@ def _moe_apply_unquant_triton() -> object:
 
 
 def _moe_apply_mxfp4_gluon() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ispp=128,
         internal_activation_dtype="fp8",
         with_bias=True,
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3738,17 +4901,23 @@ def _moe_apply_mxfp4_gluon() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_mxint4_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxint4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=2,
         ispp=256,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3757,17 +4926,23 @@ def _moe_apply_mxint4_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_mxfp4_dynamic_tp() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=1,
         ispp=2048,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3776,7 +4951,7 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3809,7 +4984,79 @@ def _case(
 
 
 _CASES = [
+    # Only contiguous BF16 on GFX950 uses Gluon; other AMD inputs retain Triton.
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "gluon_hadamard_transform_128_gfx950",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-contiguous",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=False, dtype=torch.bfloat16),
+        id_suffix="bf16-strided-fallback",
+    ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "transform",
+            "hadamard_transform",
+            "triton_hadamard_transform_128",
+            partial(_hadamard_transform, contiguous=True, dtype=dtype),
+            id_suffix=f"{dtype}-fallback",
+        )
+        for dtype in (torch.float16, torch.float32)
+    ],
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-architecture-fallback",
+    ),
+    *[
+        _case(
+            _is_blackwell_sm100,
+            "blackwell-sm100",
+            "gemm",
+            "mm",
+            (
+                "triton_mm_fp8_blockscale"
+                if 17 <= m <= 32
+                else "flashinfer_mm_fp8_blockscale"
+            ),
+            partial(_mm_mxfp8, m),
+            id_suffix=f"fp8-rows-{m}",
+        )
+        for m in (16, 17, 24, 32, 33)
+    ],
     # Attention API x architecture golden cases.
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv41_index_topk",
+        "gluon_dsv41_index_topk_gfx950",
+        partial(_attention_dsv41_index_topk, 32, None, 68),
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv41_index_topk",
+        "gluon_dsv41_index_topk_gfx1250",
+        partial(_attention_dsv41_index_topk, 32, None, 68),
+    ),
     _case(
         _is_cdna4,
         "cdna4",
@@ -3833,7 +5080,7 @@ _CASES = [
         "cdna5",
         "attention",
         "dsv4_prefill_topk",
-        "triton_dsv4_prefill_topk_mxfp4",
+        "gluon_dsv4_prefill_topk_mxfp4_gfx1250",
         _attention_dsv4_prefill_topk_mxfp4,
         id_suffix="mxfp4",
     ),
@@ -3842,9 +5089,36 @@ _CASES = [
         "cdna5",
         "attention",
         "dsv4_decode_topk",
-        "triton_dsv4_decode_topk_mxfp4",
+        "gluon_dsv4_decode_topk_mxfp4_gfx1250",
         _attention_dsv4_decode_topk_mxfp4,
         id_suffix="mxfp4",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "gluon_dsv4_decode_gfx1250",
+        _attention_dsv4_paged_selected_pro_tp8,
+        id_suffix="pro-tp8",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "triton_dsv4_decode",
+        _attention_dsv4_paged_selected_pro_tp8_i64,
+        id_suffix="pro-tp8-int64-metadata",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_decode",
+        "gluon_dsv4_decode_gfx1250",
+        _attention_dsv4_paged_selected_swa_only,
+        id_suffix="swa-only",
     ),
     *[
         _case(
@@ -4052,7 +5326,25 @@ _CASES = [
         "cdna4",
         "attention",
         "dsv4_prefill",
-        "triton_dsv4_prefill",
+        "gluon_dsv4_prefill_gfx950",
+        _attention_dsv4_selected_short,
+        id_suffix="width128",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_prefill",
+        "gluon_dsv4_prefill_gfx1250",
+        partial(_attention_dsv4_selected, width=640, heads=16),
+        id_suffix="width640",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsv4_prefill",
+        "gluon_dsv4_prefill_gfx1250",
         _attention_dsv4_selected_short,
         id_suffix="width128",
     ),
@@ -4112,6 +5404,81 @@ _CASES = [
         "triton_mla_decode_with_kvcache",
         _attention_mla_decode_fp8q_unsupported_heads,
     ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_gfx950",
+        partial(_attention_mla_prefill, torch.bfloat16, 4, 1024, 1024, 16),
+        id_suffix="bf16",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_8wave_gfx950",
+        partial(_attention_mla_prefill, torch.float8_e4m3fn, 4, 1024, 1024, 16),
+        id_suffix="fp8-full-gpu",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_8wave_gfx950",
+        partial(_attention_mla_prefill, torch.float8_e5m2, 1, 128, 16384, 16),
+        id_suffix="fp8-long-keys",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_gfx950",
+        partial(_attention_mla_prefill, torch.float8_e4m3fn, 4, 256, 256, 16),
+        id_suffix="fp8-short-keys",
+    ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            "mla_prefill",
+            (
+                "gluon_mla_prefill_8wave_gfx950"
+                if kv_len >= 1024
+                else "gluon_mla_prefill_gfx950"
+            ),
+            partial(
+                _attention_mla_prefill, torch.float8_e4m3fn, batch, 256, kv_len, 12
+            ),
+            id_suffix=f"fp8-batch{batch}-kv{kv_len}",
+        )
+        for batch in (1, 3)
+        for kv_len in (513, 1023, 1024, 1025)
+    ],
+    # Ragged batches select on the average key length, including totals the
+    # batch size does not divide.
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            "mla_prefill",
+            expected,
+            partial(
+                _attention_mla_prefill_ragged, torch.float8_e4m3fn, 256, kv_lens, 12
+            ),
+            id_suffix=f"fp8-ragged-kv{'-'.join(map(str, kv_lens))}",
+        )
+        for kv_lens, expected in (
+            ((1023, 1024, 1024), "gluon_mla_prefill_gfx950"),
+            ((1024, 1024, 1025), "gluon_mla_prefill_8wave_gfx950"),
+            ((512, 1536, 1024), "gluon_mla_prefill_8wave_gfx950"),
+        )
+    ],
     _case(
         _is_cdna5,
         "cdna5",
@@ -4667,8 +6034,8 @@ _CASES = [
         "hopper",
         "gemm",
         "mm",
-        "deep_gemm_mm_fp8_blockscale",
-        _mm_mxfp8,
+        "triton_mm_fp8_blockscale",
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_blackwell_sm100,
@@ -4676,7 +6043,23 @@ _CASES = [
         "gemm",
         "mm",
         "flashinfer_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "gemm",
+        "mm",
+        "flashinfer_cute_dsl_mm_nvfp4",
+        partial(_mm_nvfp4, 4, 128, 64),
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "gemm",
+        "mm",
+        "flashinfer_cute_dsl_mm_nvfp4",
+        partial(_mm_nvfp4, 4, 128, 64),
     ),
     _case(
         _is_blackwell_plus,
@@ -4684,7 +6067,26 @@ _CASES = [
         "gemm",
         "mm",
         "cublaslt_mm_nvfp4",
-        _mm_nvfp4,
+        partial(_mm_nvfp4, _gemm_flashinfer.NVFP4_CUTE_DSL_MAX_M + 1, 128, 64),
+        id_suffix="past-cute-dsl-m",
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "gemm",
+        "mm",
+        "cublaslt_mm_nvfp4",
+        partial(_mm_nvfp4, 4, 132, 64),
+        id_suffix="n-not-8-aligned",
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "gemm",
+        "mm",
+        "cublaslt_mm_nvfp4",
+        partial(_mm_nvfp4, 4, 128, _gemm_flashinfer.NVFP4_CUTE_DSL_MAX_K // 2 + 16),
+        id_suffix="past-cute-dsl-k",
     ),
     _case(
         _is_blackwell_sm100,
@@ -4710,8 +6112,33 @@ _CASES = [
         "gemm",
         "mm",
         "triton_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
     ),
+    # DeepSeek V4.1 MXFP8 projections on gfx950: the weight-streaming decode
+    # kernel through 256 rows (ahead of the skinny kernel's 64-row range),
+    # the large-tile kernel beyond, and from 64 rows on for 2**26-element
+    # weights.
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "gemm",
+            "mm",
+            expected,
+            partial(_mm_mxfp8_ue8m0, m, n, k),
+            id_suffix=f"mxfp8-ue8m0-m{m}-n{n}-k{k}",
+        )
+        for m, n, k, expected in (
+            (1, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (64, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (65, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (192, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (256, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (257, 5120, 2048, "gluon_mm_mxfp8_gfx950"),
+            (65, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+            (256, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+        )
+    ],
     _case(
         _is_hopper_plus,
         "hopper-plus",
@@ -4725,9 +6152,9 @@ _CASES = [
         _is_supported_gpu,
         "supported-gpu",
         "quantization",
-        "fp8_quantize_dequantize",
-        "triton_fp8_quantize_dequantize",
-        _fp8_quantize_dequantize,
+        "fp8",
+        "triton_quantize_fp8_roundtrip",
+        _quantize_fp8,
     ),
     _case(
         _is_hopper,
@@ -4784,9 +6211,9 @@ _CASES = [
             _is_cdna5,
             "cdna5",
             "moe",
-            "dsv4_select_experts",
-            "triton_dsv4_select_experts",
-            partial(_dsv4_select_experts_bias, tokens=tokens),
+            "topk",
+            "triton_sqrt_softplus_topk",
+            partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens in (1, 2, 17)
@@ -4795,27 +6222,27 @@ _CASES = [
         _is_cdna5,
         "cdna5",
         "moe",
-        "dsv4_select_experts",
-        "triton_dsv4_select_experts",
-        _dsv4_select_experts_hash,
+        "topk",
+        "triton_sqrt_softplus_topk",
+        _moe_topk_hash,
         id_suffix="hash",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "dsv4_select_experts",
-        "cuda_dsv4_select_experts",
-        partial(_dsv4_select_experts_bias, tokens=2),
+        "topk",
+        "cuda_sqrt_softplus_topk",
+        partial(_moe_topk_bias, tokens=2),
         id_suffix="bias",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "dsv4_select_experts",
-        "cuda_dsv4_select_experts",
-        _dsv4_select_experts_hash,
+        "topk",
+        "cuda_sqrt_softplus_topk",
+        _moe_topk_hash,
         id_suffix="hash",
     ),
     *[
@@ -4823,15 +6250,15 @@ _CASES = [
             _is_cdna4,
             "cdna4",
             "moe",
-            "dsv4_select_experts",
+            "topk",
             expected,
-            partial(_dsv4_select_experts_bias, tokens=tokens),
+            partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens, expected in (
-            (1, "gluon_dsv4_select_experts_gfx950"),
-            (2, "gluon_dsv4_select_experts_gfx950"),
-            (17, "triton_dsv4_select_experts"),
+            (1, "gluon_sqrt_softplus_topk_gfx950"),
+            (2, "gluon_sqrt_softplus_topk_gfx950"),
+            (17, "triton_sqrt_softplus_topk"),
         )
     ],
     _case(
@@ -4849,6 +6276,67 @@ _CASES = [
         "apply",
         "flashinfer_cutlass_fp8_moe_apply",
         _moe_apply_fp8_cutlass,
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "flashinfer_cutlass_mxfp4_w4a16_moe_apply",
+        _moe_apply_mxfp4_cutlass_w4a16,
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "flashinfer_cutlass_mxfp4_w4a8_moe_apply",
+        _moe_apply_mxfp4_cutlass_w4a8,
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "marlin_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_marlin_explicit,
+        id_suffix="explicit",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "marlin_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_situ_auto,
+        id_suffix="situ-auto",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "marlin_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_misaligned_hidden_auto,
+        id_suffix="misaligned-hidden-auto",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "triton_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_generalized_swiglu_auto,
+        id_suffix="generalized-swiglu-auto",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "moe",
+        "apply",
+        "marlin_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_zero_experts_auto,
+        id_suffix="zero-experts-auto",
     ),
     _case(
         _is_blackwell_sm100,
@@ -4951,8 +6439,33 @@ _CASES = [
         "cdna4",
         "residual",
         "mhc_post",
-        "triton_mhc_post",
+        "gluon_mhc_post_gfx950",
         _mhc_post,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_mixes",
+        "gluon_mhc_mixes_gfx950",
+        _mhc_mixes,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre_fused_norm,
+        id_suffix="fused_norm",
     ),
     _case(
         _is_cdna4,
@@ -4985,6 +6498,39 @@ _CASES = [
         "apply",
         "gluon_mxfp4_dynamic_moe_apply",
         _moe_apply_mxfp4_dynamic_tp,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "moe",
+        "apply",
+        "triton_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block, 256, "triton_fp8_block_precomputed_moe_apply", None
+        ),
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block, 256, "triton_fp8_block_precomputed_moe_apply", None
+        ),
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "gluon_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block,
+            512,
+            "gluon_fp8_block_precomputed_moe_apply",
+            "gluon_fp8_moe_weights",
+        ),
     ),
 ]
 
@@ -5023,6 +6569,23 @@ def selected_kernel_spy(monkeypatch):
                 )
             if case.mode == "dsa_plan":
                 return torch.empty((1, 4), dtype=torch.int32)
+            if case.mode == "dsv41_index_topk":
+                index_q = args[0]
+                topk = args[6]
+                candidate_topk = args[7]
+                tokens = index_q.shape[0]
+                return (
+                    torch.empty(
+                        (tokens, topk), dtype=torch.int32, device=index_q.device
+                    ),
+                    torch.empty((tokens,), dtype=torch.int32, device=index_q.device),
+                    torch.empty(
+                        (tokens, candidate_topk),
+                        dtype=torch.int32,
+                        device=index_q.device,
+                    ),
+                    torch.empty((tokens,), dtype=torch.int32, device=index_q.device),
+                )
             if case.mode in {"dsv4_prefill_topk", "dsv4_decode_topk"}:
                 q_values, _ = kwargs["index_q"]
                 indices = torch.empty(
@@ -5059,8 +6622,11 @@ def selected_kernel_spy(monkeypatch):
                 (logits.shape[0],), dtype=torch.int64, device=logits.device
             )
 
+        if case.family == "transform":
+            return torch.empty_like(args[0])
+
         if case.family == "moe":
-            if case.mode == "dsv4_select_experts":
+            if case.mode == "topk":
                 router_logits, top_k = args[:2]
                 shape = (router_logits.shape[0], top_k)
                 return (
@@ -5159,9 +6725,9 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
     try:
         Platform.override(b200_platform)
         KernelRegistry.reset()
-        importlib.reload(_moe_trtllm_fp8)
+        importlib.reload(_moe_flashinfer)
 
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "fp8",
             input_dtype=torch.bfloat16,
             activation="swiglu",
@@ -5170,6 +6736,12 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
             ispp=2048,
             fp8_scale_block_shape=(128, 128),
             internal_activation_dtype="input",
+            hidden=None,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
         )
 
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")
@@ -5178,6 +6750,206 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
     finally:
         Platform.override(real_platform)
         KernelRegistry._instance = real_registry
+
+
+def test_cutlass_fp8_weights_attach_swiglu_tensors() -> None:
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer cutlass MoE is registered only on NVIDIA")
+    from tokenspeed_kernel.ops.moe.flashinfer import (
+        flashinfer_cutlass_fp8_moe_weights,
+    )
+
+    def _fp8_arange(shape: tuple[int, ...]) -> torch.Tensor:
+        size = 1
+        for dim in shape:
+            size *= dim
+        return (
+            torch.arange(size, dtype=torch.int64)
+            .remainder(120)
+            .to(torch.uint8)
+            .reshape(shape)
+            .view(torch.float8_e4m3fn)
+        )
+
+    def _weights(
+        w13: torch.Tensor, w2: torch.Tensor, s13: torch.Tensor, s2: torch.Tensor
+    ) -> torch.nn.Module:
+        weights = torch.nn.Module()
+        weights.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
+        weights.w2_weight = torch.nn.Parameter(w2.clone(), requires_grad=False)
+        weights.w13_weight_scale_inv = torch.nn.Parameter(
+            s13.clone(), requires_grad=False
+        )
+        weights.w2_weight_scale_inv = torch.nn.Parameter(
+            s2.clone(), requires_grad=False
+        )
+        return weights
+
+    num_experts, hidden, ispp = 2, 128, 128
+    w13 = _fp8_arange((num_experts, 2 * ispp, hidden))
+    w2 = _fp8_arange((num_experts, hidden, ispp))
+    s13 = torch.rand((num_experts, 2 * ispp // 128, hidden // 128), dtype=torch.float32)
+    s2 = torch.rand((num_experts, hidden // 128, ispp // 128), dtype=torch.float32)
+
+    weights = _weights(w13, w2, s13, s2)
+    weights.swiglu_arg = SimpleNamespace(alpha=None, limit=7.0)
+    weights.swiglu_beta = 0.5
+    flashinfer_cutlass_fp8_moe_weights({}, weights)
+
+    expected_w13 = torch.cat((w13[:, ispp:], w13[:, :ispp]), dim=1)
+    expected_s13 = torch.cat((s13[:, 1:], s13[:, :1]), dim=1).clamp(min=1e-10)
+    assert torch.equal(
+        weights.w13_weight.view(torch.uint8), expected_w13.view(torch.uint8)
+    )
+    torch.testing.assert_close(weights.w13_weight_scale_inv, expected_s13)
+    torch.testing.assert_close(weights.w2_weight_scale_inv, s2.clamp(min=1e-10))
+    assert weights.swiglu_alpha_t is None
+    torch.testing.assert_close(
+        weights.swiglu_beta_t, torch.full((num_experts,), 0.5, dtype=torch.float32)
+    )
+    torch.testing.assert_close(
+        weights.swiglu_limit_t, torch.full((num_experts,), 7.0, dtype=torch.float32)
+    )
+
+    weights = _weights(w13, w2, s13, s2)
+    weights.swiglu_arg = SimpleNamespace(alpha=None, limit=None)
+    flashinfer_cutlass_fp8_moe_weights({}, weights)
+    assert weights.swiglu_alpha_t is None
+    assert weights.swiglu_beta_t is None
+    assert weights.swiglu_limit_t is None
+
+
+def _mxfp4_loader_weights(
+    num_experts: int, hidden: int, ispp: int, seed: int
+) -> torch.nn.Module:
+    """Loader-format MXFP4 experts: uint8 codes and raw E8M0 bytes, [gate; up]."""
+    generator = torch.Generator().manual_seed(seed)
+
+    def _bytes(*shape: int) -> torch.Tensor:
+        return torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+
+    weights = torch.nn.Module()
+    weights.w13_weight = torch.nn.Parameter(
+        _bytes(num_experts, 2 * ispp, hidden // 2), requires_grad=False
+    )
+    weights.w13_weight_scale = torch.nn.Parameter(
+        _bytes(num_experts, 2 * ispp, hidden // 32), requires_grad=False
+    )
+    weights.w2_weight = torch.nn.Parameter(
+        _bytes(num_experts, hidden, ispp // 2), requires_grad=False
+    )
+    weights.w2_weight_scale = torch.nn.Parameter(
+        _bytes(num_experts, hidden, ispp // 32), requires_grad=False
+    )
+    weights.swiglu_arg = SimpleNamespace(alpha=None, limit=10.0)
+    weights.swiglu_beta = None
+    weights.w13_input_layout = "concatenated"
+    return weights
+
+
+def test_cutlass_mxfp4_weights_interleave_and_attach(monkeypatch) -> None:
+    """The preprocessors hand FlashInfer [up; gate] rows and attach the epilogue tensors.
+
+    FlashInfer's SM90 interleavers are replaced by recording fakes: the layout
+    contract is what this test pins, the kernels' own numerics are covered by
+    the GPU test.
+    """
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer cutlass MoE is registered only on NVIDIA")
+    module = _moe_flashinfer
+    calls: list[tuple] = []
+
+    def fake_weights(w: torch.Tensor, dtype: str) -> torch.Tensor:
+        calls.append(("weights", w.clone(), dtype))
+        return w + 1
+
+    def fake_scales(s: torch.Tensor, group_size: int) -> torch.Tensor:
+        calls.append(("scales", s.clone(), group_size))
+        return s + 1
+
+    def fake_humming(w: torch.Tensor, s: torch.Tensor):
+        calls.append(("humming", w.clone(), s.clone()))
+        return w + 1, s + 1, torch.full(w.shape[:1], 0.5, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        module, "interleave_moe_weights_for_sm90_mixed_gemm", fake_weights
+    )
+    monkeypatch.setattr(
+        module, "interleave_moe_scales_for_sm90_mixed_gemm", fake_scales
+    )
+    monkeypatch.setattr(
+        module, "preprocess_moe_weights_for_sm90_mixed_gemm_humming", fake_humming
+    )
+    num_experts, hidden, ispp = 2, 256, 128
+    weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
+    w13, s13 = weights.w13_weight.data.clone(), weights.w13_weight_scale.data.clone()
+    w2, s2 = weights.w2_weight.data.clone(), weights.w2_weight_scale.data.clone()
+    up_gate_w13 = torch.cat((w13[:, ispp:], w13[:, :ispp]), dim=1)
+    up_gate_s13 = torch.cat((s13[:, ispp:], s13[:, :ispp]), dim=1)
+
+    module.flashinfer_cutlass_mxfp4_w4a16_moe_weights({}, weights)
+    assert [c[0] for c in calls] == ["weights", "scales", "weights", "scales"]
+    assert torch.equal(calls[0][1], up_gate_w13) and calls[0][2] == "fp4"
+    assert torch.equal(calls[1][1], up_gate_s13) and calls[1][2] == 32
+    assert torch.equal(calls[2][1], w2) and torch.equal(calls[3][1], s2)
+    assert torch.equal(weights.w13_weight.data, up_gate_w13 + 1)
+    assert torch.equal(weights.w2_weight.data, w2 + 1)
+    assert weights.w13_weight_scale.dtype == torch.int32
+    assert weights.w13_weight_scale.shape == (num_experts, 2 * ispp, hidden // 128)
+    assert weights.w2_weight_scale.dtype == torch.int32
+    assert weights.w2_weight_scale.shape == (num_experts, hidden, ispp // 128)
+    torch.testing.assert_close(
+        weights.swiglu_limit_t, torch.full((num_experts,), 10.0, dtype=torch.float32)
+    )
+    # Idempotent for the same layout; the other layout cannot follow.
+    module.flashinfer_cutlass_mxfp4_w4a16_moe_weights({}, weights)
+    assert len(calls) == 4
+    with pytest.raises(ValueError, match="already interleaved"):
+        module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
+
+    calls.clear()
+    # W4A8's fixed FC2 activation scale is only sound under the clamp: an
+    # unclamped layer is refused before any layout is touched.
+    weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
+    weights.swiglu_arg = SimpleNamespace(alpha=None, limit=None)
+    with pytest.raises(ValueError, match="SwiGLU clamp"):
+        module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
+    assert not calls
+    weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
+    module.flashinfer_cutlass_mxfp4_w4a8_moe_weights({}, weights)
+    assert [c[0] for c in calls] == ["humming", "humming"]
+    assert torch.equal(calls[0][1], up_gate_w13) and torch.equal(
+        calls[0][2], up_gate_s13
+    )
+    assert torch.equal(calls[1][1], w2) and torch.equal(calls[1][2], s2)
+    torch.testing.assert_close(
+        weights.swiglu_limit_t, torch.full((num_experts,), 10.0, dtype=torch.float32)
+    )
+    # Humming residuals carry FlashInfer's fixed 2^6 exponent compensation.
+    torch.testing.assert_close(
+        weights.w13_weight_residual, torch.full((num_experts,), 32.0)
+    )
+    torch.testing.assert_close(
+        weights.w2_weight_residual, torch.full((num_experts,), 32.0)
+    )
+    assert weights.fc2_act_scale.item() == 1.0 and weights.fc2_act_scale.ndim == 0
+
+    # Rejections: non-standard SwiGLU knobs, interleaved gate/up rows, and an
+    # FFN width whose E8M0 scales do not pack into int32.
+    for attrs, match in (
+        ({"swiglu_arg": SimpleNamespace(alpha=1.702, limit=7.0)}, "standard SwiGLU"),
+        ({"swiglu_beta": 1.0}, "standard SwiGLU"),
+        ({"w13_input_layout": "interleaved"}, "concatenated"),
+    ):
+        weights = _mxfp4_loader_weights(num_experts, hidden, ispp, seed=3)
+        for name, value in attrs.items():
+            setattr(weights, name, value)
+        with pytest.raises(ValueError, match=match):
+            module.flashinfer_cutlass_mxfp4_w4a16_moe_weights({}, weights)
+    with pytest.raises(ValueError, match="ispp%128"):
+        module.flashinfer_cutlass_mxfp4_w4a16_moe_weights(
+            {}, _mxfp4_loader_weights(num_experts, hidden, 96, seed=3)
+        )
 
 
 def test_b300_rel_decode_registration_and_selection(
@@ -5308,17 +7080,17 @@ def test_gluon_dsa_prefill_fp8_dense_traits(
     if spec is None:
         pytest.skip("gfx950 Gluon DSA registration is unavailable")
     traits = {
-        "page_size": 64,
-        "q_len_per_req": 1,
+        "q_len": 1,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "page_size": 64,
         "topk": 2051,
-        "kv_cache_available": True,
-        "sparse_kv_cache_available": False,
-        "topk_layout": "global_slots",
-        "support_logit_cap": False,
+        "has_kv_cache": True,
+        "has_sparse_kv_cache": False,
+        "logit_cap": False,
         "return_lse": False,
+        "topk_layout": "global_slots",
     }
     assert spec_matches_traits(spec, traits) is matches
 
@@ -5340,7 +7112,7 @@ _GLUON_MLA_FIXED_KERNELS = (
         pytest.param("batch_size", 16, False, id="batch16"),
         pytest.param("value_head_dim", 64, False, id="unsupported-value"),
         pytest.param("page_size", 128, False, id="unsupported-page"),
-        pytest.param("support_logit_cap", True, False, id="unsupported-logit-cap"),
+        pytest.param("logit_cap", True, False, id="unsupported-logit-cap"),
     ],
 )
 def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
@@ -5355,12 +7127,12 @@ def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
         "batch_size": 1,
         "q_len": 1,
         "num_q_heads": 12,
-        "page_size": 64,
+        "value_head_dim": 128,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "value_head_dim": 128,
+        "page_size": 64,
         "gate_kind": "sigmoid",
-        "support_logit_cap": False,
+        "logit_cap": False,
     }
     traits[trait] = value
     assert spec_matches_traits(spec, traits) is matches
@@ -5383,9 +7155,9 @@ def test_gluon_mla_project_value_gfx1250_batch_traits(
         pytest.skip("gfx1250 Gluon MLA projection registration is unavailable")
     traits = {
         "batch_size": batch_size,
-        "num_heads": 12,
-        "latent_dim": 512,
-        "value_dim": 128,
+        "num_q_heads": 12,
+        "value_head_dim": 128,
+        "kv_lora_rank": 512,
         "gate_kind": "sigmoid",
         "inputs_contiguous": True,
     }
@@ -5419,10 +7191,15 @@ def test_gluon_mla_fixed_entrypoints_are_registered(name: str) -> None:
             frozenset({2, 4}),
             id="bh64-small",
         ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+            frozenset({64, 128}),
+            id="bh64",
+        ),
     ],
 )
-@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
-def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64, 96, 128])
+def test_gluon_mla_batch_registrations_have_disjoint_traits(
     name: str,
     expected_batches: frozenset[int],
     batch: int,
@@ -5431,16 +7208,18 @@ def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
 
     traits = {
         "batch_size": batch,
-        "batch_size_div_64": batch % 64 == 0,
         "q_len": 1,
         "num_q_heads": 64,
-        "page_size": 64,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "support_logit_cap": False,
+        "page_size": 64,
+        "logit_cap": False,
         "return_lse": False,
     }
-    assert spec_matches_traits(spec, traits) is (batch in expected_batches)
+    matches = spec_matches_traits(spec, traits) and spec_matches_shape_traits(
+        spec, traits
+    )
+    assert matches is (batch in expected_batches)
 
 
 @pytest.mark.parametrize(
@@ -5496,6 +7275,86 @@ def test_gluon_mla_fixed_regime_auto_selection(
         registry.clear_cache()
 
     assert calls == [expected]
+
+
+@pytest.mark.parametrize("platform_fixture", ["mi350_platform", "mi450_platform"])
+@pytest.mark.parametrize(("heads", "shards"), [(64, 1), (16, 4), (8, 4)])
+def test_dsv41_index_topk_unsupported_gluon_geometry_selects_triton(
+    platform_fixture, heads, shards, request, monkeypatch, selected_kernel_spy
+):
+    platform = request.getfixturevalue(platform_fixture)
+    group = object() if shards > 1 else None
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: shards)
+    case = _case(
+        lambda platform: platform.is_amd,
+        "cdna4",
+        "attention",
+        "dsv41_index_topk",
+        "triton_dsv41_index_topk",
+        partial(_attention_dsv41_index_topk, heads, group, 68),
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        case.invoke()
+        assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+@pytest.mark.parametrize("platform_fixture", ["mi350_platform", "mi450_platform"])
+def test_dsv41_index_topk_fp8_rows_select_triton(
+    platform_fixture, request, selected_kernel_spy
+):
+    platform = request.getfixturevalue(platform_fixture)
+    case = _case(
+        lambda platform: platform.is_amd,
+        "cdna4",
+        "attention",
+        "dsv41_index_topk",
+        "triton_dsv41_index_topk",
+        partial(_attention_dsv41_index_topk, 32, None, 132),
+    )
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        case.invoke()
+        assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+# Capture host-available registrations before the fixture clears them. CI runs
+# this guard on each vendor; explicit DSV4.1 module checks also run across vendors.
+_CASE_REGISTRATION_MODULES = {
+    case.expected: impl.__module__
+    for case in _CASES
+    if (impl := KernelRegistry.get().get_impl(case.expected)) is not None
+}
+
+
+def test_selection_fixture_reloads_available_case_registrations():
+    assert _attention_gluon_dsv41 in _RELOAD_MODULES
+    assert _attention_triton_dsv41 in _RELOAD_MODULES
+    registry = KernelRegistry.get()
+    missing = {
+        name: module
+        for name, module in _CASE_REGISTRATION_MODULES.items()
+        if registry.get_impl(name) is None
+    }
+    assert (
+        not missing
+    ), f"Add registration modules to _RELOAD_MODULES for missing cases: {missing}"
 
 
 _CASE_PLATFORM_PARAMS = [

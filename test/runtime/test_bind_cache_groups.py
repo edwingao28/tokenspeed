@@ -34,12 +34,11 @@ FULL = "full_attention"
 SWA = "sliding_attention"
 
 
-def _spec(group_id, retention, sliding_window_tokens):
+def _spec(group_id, attn_kind, sliding_window_tokens):
     return SimpleNamespace(
         group_id=group_id,
-        retention=retention,
+        attn_kind=attn_kind,
         sliding_window_tokens=sliding_window_tokens,
-        family="history",
     )
 
 
@@ -58,6 +57,8 @@ def _layer(layer_id, sliding_window_size):
         num_kv_heads=1,
         layer_id=layer_id,
         sliding_window_size=sliding_window_size,
+        rotary_emb=None,
+        qk_norm=None,
     )
 
 
@@ -121,7 +122,7 @@ class BindCacheGroupsTest(unittest.TestCase):
         model = _Model(
             _layer(0, sliding_window_size=-1), _layer(3, sliding_window_size=-1)
         )
-        with self.assertRaisesRegex(ValueError, r"layer_id=3.*no history-family"):
+        with self.assertRaisesRegex(ValueError, r"layer_id=3.*no history cache group"):
             bind_cache_groups(
                 model, _pool({0: FULL}, (_spec(FULL, "full_history", None),))
             )

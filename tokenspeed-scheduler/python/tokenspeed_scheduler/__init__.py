@@ -22,14 +22,16 @@
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
+    AbortReason,
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     CacheTransferPolicy,
+    CapacityModel,
     ExecutionEvent,
     ExecutionPlan,
     RequestSpec,
     Scheduler,
+    SchedulerAbort,
     SchedulerConfig,
 )
 
@@ -49,6 +51,7 @@ def _forward_batch_repr(self):
         f"input_ids={list(self.input_ids)}, "
         f"shifted_input_ids={list(self.shifted_input_ids)}, "
         f"extend_prefix_lens={list(self.extend_prefix_lens)}, "
+        f"extend_replay_lens={list(self.extend_replay_lens)}, "
         f"num_extends={self.num_extends()}"
         f")"
     )
@@ -61,12 +64,14 @@ __all__ = [
     "Scheduler",
     "SchedulerConfig",
     "RequestSpec",
-    "CacheRetention",
+    "AttnKind",
     "CacheGroupConfig",
-    "CacheGroupFamily",
     "CacheTransferPolicy",
+    "CapacityModel",
     # Execution plan & operations
     "ExecutionPlan",
+    "SchedulerAbort",
+    "AbortReason",
     "Forward",
     "PD",
     "Cache",

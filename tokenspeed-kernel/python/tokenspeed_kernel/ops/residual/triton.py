@@ -28,7 +28,6 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import (
-    ArchVersion,
     CapabilityRequirement,
     current_platform,
     pdl_enabled,
@@ -69,6 +68,7 @@ def _projection_epilogue_kernel(
     down_mask = offsets < LOWRANK
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     value = tl.load(
         projected_ptr + row * projected_row_stride + offsets,
         mask=down_mask,
@@ -93,8 +93,6 @@ def _projection_epilogue_kernel(
             inject * projection_scale,
             mask=inject_mask,
         )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -115,6 +113,7 @@ def _mix_epilogue_kernel(
     mask = offsets < hidden_size
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     mixed = tl.zeros([BLOCK], dtype=tl.float32)
     for branch in tl.static_range(HC_COUNT):
         column = branch * hidden_size + offsets
@@ -128,8 +127,6 @@ def _mix_epilogue_kernel(
         ).to(tl.float32)
         mixed += tl.sigmoid(gate) * value
     tl.store(out_ptr + row * out_row_stride + offsets, mixed / HC_COUNT, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -251,7 +248,6 @@ def _launch_mix_epilogue(
     solution="triton",
     signatures=_MIX_SIGNATURES,
     priority=Priority.PERFORMANT,
-    tags={"determinism", "portability", "throughput"},
 )
 def triton_hyperconnection_mix(
     normalized: torch.Tensor,
@@ -260,11 +256,14 @@ def triton_hyperconnection_mix(
     hc_count: int,
     hidden_size: int,
     lowrank: int,
+    projection_rows: int,
     projection_scale: float,
     weights_independent: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """GEMM plus Triton-epilogue path for general decode and prefill shapes."""
-    projected = F.linear(normalized, projection_weight)
+    # Model loading aligns BF16/FP16 GEMM output widths; discard only the
+    # extra output columns, preserving the GEMM's aligned row stride.
+    projected = F.linear(normalized, projection_weight)[:, :projection_rows]
     activated, inject = _launch_projection_epilogue(
         projected, lowrank, hc_count, projection_scale
     )
@@ -279,7 +278,6 @@ def triton_hyperconnection_mix(
     solution="triton",
     signatures=_COMBINE_SIGNATURES,
     priority=Priority.PERFORMANT,
-    tags={"determinism", "portability"},
 )
 def triton_hyperconnection_combine(
     block_output: torch.Tensor,
@@ -324,14 +322,35 @@ def triton_hyperconnection_combine(
 
 
 @cache
-def _compute_num_split(
+def compute_mhc_num_splits(
     device: torch.device, block_k: int, k: int | None, grid_size: int
 ) -> int:
+    """Split-K count for the mHC prenorm GEMM.
+
+    The count that fills the SMs once is rounded down to a power of two, then
+    capped at a quarter of the K tiles. The split count is a DeepGEMM
+    template argument, so every new value is a JIT compilation on the
+    forward thread: the rounding keeps the batch-dependent part to a few
+    values, and the cap only depends on the model. The cap is applied
+    exactly because the GFX950 pre-reduce-apply kernel requires
+    ``hidden_size // 64`` splits. Callers that warm DeepGEMM must use this
+    same count.
+
+    Args:
+        device: CUDA device whose SM count bounds the split.
+        block_k: K tile size of the GEMM.
+        k: GEMM reduction size (``hc_mult * hidden_size``), or ``None`` to
+            skip the K-tile cap.
+        grid_size: Token tiles the GEMM launches without splitting.
+
+    Returns:
+        The split count, at least 1.
+    """
     device_props = torch.cuda.get_device_properties(device)
-    split_k = device_props.multi_processor_count // grid_size
+    fill = max(device_props.multi_processor_count // grid_size, 1)
+    split_k = 1 << (fill.bit_length() - 1)
     if k is not None:
-        num_block_k = triton.cdiv(k, block_k)
-        split_k = min(split_k, num_block_k // 4)
+        split_k = min(split_k, triton.cdiv(k, block_k) // 4)
     return max(split_k, 1)
 
 
@@ -373,7 +392,9 @@ def _mhc_prenorm_gemm_triton_kernel(
     num_tokens,
     K: tl.constexpr,
     N: tl.constexpr,
-    SPLIT_K: tl.constexpr,
+    # Derived from the per-batch split count; runtime so every batch shape
+    # shares one binary.
+    SPLIT_K,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -471,10 +492,12 @@ def _load_reduced_mix(
     mix_id: tl.constexpr,
     num_tokens,
     hc_mult3: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
 ):
     value = tl.full((), 0.0, tl.float32)
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         offset = split_id * num_tokens * hc_mult3 + token_id * hc_mult3 + mix_id
         value += tl.load(gemm_out_mul + offset)
     return value
@@ -493,7 +516,9 @@ def _mhc_pre_mix_triton_kernel(
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
     sinkhorn_iters: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
     hc_mult: tl.constexpr,
     hc_mult2: tl.constexpr,
     hc_mult3: tl.constexpr,
@@ -503,7 +528,7 @@ def _mhc_pre_mix_triton_kernel(
     token_id = tl.program_id(0)
 
     rms_sum = tl.full((), 0.0, tl.float32)
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         rms_sum += tl.load(gemm_out_sqrsum + split_id * num_tokens + token_id)
     rms = tl.rsqrt(rms_sum / (hc_mult * hidden_size) + rms_eps)
 
@@ -540,7 +565,7 @@ def _mhc_pre_mix_triton_kernel(
     comb_mask = comb_offsets < hc_mult2
     comb_scale = tl.load(hc_scale + 2)
     comb_mix_values = tl.zeros((block_comb,), tl.float32)
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         split_base = split_id * num_tokens * hc_mult3 + token_id * hc_mult3
         comb_mix_values += tl.load(
             gemm_out_mul + split_base + hc_mult * 2 + comb_offsets,
@@ -785,7 +810,7 @@ def _mhc_pre_impl(
             ),
         )
 
-    n_splits = _compute_num_split(
+    n_splits = compute_mhc_num_splits(
         residual.device,
         64,
         hc_hidden_size,
@@ -1020,7 +1045,6 @@ def _tiled_mhc_pre_hc4(
         }
     ),
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_mhc_pre(
     residual: torch.Tensor,
@@ -1083,7 +1107,6 @@ def triton_mhc_pre(
         }
     ),
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_mhc_post(
     hidden_states: torch.Tensor,
@@ -1291,7 +1314,9 @@ def _mhc_pre_mix_hc4_kernel(
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
     sinkhorn_iters: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
     num_tokens,
 ):
     token_id = tl.program_id(0)
@@ -1301,7 +1326,7 @@ def _mhc_pre_mix_hc4_kernel(
     comb_values = tl.zeros((16,), tl.float32)
     rms_sum = tl.full((), 0.0, tl.float32)
 
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         split_base = split_id * num_tokens * 24 + token_id * 24
         pre_post_values += tl.load(gemm_out_mul + split_base + pre_post_offsets)
         comb_values += tl.load(gemm_out_mul + split_base + 8 + comb_offsets)
@@ -1414,7 +1439,9 @@ def _mhc_pre_only_hc4_kernel(
     hidden_size: tl.constexpr,
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
     num_tokens,
 ):
     token_id = tl.program_id(0)
@@ -1422,7 +1449,7 @@ def _mhc_pre_only_hc4_kernel(
     pre_values = tl.zeros((4,), tl.float32)
     rms_sum = tl.full((), 0.0, tl.float32)
 
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         split_base = split_id * num_tokens * 24 + token_id * 24
         pre_values += tl.load(gemm_out_mul + split_base + pre_offsets)
         rms_sum += tl.load(gemm_out_sqrsum + split_id * num_tokens + token_id)
@@ -1494,7 +1521,9 @@ def _mhc_post_comb_hc4_kernel(
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
     sinkhorn_iters: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
     num_tokens,
 ):
     token_id = tl.program_id(0)
@@ -1504,7 +1533,7 @@ def _mhc_post_comb_hc4_kernel(
     comb_values = tl.zeros((16,), tl.float32)
     rms_sum = tl.full((), 0.0, tl.float32)
 
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         split_base = split_id * num_tokens * 24 + token_id * 24
         post_values += tl.load(gemm_out_mul + split_base + 4 + post_offsets)
         comb_values += tl.load(gemm_out_mul + split_base + 8 + comb_offsets)
@@ -1699,132 +1728,11 @@ def _mhc_prefill_config_hc4(num_tokens: int) -> tuple[int, int, int]:
     return 1, 64, 256
 
 
-def fused_mhc_prefill_hc4(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_weight: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the tiled hc=4 mHC prefill path with fused output RMSNorm.
-
-    Args:
-        residual: Contiguous BF16 residual streams shaped ``[T, 4, H]``.
-        fn: Contiguous FP32 projection weights shaped ``[24, 4 * H]``.
-        hc_scale: Contiguous FP32 pre, post, and combination scales shaped
-            ``[3]``.
-        hc_base: Contiguous FP32 projection bias shaped ``[24]``.
-        norm_weight: Contiguous BF16 or FP32 RMSNorm weight shaped ``[H]``.
-        rms_eps: Epsilon used by the pre-projection RMS normalization.
-        hc_eps: Epsilon used by the mHC mapping transforms.
-        sinkhorn_iters: Number of row/column Sinkhorn normalization rounds.
-        norm_eps: Epsilon used by the output RMSNorm.
-
-    Returns:
-        A tuple of BF16 normalized layer input ``[T, H]``, FP32 post
-        coefficients ``[T, 4, 1]``, and FP32 combination coefficients
-        ``[T, 4, 4]``.
-    """
-    if residual.ndim != 3 or residual.shape[1] != 4:
-        raise ValueError("fused_mhc_prefill_hc4 requires residual shaped [T, 4, H]")
-    if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
-        raise ValueError(
-            "fused_mhc_prefill_hc4 requires BF16 residual and FP32 weights"
-        )
-    if hc_scale.dtype != torch.float32 or hc_base.dtype != torch.float32:
-        raise ValueError("fused_mhc_prefill_hc4 requires FP32 scales and biases")
-    if norm_weight.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("fused_mhc_prefill_hc4 requires BF16 or FP32 norm weight")
-    tensors = (residual, fn, hc_scale, hc_base, norm_weight)
-    if not all(tensor.is_cuda for tensor in tensors):
-        raise ValueError("fused_mhc_prefill_hc4 requires CUDA tensors")
-    if not all(tensor.device == residual.device for tensor in tensors):
-        raise ValueError("fused_mhc_prefill_hc4 tensors must share one device")
-    if not all(tensor.is_contiguous() for tensor in tensors):
-        raise ValueError("fused_mhc_prefill_hc4 tensors must be contiguous")
-    if sinkhorn_iters < 1:
-        raise ValueError("sinkhorn_iters must be positive")
-
-    num_tokens, _, hidden_size = residual.shape
-    if hidden_size < 1:
-        raise ValueError("hidden size must be positive")
-    if fn.shape != (24, 4 * hidden_size):
-        raise ValueError(
-            f"fn shape mismatch: expected {(24, 4 * hidden_size)}, "
-            f"got {tuple(fn.shape)}"
-        )
-    if hc_scale.shape != (3,) or hc_base.shape != (24,):
-        raise ValueError("hc_scale and hc_base must have shapes [3] and [24]")
-    if norm_weight.shape != (hidden_size,):
-        raise ValueError(
-            f"norm_weight shape mismatch: expected {(hidden_size,)}, "
-            f"got {tuple(norm_weight.shape)}"
-        )
-    if num_tokens == 0:
-        return (
-            residual.new_empty(0, hidden_size),
-            torch.empty(0, 4, 1, device=residual.device, dtype=torch.float32),
-            torch.empty(0, 4, 4, device=residual.device, dtype=torch.float32),
-        )
-
-    n_splits, block_m, block_k = _mhc_prefill_config_hc4(num_tokens)
-    n_splits = min(n_splits, triton.cdiv(4 * hidden_size, block_k))
-    projection = torch.empty(
-        n_splits, num_tokens, 24, device=residual.device, dtype=torch.float32
-    )
-    square_sum = torch.empty(
-        n_splits, num_tokens, device=residual.device, dtype=torch.float32
-    )
-    pre_mix = torch.empty(num_tokens, 4, device=residual.device, dtype=torch.float32)
-    post_mix = torch.empty_like(pre_mix)
-    comb_mix = torch.empty(num_tokens, 16, device=residual.device, dtype=torch.float32)
-    layer_input = torch.empty(
-        num_tokens, hidden_size, device=residual.device, dtype=torch.bfloat16
-    )
-
-    mhc_prefill_project_hc4(
-        residual,
-        fn,
-        projection,
-        square_sum,
-        n_splits=n_splits,
-        block_m=block_m,
-        block_k=block_k,
-    )
-    mhc_pre_mix_hc4(
-        projection,
-        square_sum,
-        hc_scale,
-        hc_base,
-        pre_mix,
-        post_mix,
-        comb_mix,
-        hidden_size=hidden_size,
-        rms_eps=rms_eps,
-        hc_eps=hc_eps,
-        sinkhorn_iters=sinkhorn_iters,
-        n_splits=n_splits,
-        num_tokens=num_tokens,
-    )
-    mhc_pre_layer_norm_hc4(
-        pre_mix,
-        residual,
-        norm_weight,
-        layer_input,
-        eps=norm_eps,
-    )
-    return layer_input, post_mix.unsqueeze(-1), comb_mix.view(num_tokens, 4, 4)
-
-
 def _mhc_mixes_impl(
     residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters, prenorm_gemm
 ):
     tokens, _, hidden = residual.shape
-    splits = _compute_num_split(
+    splits = compute_mhc_num_splits(
         residual.device, 64, 4 * hidden, max(1, triton.cdiv(tokens, 64))
     )
     projection = torch.empty(
@@ -1899,6 +1807,37 @@ def mhc_apply_pre(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
             num_warps=4,
             enable_fp_fusion=False,
         )
+    return out
+
+
+@register_kernel(
+    "residual",
+    "mhc_apply_pre",
+    name="triton_mhc_apply_pre",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                pre=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_mhc_apply_pre(
+    residual: torch.Tensor,
+    pre: torch.Tensor,
+    *,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> torch.Tensor:
+    """Collapse residual streams with ``pre``, optionally fusing RMSNorm (hc=4)."""
+    if norm_weight is None:
+        return mhc_apply_pre(residual, pre)
+    out = residual.new_empty((*residual.shape[:-2], residual.shape[-1]))
+    mhc_pre_layer_norm_hc4(pre, residual, norm_weight, out, eps=norm_eps)
     return out
 
 

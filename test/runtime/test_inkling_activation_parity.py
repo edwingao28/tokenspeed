@@ -230,19 +230,27 @@ class _Harness:
         inner.bind(
             CacheGroupGeometry(
                 granularities={gid: PAGE_SIZE for gid in self.attn_groups},
-                families={gid: "history" for gid in self.attn_groups},
+                attn_kinds={gid: "full_history" for gid in self.attn_groups},
                 full_history_group_id=(
                     "full_attention"
                     if "full_attention" in self.attn_groups
                     else self.attn_groups[0]
                 ),
                 row_geometry={gid: (PAGE_SIZE, 1) for gid in self.attn_groups},
-                retentions={gid: ("full_history", None) for gid in self.attn_groups},
+                windows={gid: None for gid in self.attn_groups},
             ),
             leaves,
         )
         from cache_pool_test_utils import make_mha_memory_plan, make_pool
 
+        layer_kv_heads = tuple(
+            (
+                text.swa_num_key_value_heads
+                if i in text.local_layer_ids
+                else text.ckpt_num_key_value_heads
+            )
+            for i in range(text.num_hidden_layers)
+        )
         # One arena, one view over it: the pool owns no memory or geometry.
         _arena, self.kv_pool = make_pool(
             MHATokenToKVPool,
@@ -260,6 +268,9 @@ class _Harness:
             head_dim=text.head_dim,
             layer_num=text.num_hidden_layers,
             rank=0,
+            # Full and sliding layers serve their own KV head counts, as the recipe plans them.
+            layer_kv_head_counts=layer_kv_heads,
+            kv_alloc_head_count=text.num_key_value_heads,
         )
         conv_pool = InklingConvStatePool(
             num_layers=text.num_hidden_layers,
@@ -270,39 +281,23 @@ class _Harness:
             dtype=torch.bfloat16,
             device=device,
         )
-        conv_block_tokens = 128
-        num_conv_pages = 1024 // conv_block_tokens
         conv_columns = {
-            "block_tokens": conv_block_tokens,
-            "group_block_tokens": {
-                "kvconv": conv_block_tokens,
-                "hiddenconv": conv_block_tokens,
-            },
+            "groups": ("kvconv", "hiddenconv"),
             "pd_endpoint_snapshots": False,
         }
         self.backend = InklingAttnBackend(inner, conv_pool)
-        # The leaves bind directly below; supply the geometry a wrapper bind learns.
+        # The leaves bind directly below; supply the groups a wrapper bind learns.
         self.backend.conv_columns = conv_columns
         self.pool_view = _ConvCheckpointPool(
             self.kv_pool,
-            layer_kv_widths=[
-                (
-                    text.swa_num_key_value_heads
-                    if i in text.local_layer_ids
-                    else text.ckpt_num_key_value_heads
-                )
-                * text.head_dim
-                for i in range(text.num_hidden_layers)
-            ],
-            num_pages=num_conv_pages + 1,
+            layer_kv_widths=[heads * text.head_dim for heads in layer_kv_heads],
+            num_pages=4,
             rows=text.sconv_kernel_size - 1,
             hidden=text.hidden_size,
             device=device,
         )
-        # Dense conv page map: boundary j*128 -> page j+1 (page 0 = hole).
-        conv_table = torch.arange(
-            1, num_conv_pages + 1, dtype=torch.int32, device=device
-        ).unsqueeze(0)
+        # Two-slot conv tables: the request starts cold and writes block 1.
+        conv_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
         self.conv_tables = {"kvconv": conv_table, "hiddenconv": conv_table}
         # Request slot REQ_SLOT owns pages [1, 2, ...] -> token locs 64+.
         max_pages = 1024 // PAGE_SIZE
@@ -315,6 +310,11 @@ class _Harness:
         self.block_tables = {
             **self.conv_tables,
             **{gid: attn_table for gid in self.attn_groups},
+        }
+        # The runner's host mirror of the tables, as the router's extend
+        # metadata contract requires (read only under a query shard).
+        self.block_tables_cpu = {
+            gid: table.cpu() for gid, table in self.block_tables.items()
         }
         self.seq_len = 0
         # Unified decode path: decode metadata is refreshed into persistent
@@ -374,8 +374,12 @@ class _Harness:
             extend_seq_lens_cpu=torch.tensor([T]),
             extend_prefix_lens=torch.zeros(1, dtype=torch.int32, device=dev),
             extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
+            extend_replay_lens_cpu=torch.zeros(1, dtype=torch.int32),
+            extend_prompt_lens_cpu=torch.tensor([T], dtype=torch.int32),
             extend_with_prefix=False,
+            query_shard=None,
             block_tables=self.block_tables,
+            block_tables_cpu=self.block_tables_cpu,
         )
         self.seq_len = T
         self._check_write_locations(ForwardMode.EXTEND, 0, T)
@@ -471,16 +475,12 @@ class InklingRebindTest(unittest.TestCase):
             conv_columns_for_pool,
         )
 
-        def pool(block_granularity, transfer_policy):
-            spec = SimpleNamespace(
-                group_id="kvconv",
-                block_granularity=block_granularity,
-                transfer_policy=transfer_policy,
+        def pool(groups, transfer_policy):
+            specs = tuple(
+                SimpleNamespace(group_id=group_id, transfer_policy=transfer_policy)
+                for group_id in groups
             )
-            plan = SimpleNamespace(prefix_granularity=1)
-            return SimpleNamespace(
-                arena=SimpleNamespace(plan=plan, cache_group_specs=(spec,))
-            )
+            return SimpleNamespace(arena=SimpleNamespace(cache_group_specs=specs))
 
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
         backend._init_pool_binding()
@@ -498,8 +498,9 @@ class InklingRebindTest(unittest.TestCase):
             dtype=torch.float32,
             device="cpu",
         )
-        backend.conv_columns = conv_columns_for_pool(pool(64, "latest_snapshot"))
-        backend.set_cache_pool(pool(64, "latest_snapshot"))
+        both = ("kvconv", "hiddenconv")
+        backend.conv_columns = conv_columns_for_pool(pool(both, "latest_snapshot"))
+        backend.set_cache_pool(pool(both, "latest_snapshot"))
         stream = dict(layer_id=0, channel_offset=0, dim=4, group_id="kvconv")
         backend.register_shortconv_checkpoint_stream(
             **stream, buffers=(torch.zeros(4),)
@@ -512,7 +513,7 @@ class InklingRebindTest(unittest.TestCase):
         backend._rel_qsl_retired = [object()]
         backend.conv_pool.conv_state[0, 3].fill_(17)
         backend.mark_remote_cache_ready(3)
-        backend.set_cache_pool(pool(64, "latest_snapshot"))
+        backend.set_cache_pool(pool(both, "latest_snapshot"))
         assert not backend.conv_pool.conv_state.any()
         assert not backend.conv_pool.remote_restore_pending.any()
         assert backend.conv_prefill_metadata is None
@@ -524,24 +525,17 @@ class InklingRebindTest(unittest.TestCase):
         rebound = (torch.zeros(4),)
         backend.register_shortconv_checkpoint_stream(**stream, buffers=rebound)
         assert backend._checkpoint_streams[(0, 0, 4, "kvconv")] is rebound
-        # hiddenconv has no spec in this fixture, so its grain is the plan's P.
-        assert backend.conv_columns["group_block_tokens"] == {
-            "kvconv": 64,
-            "hiddenconv": 1,
-        }
+        assert backend.conv_columns["groups"] == both
+        assert backend.conv_columns["pd_endpoint_snapshots"] is True
 
-        backend.set_cache_pool(pool(64, transfer_policy="none"))
-        assert backend.conv_columns["pd_endpoint_snapshots"] is False
+        # The transfer policy is part of the geometry a rebind keeps, as is
+        # the set of conv groups.
         with self.assertRaisesRegex(RuntimeError, "geometry changed on rebind"):
-            backend.set_cache_pool(pool(32, "latest_snapshot"))
-        # A pool publishing no conv groups falls back to P for every grain: still not this geometry.
-        bare = SimpleNamespace(
-            arena=SimpleNamespace(
-                plan=SimpleNamespace(prefix_granularity=64), cache_group_specs=()
-            )
-        )
+            backend.set_cache_pool(pool(both, transfer_policy="none"))
         with self.assertRaisesRegex(RuntimeError, "geometry changed on rebind"):
-            backend.set_cache_pool(bare)
+            backend.set_cache_pool(pool(("kvconv",), "latest_snapshot"))
+        with self.assertRaisesRegex(RuntimeError, "geometry changed on rebind"):
+            backend.set_cache_pool(pool((), "latest_snapshot"))
 
 
 if __name__ == "__main__":

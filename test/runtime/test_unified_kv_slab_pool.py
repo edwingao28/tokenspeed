@@ -46,15 +46,6 @@ def _specs_for_layers(**kwargs):
     return specs_for_layers(**kwargs)
 
 
-def _real_spec():
-    # The REAL package module (not the file-loaded shadow above): pool
-    # constructions need specs whose class passes the contract's
-    # isinstance check.
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
-
-    return spec
-
-
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
 
 # One Inkling-style layer block: 5 sliding sub-groups + 1 full layer.
@@ -334,7 +325,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.assertTrue(pool.arena.supports_disaggregation)
         self.assertEqual(base_addr, pool.arena.buffer.data_ptr())
         self.assertEqual(layout.plan, pool.arena.plan)
-        groups = {spec.retention: spec for spec in layout.group_specs}
+        groups = {spec.attn_kind: spec for spec in layout.group_specs}
         self.assertEqual(set(groups), {"full_history", "sliding_window"})
         self.assertIsNone(groups["full_history"].sliding_window_tokens)
         self.assertEqual(groups["sliding_window"].sliding_window_tokens, 128)
@@ -457,52 +448,90 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 
 
 class StateCacheGroupPageCountTest(unittest.TestCase):
-    """compute_cache_group_page_counts: the family="state" branch is
-    positive and bounded by the full-history formula for the same inputs
-    (sparse state uses two rolling checkpoints independent of overlap and
-    prefill chunk width).
-    The direct-loaded module still imports ceil_div from the real package
-    at call time, so this skips on a bare interpreter.
+    """The scheduler's capacity model over a state + full-history pair: a
+    state group's demand is two blocks per live request (the input checkpoint
+    and the live block), independent of how much history the requests hold,
+    how the chunk is cut or how deep the overlap runs.
+    Needs the real package and the scheduler extension.
     """
 
     def setUp(self):
         try:
-            from tokenspeed.runtime.utils.common import ceil_div  # noqa: F401
-        except ImportError as exc:
-            self.skipTest(f"page-count math needs the real package: {exc}")
+            import tokenspeed_scheduler  # noqa: F401
 
-    def _counts(self, **overrides):
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes import (  # noqa: F401
+                scheduler_bridge,
+            )
+        except ImportError as exc:
+            self.skipTest(f"page-count math needs the scheduler extension: {exc}")
+
+    def _pages(
+        self,
+        *,
+        max_total_tokens=1024,
+        max_scheduled_tokens=64,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    ):
+        from tokenspeed_scheduler import SchedulerConfig
+
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+            SchedulerLimits,
+            capacity_model,
+        )
+
         specs = _specs_for_layers(
             layer_types=("linear_attention", "full_attention"),
             group_ids=("linear_attention", "full_attention"),
             sliding_window_tokens=None,
             prefix_granularity=16,
         )
-        params = {
-            "max_live_requests": 2,
-            "max_scheduled_tokens": 64,
-            "max_total_tokens": 1024,
-            "max_context_len": 4096,
-        }
-        params.update(overrides)
-        return _pcs.compute_cache_group_page_counts(specs, **params)
+        model = capacity_model(
+            specs,
+            prefix_granularity=16,
+            virtual_packing={spec.group_id: 1 for spec in specs},
+            limits=SchedulerLimits(
+                role=SchedulerConfig.Role.Fused,
+                max_live_requests=2,
+                max_scheduled_tokens=max_scheduled_tokens,
+                max_context_len=4096,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+                disable_prefix_cache=False,
+            ),
+        )
+        pages = model.concurrent_group_pages(
+            max_total_tokens=max_total_tokens, max_context_len=4096
+        )
+        return dict(zip((spec.group_id for spec in specs), pages))
 
     def test_state_count_positive_and_bounded_by_full_history(self):
-        counts = self._counts()
-        self.assertGreater(counts["linear_attention"], 0)
-        self.assertLessEqual(counts["linear_attention"], counts["full_attention"])
+        pages = self._pages()
+        self.assertGreater(pages["linear_attention"], 0)
+        self.assertLessEqual(pages["linear_attention"], pages["full_attention"])
 
-    def test_state_branch_is_independent_of_chunk_and_total_token_width(self):
-        small = self._counts(max_scheduled_tokens=16, max_total_tokens=128)
-        large = self._counts(max_scheduled_tokens=4096, max_total_tokens=1 << 20)
+    def test_state_demand_is_two_blocks_per_live_request(self):
+        small = self._pages(max_total_tokens=128)
+        large = self._pages(max_total_tokens=1 << 20)
         self.assertEqual(small["linear_attention"], large["linear_attention"])
-        # R=2: two input/output blocks each plus one allocator dummy page.
-        self.assertEqual(small["linear_attention"], 2 * 2 + 1)
+        self.assertEqual(small["linear_attention"], 2 * 2)
+        self.assertEqual(
+            self._pages(max_scheduled_tokens=16)["linear_attention"], 2 * 2
+        )
+        self.assertEqual(
+            self._pages(max_scheduled_tokens=37)["linear_attention"], 2 * 2
+        )
 
-    def test_state_branch_is_independent_of_overlap(self):
-        baseline = self._counts(overlap_schedule_depth=0, decode_input_tokens=1)
-        overlapped = self._counts(overlap_schedule_depth=1, decode_input_tokens=1)
-        self.assertEqual(baseline["linear_attention"], overlapped["linear_attention"])
+    def test_overlap_and_decode_width_change_nothing_for_state(self):
+        for depth in (0, 1):
+            for width in (1, 16):
+                self.assertEqual(
+                    self._pages(
+                        overlap_schedule_depth=depth, decode_input_tokens=width
+                    )["linear_attention"],
+                    2 * 2,
+                    (depth, width),
+                )
 
 
 class CachePoolFieldBindingTest(unittest.TestCase):
@@ -657,7 +686,7 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
         )
 
     @staticmethod
-    def _arena(fields, families):
+    def _arena(fields, attn_kinds):
         from types import SimpleNamespace
 
         return SimpleNamespace(
@@ -668,8 +697,8 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
                 )
             ),
             cache_group_specs=tuple(
-                SimpleNamespace(group_id=group_id, family=family)
-                for group_id, family in families.items()
+                SimpleNamespace(group_id=group_id, attn_kind=attn_kind)
+                for group_id, attn_kind in attn_kinds.items()
             ),
         )
 
@@ -682,10 +711,10 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
                 ("layer.1.k", "full_attention"),
                 ("layer.1.v", "full_attention"),
             ),
-            families={
+            attn_kinds={
                 "linear_attention_0": "state",
                 "qwen4_exp_ple": "state",
-                "full_attention": "history",
+                "full_attention": "full_history",
             },
         )
         mapping = self.derive(arena, first_layer=0, num_layers=2, state_layer_ids=(0,))
@@ -697,7 +726,10 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
                 ("layer.0.k", "full_attention"),
                 ("layer.1.conv", "linear_attention_0"),
             ),
-            families={"linear_attention_0": "state", "full_attention": "history"},
+            attn_kinds={
+                "linear_attention_0": "state",
+                "full_attention": "full_history",
+            },
         )
         mapping = self.derive(arena, first_layer=1, num_layers=1, state_layer_ids=(0,))
         self.assertEqual(mapping, {0: "linear_attention_0"})
@@ -708,7 +740,7 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
                 ("layer.0.conv", "linear_attention_0"),
                 ("layer.0.ssm", "linear_attention_1"),
             ),
-            families={
+            attn_kinds={
                 "linear_attention_0": "state",
                 "linear_attention_1": "state",
             },

@@ -20,25 +20,70 @@
 
 import logging
 import os
+from ctypes import c_void_p
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    create_per_token_group_quant_fp8_output_scale,
-)
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import ErrorClass, error_fn
+from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.registry import ErrorClass, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)
 
 
+def _create_per_token_group_quant_fp8_output_scale(
+    x_shape,
+    device,
+    group_size: int,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+):
+    if scale_ue8m0:
+        if len(x_shape) != 2 or group_size != 128:
+            raise ValueError("packed E8M0 scales require 2-D 1x128 input groups")
+        rows, columns = x_shape
+        aligned_rows = (rows + 3) // 4 * 4
+        packed_columns = (columns // group_size + 3) // 4
+        base = torch.zeros(
+            (packed_columns, aligned_rows), device=device, dtype=torch.int32
+        )
+        return base.transpose(-1, -2)[:rows, :]
+    if column_major_scales:
+        if scale_tma_aligned:
+            aligned_rows = (x_shape[-2] + 3) // 4 * 4
+            return torch.empty(
+                x_shape[:-2] + (x_shape[-1] // group_size, aligned_rows),
+                device=device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x_shape[-2], :]
+        return torch.empty(
+            (x_shape[-1] // group_size,) + x_shape[:-1],
+            device=device,
+            dtype=torch.float32,
+        ).permute(-1, -2)
+    return torch.empty(
+        x_shape[:-1] + (x_shape[-1] // group_size,),
+        device=device,
+        dtype=torch.float32,
+    )
+
+
 __all__ = [
+    "TrtllmAllGatherState",
+    "TrtllmAllGatherQuantState",
+    "TrtllmReduceScatterState",
+    "trtllm_allgather",
+    "trtllm_allgather_fp8_quantize",
+    "trtllm_reduce_scatter",
     "AllReduceFusionPattern",
     "allgather_dual_rmsnorm",
     "allreduce_residual_rmsnorm",
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+    "trtllm_workspace_all_gather",
     "trtllm_workspace_allreduce",
     "group_spans_nodes",
     "armed_workspace_hidden_dim",
@@ -49,10 +94,17 @@ __all__ = [
 platform = current_platform()
 
 AllReduceFusionPattern = ErrorClass
+TrtllmAllGatherState = ErrorClass
+TrtllmAllGatherQuantState = ErrorClass
+TrtllmReduceScatterState = ErrorClass
+trtllm_allgather = error_fn
+trtllm_allgather_fp8_quantize = error_fn
+trtllm_reduce_scatter = error_fn
 # Two-shot token capacity of the mnnvl workspace; 0 where the path is absent.
 MNNVL_TWOSHOT_MAX_TOKEN = 0
 allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
+trtllm_workspace_all_gather = error_fn
 trtllm_workspace_allreduce = error_fn
 armed_workspace_hidden_dim = error_fn
 ensure_workspace_initialized = error_fn
@@ -79,6 +131,7 @@ if current_platform().is_nvidia:
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
+        trtllm_mnnvl_allgather,
         trtllm_reducescatter_fusion,
     )
 
@@ -119,7 +172,7 @@ if current_platform().is_nvidia:
                 return False
             return hasattr(_load_trtllm_comm_module(), "trtllm_mnnvl_allreduce_fusion")
         except Exception as exc:  # noqa: BLE001 - capability probe must not raise
-            logger.debug("mnnvl capability probe failed: %s", exc)
+            logger.debug(f"mnnvl capability probe failed: {exc!s}")
             return False
 
     def _try_create_mnnvl_workspace(
@@ -152,7 +205,7 @@ if current_platform().is_nvidia:
                 rank, world_size, max_token_num, hidden_dim, group=group
             )
         except Exception as exc:  # noqa: BLE001 - fall back to the IPC path
-            logger.warning("mnnvl workspace creation failed, using IPC: %s", exc)
+            logger.warning(f"mnnvl workspace creation failed, using IPC: {exc!s}")
 
         ok = torch.tensor(
             [1 if workspace is not None else 0], dtype=torch.int32, device=device
@@ -161,13 +214,10 @@ if current_platform().is_nvidia:
         if ok.item() == 0:
             return None
         logger.info(
-            "MNNVL one-shot AR workspace armed: rank=%s world_size=%s "
-            "max_token_num=%s hidden_dim=%s buffer=%s bytes",
-            rank,
-            world_size,
-            workspace.max_token_num,
-            hidden_dim,
-            workspace.buffer_size_bytes,
+            f"MNNVL one-shot AR workspace armed: rank={rank!s} world_size="
+            f"{world_size!s} "
+            f"max_token_num={workspace.max_token_num!s} hidden_dim={hidden_dim!s} "
+            f"buffer={workspace.buffer_size_bytes!s} bytes",
         )
         return workspace
 
@@ -434,15 +484,12 @@ if current_platform().is_nvidia:
                 # Recreating would leave captured graphs on freed peer pointers.
                 logger.warning(
                     "trtllm AR: refusing to grow the fusion workspace "
-                    "(tokens %s->%s hidden %s->%s fp32 %s->%s): a captured "
+                    f"(tokens {manager.max_token_num!s}->{target_max_token_num!s} "
+                    f"hidden {manager.hidden_dim!s}->{target_hidden_dim!s} fp32 "
+                    f"{manager.use_fp32_lamport!s}->{target_use_fp32_lamport!s}): a "
+                    "captured "
                     "CUDA graph references it. Arm the full geometry before "
                     "graph capture.",
-                    manager.max_token_num,
-                    target_max_token_num,
-                    manager.hidden_dim,
-                    target_hidden_dim,
-                    manager.use_fp32_lamport,
-                    target_use_fp32_lamport,
                 )
                 return False
             if (
@@ -457,16 +504,11 @@ if current_platform().is_nvidia:
                 )
             logger.info(
                 "Re/initializing TRT-LLM fusion IPC workspace: "
-                "world_size=%s rank=%s max_token_num=%s hidden_dim=%s use_fp32_lamport=%s "
-                "(prev max_token_num=%s hidden_dim=%s use_fp32_lamport=%s)",
-                world_size,
-                rank,
-                target_max_token_num,
-                target_hidden_dim,
-                target_use_fp32_lamport,
-                manager.max_token_num,
-                manager.hidden_dim,
-                manager.use_fp32_lamport,
+                f"world_size={world_size!s} rank={rank!s} max_token_num="
+                f"{target_max_token_num!s} hidden_dim={target_hidden_dim!s} "
+                f"use_fp32_lamport={target_use_fp32_lamport!s} "
+                f"(prev max_token_num={manager.max_token_num!s} hidden_dim="
+                f"{manager.hidden_dim!s} use_fp32_lamport={manager.use_fp32_lamport!s})",
             )
             manager.initialize(
                 world_size=world_size,
@@ -554,15 +596,12 @@ if current_platform().is_nvidia:
         # hand the kernel a null workspace.
         if not ipc_ok:
             logger.debug(
-                "trtllm AR fusion: shape (tokens=%s, hidden=%s, dtype=%s, "
-                "pattern=%s, oneshot=%s) not supported by mnnvl and no "
+                f"trtllm AR fusion: shape (tokens={token_num!s}, hidden={hidden_dim!s},"
+                f" dtype={dtype!s}, "
+                f"pattern={pattern_code!s}, oneshot={use_oneshot!s}) not supported by "
+                "mnnvl and no "
                 "compatible IPC workspace (missing or sentinel-width "
                 "mismatch); caller falls back unfused",
-                token_num,
-                hidden_dim,
-                dtype,
-                pattern_code,
-                use_oneshot,
             )
             return None
         return _mark_captured(manager, manager.workspace_tensor)
@@ -614,14 +653,10 @@ if current_platform().is_nvidia:
             partial_norm_out = norm_out[start : start + counts[rank]].contiguous()
 
         if block_quant_fp8:
-            from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
-            quant_out, scale_out = per_token_group_quant_fp8(
+            quant_out, scale_out = quantize_fp8(
                 norm_out,
+                granularity="token_group",
                 group_size=128,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=False,
             )
             return quant_out, residual_out, scale_out, partial_norm_out
         return norm_out, residual_out, None, partial_norm_out
@@ -733,6 +768,30 @@ if current_platform().is_nvidia:
         )
         return allreduce_out.view(input_tensor.shape)
 
+    def trtllm_workspace_all_gather(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor | None:
+        """All-gather of 16-bit rows along the last dim through the group's
+        mnnvl workspace: one lamport exchange, no barrier.
+
+        Args:
+            input_tensor: ``[T, W]`` rows of this rank.
+            group: process group whose armed workspace to use.
+
+        Returns:
+            ``[T, world * W]`` (rank-major columns, bit for bit), or None when
+            no mnnvl workspace serves the shape.
+        """
+        manager = _manager_for_group(group)
+        mnnvl = manager.mnnvl_workspace
+        if mnnvl is None or input_tensor.dim() != 2:
+            return None
+        gathered = trtllm_mnnvl_allgather(input_tensor, mnnvl, pdl_enabled())
+        if gathered is not None:
+            _mark_captured(manager, mnnvl)
+        return gathered
+
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,
         residual: torch.Tensor,
@@ -800,7 +859,7 @@ if current_platform().is_nvidia:
                 device=input_tensor.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=128,
@@ -1132,7 +1191,7 @@ if current_platform().is_nvidia:
                 device=input_tensor.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=128,
@@ -1259,7 +1318,7 @@ if current_platform().is_nvidia:
                 device=qkv.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=block_size,
@@ -1328,3 +1387,346 @@ if current_platform().is_nvidia:
             y_norm_out,
             scale_out,
         )
+
+    # Explicit-state plain collectives use private IPC allocations, not the
+    # per-group fusion workspace above. Keep scratch isolated across streams.
+    # Their registry modes are separate from stateless/auto-dispatched ops.
+
+    class TrtllmAllGatherState:
+        """Own BF16 AllGather IPC scratch for serialized auxiliary-stream calls."""
+
+        def __init__(self, group, max_rows, hidden, device, oneshot):
+            from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+                trtllm_create_ipc_workspace_for_allgather_fusion,
+            )
+
+            self.tp_size = group.size()
+            if self.tp_size not in (2, 4, 8, 16) or not 0 < max_rows <= 128:
+                raise ValueError(
+                    "TRT-LLM one-shot gather requires TP2/4/8/16 and 1..128 rows"
+                )
+            if hidden <= 0 or hidden % 128:
+                raise ValueError(
+                    "TRT-LLM gather width must be a positive multiple of 128"
+                )
+            if self.tp_size * max_rows * hidden * 2 >= 2**31 - 2**21:
+                raise ValueError("TRT-LLM gather exceeds one-shot Lamport capacity")
+            self.max_rows = max_rows
+            self.group, self.hidden, self.oneshot = group, hidden, oneshot
+            # Plain gather has no normalization semantics: subdividing rows is an
+            # exact view. Choose the largest divisor satisfying the fused wrapper's
+            # <=2112 hidden limit and 128-element q_lora_rank alignment.
+            self.kernel_hidden = next(
+                width
+                for width in range(min(hidden, 2112) // 128 * 128, 0, -128)
+                if hidden % width == 0
+            )
+            self.handles, self.workspace = (
+                trtllm_create_ipc_workspace_for_allgather_fusion(
+                    tp_rank=group.rank(),
+                    tp_size=self.tp_size,
+                    max_token_num=self.tp_size
+                    * max_rows
+                    * hidden
+                    // self.kernel_hidden,
+                    hidden_dim=self.kernel_hidden,
+                    use_fp32_lamport=False,
+                    group=group,
+                    create_metadata=False,
+                )
+            )
+            self.control_ptr = self.workspace[-1].item()
+            self.out = torch.empty(
+                (self.tp_size * max_rows, hidden), dtype=torch.bfloat16, device=device
+            )
+
+        def gather(self, inputs):
+            """Return borrowed [TP*M,H] BF16 rows, valid until the next gather."""
+            if (
+                inputs.dtype != torch.bfloat16
+                or not inputs.is_contiguous()
+                or inputs.shape[1] != self.hidden
+                or not 0 < inputs.shape[0] <= self.max_rows
+            ):
+                raise ValueError("Invalid TRT-LLM AllGather input")
+            from tokenspeed_kernel.thirdparty.cuda.trtllm import trtllm_allgather_fusion
+
+            local = inputs.view(-1, self.kernel_hidden)
+            out = self.out[: self.tp_size * inputs.shape[0]]
+            trtllm_allgather_fusion(
+                allgather_in=local,
+                world_size=self.tp_size,
+                world_rank=self.group.rank(),
+                hidden_dim=self.kernel_hidden,
+                workspace_ptrs=self.workspace,
+                trigger_completion_at_end=False,
+                num_token_current_rank=local.shape[0],
+                allgather_out=out.view(-1, self.kernel_hidden),
+                num_token_all_group=self.tp_size * local.shape[0],
+                launch_with_pdl=False,
+                pattern_code=0,
+                use_oneshot=self.oneshot,
+                fp32_acc=False,
+                x_norm_out=None,
+                y_norm_out=None,
+                quant_out=None,
+                scale_out=None,
+                x_rms_gamma=None,
+                y_rms_gamma=None,
+                x_rms_eps=1e-6,
+                y_rms_eps=1e-6,
+                q_lora_rank=self.kernel_hidden,
+                kv_lora_rank=0,
+                qk_rope_head_dim=0,
+            )
+            return out
+
+        def close(self):
+            from tokenspeed_kernel.thirdparty.cuda.cuda_ipc import cudart
+            from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+                trtllm_destroy_ipc_workspace_for_allgather_fusion,
+            )
+
+            torch.cuda.synchronize()
+            dist.barrier(group=self.group)
+            trtllm_destroy_ipc_workspace_for_allgather_fusion(
+                self.handles, group=self.group
+            )
+            cudart.cudaFree(c_void_p(self.control_ptr))
+
+    class TrtllmAllGatherQuantState(TrtllmAllGatherState):
+        """Fused BF16 gather and 1x128 FP8 quantization scratch.
+
+        Construct collectively before capture. ``max_rows`` is the per-rank
+        capacity (1..128), ``hidden`` is a multiple of 128, and ``num_blocks``
+        bounds the launch grid to at most one CTA per SM. Outputs are borrowed
+        until the next quantized gather; calls sharing this state are serialized.
+        Every peer supplies equal positive physical rows, so empty logical
+        owners must participate with zero padding. Communication remains BF16;
+        fusion removes gathered-BF16 materialization and a separate quantizer,
+        but does not reduce link traffic. Ordinary ``gather`` remains available
+        as the numerical reference and fallback building block.
+        """
+
+        def __init__(self, group, max_rows, hidden, device, num_blocks):
+            from tokenspeed_kernel.thirdparty.flashinfer.allgather_quant import (
+                load_allgather_quant_module,
+            )
+
+            if (
+                not 0
+                < num_blocks
+                <= torch.cuda.get_device_properties(device).multi_processor_count
+            ):
+                raise ValueError("Fused gather requires a positive, SM-bounded grid")
+            self.module = load_allgather_quant_module()
+            self.num_blocks = num_blocks
+            super().__init__(group, max_rows, hidden, device, True)
+            padded_rows = (self.tp_size * max_rows + 3) // 4 * 4
+            self.fp8_out = torch.empty(
+                (padded_rows, hidden), dtype=torch.float8_e4m3fn, device=device
+            )
+            self.scales_out = torch.empty(
+                padded_rows * (hidden // 128), dtype=torch.float32, device=device
+            )
+
+    @register_kernel(
+        "communication",
+        "stateful_all_gather_fp8_quantize",
+        name="trtllm_allgather_fp8_quantize",
+        solution="trtllm",
+        signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
+    )
+    def trtllm_allgather_fp8_quantize(state, inputs):
+        """Gather BF16 rows and quantize ready 128-element groups in one kernel.
+
+        Args:
+            state: Prepared ``TrtllmAllGatherQuantState`` on the current GPU.
+            inputs: Contiguous BF16 ``[rows,H]``; every peer supplies equal rows.
+
+        Returns:
+            Borrowed FP8 values ``[round_up(TP*rows,4),H]`` and contiguous FP32
+            MN-major scales ``[H/128,round_up(TP*rows,4)]``. Padding is zero/one.
+            No RMSNorm or PDL is applied. A following GEMM uses normal stream
+            ordering; this API does not publish per-tile readiness to consumers.
+        """
+        if (
+            inputs.ndim != 2
+            or inputs.dtype != torch.bfloat16
+            or not inputs.is_contiguous()
+            or inputs.device != state.fp8_out.device
+            or inputs.shape[1] != state.hidden
+            or not 0 < inputs.shape[0] <= state.max_rows
+        ):
+            raise ValueError("Invalid fused AllGather quantization input")
+        rows = (state.tp_size * inputs.shape[0] + 3) // 4 * 4
+        values = state.fp8_out[:rows]
+        scales = state.scales_out[: rows * (state.hidden // 128)].view(-1, rows)
+        state.module.allgather_fp8_quantize(
+            inputs,
+            values,
+            scales,
+            state.workspace,
+            state.group.rank(),
+            state.tp_size,
+            state.num_blocks,
+        )
+        return values, scales
+
+    @register_kernel(
+        "communication",
+        "stateful_all_gather",
+        name="trtllm_allgather",
+        solution="trtllm",
+        signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
+    )
+    def trtllm_allgather(state, inputs):
+        """Gather BF16 [M,H] rows into borrowed [TP*M,H] subgroup-rank order.
+
+        state is a preallocated TrtllmAllGatherState. All peers call on one
+        serialized stream; finish reading the returned view before the next call.
+        """
+        return state.gather(inputs)
+
+    class TrtllmReduceScatterState:
+        """Own IPC scratch shared by sequential layers, not by concurrent streams.
+
+        Args:
+            group: 2/4/8/16-rank process group on a CUDA-IPC-accessible topology.
+            max_rows: Prepared physical rows per rank, at most 128.
+            hidden: Output width, a positive multiple of eight BF16 elements.
+            device: Current rank's CUDA device, already selected by the caller.
+        """
+
+        def __init__(self, group, max_rows: int, hidden: int, device: torch.device):
+            from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+                trtllm_create_ipc_workspace_for_reduce_scatter_fusion,
+            )
+
+            self.tp_size = group.size()
+            if (
+                self.tp_size not in (2, 4, 8, 16)
+                or not 0 < max_rows <= 128
+                or hidden <= 0
+            ):
+                raise ValueError(
+                    "Lamport TRT-LLM reduction requires TP2/4/8/16, positive width and 1..128 rows"
+                )
+            if hidden % 8:
+                raise ValueError(
+                    "Lamport BF16 TRT-LLM reduction width must be divisible by 8"
+                )
+            # Bound allocation and prevent the native wrapper silently selecting
+            # two-shot on inputs larger than its signed-int32 Lamport address space.
+            if self.tp_size * self.tp_size * max_rows * hidden * 2 >= 2**31 - 2**21:
+                raise ValueError("TRT-LLM reduction exceeds one-shot Lamport capacity")
+            self.group = group
+            self.max_rows = max_rows
+            self.hidden = hidden
+            self.buffer = torch.empty(
+                (self.tp_size * max_rows, hidden), dtype=torch.bfloat16, device=device
+            )
+            self.handles, self.workspace = (
+                trtllm_create_ipc_workspace_for_reduce_scatter_fusion(
+                    tp_rank=group.rank(),
+                    tp_size=self.tp_size,
+                    max_token_num=self.tp_size * max_rows,
+                    hidden_dim=hidden,
+                    use_fp32_lamport=False,
+                    group=group,
+                    create_metadata=False,
+                )
+            )
+            # The native helper's destroy routine frees shared IPC allocations,
+            # but not the separately allocated local ring-control flags.
+            self.control_ptr = self.workspace[-1].item()
+
+        def input_buffer(self, rows: int) -> torch.Tensor:
+            """Borrow a local GEMM destination; peers never read this buffer."""
+            if self.handles is None or not 0 < rows <= self.max_rows:
+                raise ValueError(
+                    "Lamport TRT-LLM reduction is closed or exceeds capacity"
+                )
+            return self.buffer[: self.tp_size * rows]
+
+        def close(self) -> None:
+            """Collectively release IPC storage after all referencing graphs die."""
+            from tokenspeed_kernel.thirdparty.cuda.cuda_ipc import cudart
+            from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+                trtllm_destroy_ipc_workspace_for_reduce_scatter_fusion,
+            )
+
+            if self.handles is not None:
+                torch.cuda.synchronize(self.buffer.device)
+                dist.barrier(group=self.group)
+                trtllm_destroy_ipc_workspace_for_reduce_scatter_fusion(
+                    self.handles, group=self.group
+                )
+                cudart.cudaFree(c_void_p(self.control_ptr))
+                self.handles = None
+
+    @register_kernel(
+        "communication",
+        "stateful_reduce_scatter",
+        name="trtllm_reduce_scatter",
+        solution="trtllm",
+        signatures=format_signatures(("partial",), "dense", {torch.bfloat16}),
+    )
+    def trtllm_reduce_scatter(state, partial, rows):
+        """Reduce BF16 [TP*rows,H] partials into owned [rows,H] output.
+
+        Prepare state collectively before capture. The native one-shot protocol
+        publishes payloads into its own IPC ring and synchronizes their reuse;
+        no symmetric-memory publication barrier is needed around local partials.
+        Calls must be serialized on one stream. Output survives later state reuse.
+
+        Args:
+            state: Collectively prepared TrtllmReduceScatterState.
+            partial: Contiguous BF16 [TP*rows,H] local GEMM partials.
+            rows: Equal physical row count per rank, including padding.
+
+        Returns:
+            Owned BF16 [rows,H] tensor for the calling rank's token segment.
+        """
+        from tokenspeed_kernel.thirdparty.cuda.trtllm import trtllm_reducescatter_fusion
+
+        destination = state.input_buffer(rows)
+        if (
+            partial.shape != destination.shape
+            or partial.dtype != destination.dtype
+            or partial.device != destination.device
+            or not partial.is_contiguous()
+        ):
+            raise ValueError(
+                "Lamport TRT-LLM reduction partials have incompatible layout"
+            )
+        out = torch.empty(
+            (rows, state.hidden), dtype=partial.dtype, device=partial.device
+        )
+        trtllm_reducescatter_fusion(
+            reducescatter_in=partial,
+            world_size=state.tp_size,
+            world_rank=state.group.rank(),
+            token_num=state.tp_size * rows,
+            hidden_dim=state.hidden,
+            workspace_ptrs=state.workspace,
+            trigger_completion_at_end=False,
+            fp32_acc=True,
+            num_token_current_rank=rows,
+            pattern_code=0,
+            launch_with_pdl=False,
+            use_oneshot=True,
+            reducescatter_out=out,
+            add_in=None,
+            residual_in=None,
+            residual_out=None,
+            norm_out=None,
+            quant_out=None,
+            scale_out=None,
+            rms_gamma=None,
+            rms_eps=None,
+            scale_factor=None,
+            layout_code=None,
+            metadata=None,
+        )
+        return out

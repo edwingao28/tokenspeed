@@ -1,0 +1,145 @@
+# Code review guidelines
+
+Read [AGENTS.md](AGENTS.md) and any local overrides first. Map changed files to
+the relevant TokenSpeed design documents below before reviewing.
+
+## Severity
+
+Prefix **every inline comment** with one of these markers:
+
+| Marker | Severity | Meaning |
+| ------ | -------- | ------- |
+| 🔴 | **Important** | A bug that should be fixed before merging |
+| 🟡 | **Nit** | A minor issue, worth fixing but not blocking |
+| 🟣 | **Pre-existing** | A bug in the codebase not introduced by this PR |
+
+For example:
+
+> 🔴 **Important**: The buffer is sized to the capture ladder rather than the
+> maximum decode batch. A larger eager batch writes past its capacity.
+
+Explain the triggering condition, observable impact, and a concrete correction.
+Verify findings against the surrounding code and callers; avoid speculative
+bugs or performance claims without evidence. Check existing review threads and
+do not repeat an unresolved finding. After posting inline comments, write a
+brief summary with counts for each severity, including zero counts. Distinguish
+pre-existing issues from regressions introduced by the PR.
+
+## Focus on
+
+- Production correctness, security vulnerabilities, resource lifetime errors,
+  races, deadlocks, and silent failures or swallowed exceptions.
+- Explicit execution modes and backend choices, preserved wrapper arguments,
+  and validation that rejects unsupported configurations.
+- Scheduler state transitions, admission/retraction/recovery, KV ownership,
+  cancellation, and ordering of asynchronous forward and transfer work.
+- Consistent behavior across eager/CUDA-graph execution, speculation,
+  prefill/decode disaggregation, and supported hardware configurations.
+- Kernel indexing, shapes, dtypes, strides, padding, numerical accuracy, and
+  capability-based selection; vendor libraries must remain behind the kernel
+  package boundary described in AGENTS.md.
+- Tests that exercise the changed behavior, especially failure paths and
+  boundary cases. Identify the missing regression case rather than demanding
+  broad coverage without a concrete reason.
+- Broken code/documentation references and configuration documentation that
+  disagrees with the implementation.
+
+## Domain references
+
+Treat the design documents as the source of truth. Justify and document
+deliberate deviations in the same change.
+
+| Changed area | Read |
+| ------------ | ---- |
+| Event loop and execution coordination | [Event loop](docs/design/event-loop.md): control/data plane separation, centralized feedback, in-flight depth, hooks |
+| C++ scheduler | [Scheduler](docs/design/scheduler.md): chunk admission, retraction, engine roles, recovery invariants |
+| Cache allocation, prefix reuse, transfer | [Cache concepts](docs/design/cache-concepts.md): logical/physical units, ownership, geometry, layering |
+| Attention metadata and decode execution | [Unified decode path](docs/design/unified_path.md): refresh-in-place metadata, padding, buffer capacity, graph mechanics |
+| QK norm, RoPE, KV quantization and KV writes | [Attention prologue](docs/design/attention-prologue.md): one entry, numerics contract, who writes the cache |
+| KDA prefill graphs | [KDA prefill subgraphs](docs/design/kda-prefill-subgraphs.md) |
+| Kernel registration and backends | [Kernel design](tokenspeed-kernel/README.md) and the affected operation's README |
+| CI task declarations and validation | [CI task specs](test/ci/README.md) |
+| Public serving configuration | [Server parameters](docs/configuration/server.md) and [parallelism](docs/serving/parallelism.md) |
+
+## Skip
+
+- Formatting-only changes and style comments already enforced by tooling.
+- Documentation-only PRs under `docs/**`.
+- Dependency version bumps with no code changes.
+
+## Claude workflow setup and operation
+
+[The workflow](.github/workflows/claude-code-review.yml) runs both automatic
+reviews and `@claude` replies on the self-managed runner scale set
+`org-k8s-runner-cpu`. Grant this repository access to that runner set and install
+the [Claude GitHub App](https://github.com/apps/claude) for this repository.
+The workflow uses the app's short-lived token for reviews and replies.
+
+As in the SMG workflow, provide `ANTHROPIC_API_KEY` through the runner pod's
+environment, typically from a Kubernetes Secret. The workflow passes it to the
+Claude action. Do not commit the key or print it in logs. The runner needs Git,
+`jq`, `curl`, `tar`, and network access to GitHub and the Anthropic API, plus the
+prerequisites for `anthropics/claude-code-action@v1`. The workflow installs the
+Linux AMD64 GitHub CLI (`gh`) if it is missing.
+
+Automatic reviews run for same-repository pull requests on `opened`,
+`synchronize` (new commits), and `reopened`, including drafts. The workflow
+skips fork PRs and runs triggered by `dependabot[bot]`. It also skips PR
+events when all changed paths match `*.md`, `docs/**`, or `*.lock`.
+
+Mention `@claude` in a new issue/PR conversation comment or inline PR review
+comment to request a reply. Both jobs load the official `pr-review-toolkit`
+plugin. This CPU runner reviews source and CI evidence. GPU tests remain in
+the repository's existing CI workflows.
+
+## CI workflow setup and operation
+
+[The CI planning workflow](.github/workflows/pr-ci-plan.yml) handles same-repository
+branch PRs on `opened`, `synchronize`, and `reopened`, including drafts. The
+workflow skips fork PRs and runs triggered by `dependabot[bot]`. It uses a
+GitHub-hosted CPU runner and posts a coverage proposal for the exact head and
+base commits. A newer push cancels the previous run. General code review remains
+with the existing reviewer. It does not approve PRs, change required checks, or
+merge automatically.
+
+The workflow calls [the planning script](.github/scripts/pr-ci-model.py) with
+`prepare`, `plan`, and `publish` stages. Maintain the planner instructions in
+[the agent prompt](.github/scripts/pr-ci-planner.md).
+
+The API must implement the OpenAI-compatible protocol. Configure these organization
+Actions variables and secrets with `all` repository access to share them across the
+organization. Keep the publishing token as a repository secret:
+
+| Setting | Kind | Value |
+| --- | --- | --- |
+| `KIMI_API_URL` | Organization variable | Provider API base URL, including its API version path |
+| `KIMI_MODEL` | Organization variable | Model ID accepted by that endpoint |
+| `KIMI_API_KEY` | Organization secret | API token for that endpoint |
+| `LIGHTSEEK_BOT_TOKEN` | Repository secret | Token for `lightseek-bot` with organization variable read and PR comment write access |
+
+The planner runs from a separate temporary directory with only `Read`, `Grep`, and
+`Glob` tools. GitHub authentication is available only to the configuration and
+publishing steps. The workflow does not publish failed, empty, oversized, or
+sensitive output, and it does not upload raw CLI events and logs.
+Same-repository contributors can edit the workflow, so repository write access
+remains the trust boundary.
+
+[The coverage validator](.github/scripts/pr_ci_plan.py) reuses the existing task
+loader and UT target discovery, including manual tasks. The planner verifies PR
+title/body hints against changed code, callers and test assertions, then orders a
+small set of focused test files and model CI tasks with code-to-coverage reasons.
+Comments use one scope sentence, a priority table with short source-linked names,
+and a status line. Runner routing and material coverage limits stay explicit.
+It does not append a full baseline merely because a shared directory changed.
+Recommendations must refer to tracked test files and catalogued tasks/runners.
+This is advisory prioritization. Required checks and merge policy are unchanged.
+
+Run diagnostics through the existing K8s Dispatch and Slurm Dispatch workflows.
+Prioritize Slurm GB200 for NVIDIA; if GB200 is full, check GB300. Use K8s AMD
+for AMD changes. Slurm recommendations retain declared logical runner labels.
+They name the actual cluster separately and mark B200 tasks as cross-hardware.
+For a single Slurm task use bulk mode (`yaml=off`) with its full config path as
+`match`, one declared `runners` label, its `task_types`, and `trigger=all`. This
+avoids single-YAML mode replaying multiple labels on the same physical cluster.
+Retry Failed CI Cases replays retained Slurm reports. Completion evaluation,
+automatic dispatch, source repair and merge-policy integration are separate work.

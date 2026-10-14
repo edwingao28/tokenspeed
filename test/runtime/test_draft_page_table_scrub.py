@@ -61,10 +61,10 @@ def _draft_router(rows: int = 8) -> CacheGroupRouter:
     router.bind(
         CacheGroupGeometry(
             granularities={FULL: 128},
-            families={FULL: "history"},
+            attn_kinds={FULL: "full_history"},
             full_history_group_id=FULL,
             row_geometry={FULL: (128, 1)},
-            retentions={FULL: ("full_history", None)},
+            windows={FULL: None},
         ),
         {FULL: _Leaf()},
     )
@@ -146,6 +146,8 @@ class IdleReplayScrubTest(unittest.TestCase):
                 extend_prefix_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 extend_seq_lens_buf=torch.zeros(8, dtype=torch.int32),
                 extend_seq_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_replay_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_prompt_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 fill_dummy_decode_buffers=lambda batch_size, total_tokens: None,
             ),
             runtime_states=SimpleNamespace(
@@ -153,6 +155,9 @@ class IdleReplayScrubTest(unittest.TestCase):
                 vocab_size=32,
             ),
             device="cpu",
+            device_module=torch.cpu,
+            default_stream=torch.cpu.current_stream(),
+            execution_stream=torch.cpu.Stream(),
             config=SimpleNamespace(output_length=1),
             capturable_grammar=None,
             forward_step=_Step(),
@@ -180,6 +185,8 @@ class IdleReplayScrubTest(unittest.TestCase):
             "extend_seq_lens_cpu",
         ):
             self.assertEqual(extend_kwargs[name].numel(), 0, name)
+        # And the runner's required host tables: no request, no groups.
+        self.assertEqual(extend_kwargs["block_tables_cpu"], {})
 
 
 if __name__ == "__main__":

@@ -24,47 +24,353 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.gemm.kimi3 import KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE
+from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    tensor_format,
+)
+
+_FP8_DTYPE = torch.float8_e4m3fn
+_MXFP8_UE8M0_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(1, 32),
+)
+_FP8_BLOCK_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(128, 128),
+)
 
 if current_platform().is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        supports_gluon_mm_a16w16_prefill_gfx950 as _supports_mm_a16w16_prefill,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-        gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
+        launch_gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_mm_a16w16_decode_gfx950 as _mm_a16w16_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
+        launch_gluon_mxfp4_linear_gfx950 as _mxfp4_linear_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
+        launch_gluon_mxfp4_swiglu_linear_gfx950 as _mxfp4_swiglu_linear_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
+        preshuffle_mxfp4_weight as _preshuffle_mxfp4_weight,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
+        launch_gluon_mm_mxfp8_decode_gfx950 as _mm_mxfp8_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
+        supports_gluon_mm_mxfp8_decode_gfx950 as _supports_mxfp8_decode_problem,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
+        launch_gluon_mm_mxfp8_gfx950 as _mm_mxfp8_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
+        supports_mxfp8_gemm_shape as _supports_mxfp8_gemm_shape,
     )
 
     try:
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
-            gluon_linear_attnres_partials_gfx950 as _linear_attnres_partials_impl,
+            launch_gluon_linear_attnres_partials_gfx950 as _linear_attnres_partials_impl,
         )
     except ImportError as exc:
-        _IMPORT_ERROR = exc
+        # Keep the message only: an exception object carries its traceback,
+        # which pins every frame that was importing at the time.
+        _IMPORT_ERROR_MESSAGE = str(exc)
         _linear_attnres_partials_impl = None
     else:
-        _IMPORT_ERROR = None
+        _IMPORT_ERROR_MESSAGE = None
+
+    _GFX950_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
+    _DENSE16_SIGNATURES = frozenset(
+        {
+            format_signature(
+                a=dense_tensor_format(torch.bfloat16),
+                b=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    )
+
+    def _validate_dense16_mm_arguments(
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        block_size: list[int] | None,
+    ) -> None:
+        if A_scales is not None or B_scales is not None:
+            raise ValueError("dense16 Gluon MM does not accept quantization scales")
+        if block_size is not None:
+            raise ValueError("dense16 Gluon MM does not accept block_size")
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_a16w16_prefill_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_DENSE16_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mm_a16w16_prefill}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+        },
+    )
+    def gluon_mm_a16w16_prefill_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch measured Kimi K3 projection prefills to the large-M kernel."""
+        _validate_dense16_mm_arguments(A_scales, B_scales, block_size)
+        output = _mm_a16w16_prefill_impl(A, B, out_dtype, alpha=alpha, out=out)
+        if output is None:
+            raise RuntimeError("registered gfx950 prefill shape was rejected")
+        return output
+
+    @register_kernel(
+        "gemm",
+        "decode_gemv",
+        name="gluon_mm_a16w16_decode_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={"mnk_problem_filter": frozenset({_supports_mm_a16w16_decode})},
+    )
+    def gluon_mm_a16w16_decode_gfx950(
+        x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``x @ weight.T`` for the measured K3 decode shapes (M >= 2).
+
+        Args:
+            x: ``[M, K]`` contiguous bf16 activation.
+            weight: ``[N, K]`` contiguous bf16 weight.
+            out: optional ``[M, N]`` destination.
+
+        Returns:
+            ``[M, N]`` output in ``x``'s dtype.
+        """
+        return _mm_a16w16_decode_impl(x, weight, x.dtype, out=out)
+
+    _MXFP8_SIGNATURES = frozenset(
+        {
+            format_signature(
+                a=tensor_format("mxfp8", torch.float8_e4m3fn, scale=_MXFP8_UE8M0_SCALE),
+                b=tensor_format("mxfp8", torch.float8_e4m3fn, scale=_MXFP8_UE8M0_SCALE),
+            )
+        }
+    )
+
+    def _prefers_mxfp8_large_tiles(m: int, n: int, k: int) -> bool:
+        # Up to 256 rows the weight-streaming decode kernel wins, except on
+        # weights of 64 Mi elements or more (V4.1 25600x6144 and 5120x15360):
+        # there the two tie near 48-64 rows and the large-tile kernel is up to
+        # 1.6x faster from 96 rows on.
+        return m > 256 or (m >= 64 and n * k >= 1 << 26)
+
+    def _is_mxfp8_prefill_problem(m: int, n: int, k: int) -> bool:
+        return _supports_mxfp8_gemm_shape(m, n, k) and _prefers_mxfp8_large_tiles(
+            m, n, k
+        )
+
+    def _is_mxfp8_decode_problem(m: int, n: int, k: int) -> bool:
+        return _supports_mxfp8_decode_problem(
+            m, n, k
+        ) and not _prefers_mxfp8_large_tiles(m, n, k)
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_mxfp8_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_MXFP8_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_is_mxfp8_prefill_problem}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
+            # GEMM format signatures currently describe input roles only.
+            "out_dtype": frozenset({torch.bfloat16, torch.float16}),
+        },
+    )
+    def gluon_mm_mxfp8_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch the canonical true-MXFP8 layout to the gfx950 kernel."""
+        if A_scales is None or B_scales is None:
+            raise ValueError("gfx950 MXFP8 GEMM requires both scale tensors")
+        if block_size is None:
+            raise ValueError("gfx950 MXFP8 GEMM requires block_size")
+        return _mm_mxfp8_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            out=out,
+        )
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_mxfp8_decode_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_MXFP8_SIGNATURES,
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "mnk_problem_filter": frozenset({_is_mxfp8_decode_problem}),
+            "a_inner_stride_one": frozenset({True}),
+            "a_scales_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "b_scales_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
+            "out_dtype": frozenset({torch.bfloat16, torch.float16}),
+            "out_inner_stride_one": frozenset({True}),
+        },
+    )
+    def gluon_mm_mxfp8_decode_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch decode-sized true-MXFP8 GEMMs to the gfx950 kernel."""
+        if A_scales is None or B_scales is None:
+            raise ValueError("gfx950 MXFP8 decode GEMM requires both scale tensors")
+        if block_size is None:
+            raise ValueError("gfx950 MXFP8 decode GEMM requires block_size")
+        return _mm_mxfp8_decode_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            out=out,
+        )
+
+    # Packed E2M1 weight in 16x16 MFMA-tile order (preshuffle_mxfp4_weight).
+    MXFP4_LINEAR_MFMA_LAYOUT = "mfma_16x16"
+    # The kernels address the weight with 32-bit buffer offsets.
+    _MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS = 2**31 - 1
+
+    def prepare_mxfp4_linear_mfma_weight(weight: torch.Tensor) -> torch.Tensor:
+        """Reorder a checkpoint ``[N, K/2]`` MXFP4 weight for the gfx950 kernels."""
+        return _preshuffle_mxfp4_weight(weight)
+
+    @register_kernel(
+        "gemm",
+        "mxfp4_linear",
+        name="gluon_mxfp4_linear_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=MXFP4_LINEAR_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "n_align": frozenset({16}),
+            "k_align": frozenset({64}),
+            "weight_elements_max": frozenset({_MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS}),
+            "weight_layout": frozenset({MXFP4_LINEAR_MFMA_LAYOUT}),
+        },
+    )
+    def gluon_mxfp4_linear_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``mxfp4(x) @ W.T`` with in-kernel activation quantization."""
+        return _mxfp4_linear_impl(x, weight, weight_scale, out=out)
+
+    @register_kernel(
+        "gemm",
+        "mxfp4_swiglu_linear",
+        name="gluon_mxfp4_swiglu_linear_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=MXFP4_LINEAR_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "n_align": frozenset({32}),
+            "k_align": frozenset({64}),
+            "weight_elements_max": frozenset({_MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS}),
+            "weight_layout": frozenset({MXFP4_LINEAR_MFMA_LAYOUT}),
+        },
+    )
+    def gluon_mxfp4_swiglu_linear_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``silu(gate) * up`` of ``mxfp4(x) @ W.T`` fused into one GEMM."""
+        return _mxfp4_swiglu_linear_impl(x, weight, weight_scale, out=out)
 
     @register_kernel(
         "gemm",
         "bmm",
         name="gluon_bmm_a16w16_gfx950",
         solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset(
-            {
-                format_signature(
-                    a=dense_tensor_format(torch.bfloat16),
-                    b=dense_tensor_format(torch.bfloat16),
-                ),
-            }
-        ),
+        capability=_GFX950_CAPABILITY,
+        signatures=_DENSE16_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
             "batch": frozenset({12, 16}),
@@ -73,8 +379,8 @@ if current_platform().is_amd:
             "k": frozenset({128}),
             "a_inner_stride_one": frozenset({True}),
             "b_n_stride_one": frozenset({True}),
-            "out_inner_stride_one": frozenset({True}),
             "out_dtype": frozenset({torch.bfloat16}),
+            "out_inner_stride_one": frozenset({True}),
         },
     )
     def gluon_bmm_a16w16_gfx950(
@@ -112,9 +418,140 @@ if current_platform().is_amd:
         return output
 
     if current_platform().is_cdna5:
+        from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.decode_mm import (
+            launch_gluon_mm_fp8_blockscale_gfx1250 as _mm_fp8_blockscale_gfx1250_impl,
+        )
+        from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.decode_mm import (
+            launch_gluon_mm_mxfp8_ue8m0_gfx1250 as _mm_mxfp8_ue8m0_gfx1250_impl,
+        )
+
+        _GFX1250_MXFP8_COMMON_TRAITS = {
+            "a_inner_stride_one": frozenset({True}),
+            "a_scales_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "b_scales_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "out_inner_stride_one": frozenset({True}),
+        }
+
+        @register_kernel(
+            "gemm",
+            "mm",
+            name="gluon_mm_mxfp8_ue8m0_gfx1250",
+            solution="gluon",
+            capability=CapabilityRequirement(
+                min_arch_version=ArchVersion(12, 5),
+                max_arch_version=ArchVersion(12, 5),
+                vendors=frozenset({"amd"}),
+            ),
+            signatures=frozenset(
+                {
+                    format_signature(
+                        a=tensor_format(
+                            "mxfp8",
+                            _FP8_DTYPE,
+                            scale=_MXFP8_UE8M0_SCALE,
+                        ),
+                        b=tensor_format(
+                            "mxfp8",
+                            _FP8_DTYPE,
+                            scale=_MXFP8_UE8M0_SCALE,
+                        ),
+                    )
+                }
+            ),
+            priority=Priority.SPECIALIZED,
+            traits={
+                "m": frozenset(range(1, 17)),
+                "n_align": frozenset({16}),
+                "k_align": frozenset({32}),
+                "k_min": frozenset({256}),
+                **_GFX1250_MXFP8_COMMON_TRAITS,
+            },
+        )
+        def gluon_mm_mxfp8_ue8m0_gfx1250(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            A_scales: torch.Tensor | None,
+            B_scales: torch.Tensor | None,
+            out_dtype: torch.dtype,
+            *,
+            alpha: torch.Tensor | None = None,
+            block_size: list[int] | None = None,
+            out: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            return _mm_mxfp8_ue8m0_gfx1250_impl(
+                A,
+                B,
+                A_scales,
+                B_scales,
+                out_dtype,
+                alpha=alpha,
+                block_size=block_size,
+                out=out,
+            )
+
+        @register_kernel(
+            "gemm",
+            "mm",
+            name="gluon_mm_fp8_blockscale_gfx1250",
+            solution="gluon",
+            capability=CapabilityRequirement(
+                min_arch_version=ArchVersion(12, 5),
+                max_arch_version=ArchVersion(12, 5),
+                vendors=frozenset({"amd"}),
+            ),
+            signatures=frozenset(
+                {
+                    format_signature(
+                        a=tensor_format(
+                            "mxfp8",
+                            _FP8_DTYPE,
+                            scale=_FP8_BLOCK_SCALE,
+                        ),
+                        b=tensor_format(
+                            "mxfp8",
+                            _FP8_DTYPE,
+                            scale=_FP8_BLOCK_SCALE,
+                        ),
+                    )
+                }
+            ),
+            priority=Priority.SPECIALIZED,
+            traits={
+                "m": frozenset(range(1, 17)),
+                "n_align": frozenset({128}),
+                "k_align": frozenset({128}),
+                "k_min": frozenset({128}),
+                **_GFX1250_MXFP8_COMMON_TRAITS,
+            },
+        )
+        def gluon_mm_fp8_blockscale_gfx1250(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            A_scales: torch.Tensor | None,
+            B_scales: torch.Tensor | None,
+            out_dtype: torch.dtype,
+            *,
+            alpha: torch.Tensor | None = None,
+            block_size: list[int] | None = None,
+            out: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            return _mm_fp8_blockscale_gfx1250_impl(
+                A,
+                B,
+                A_scales,
+                B_scales,
+                out_dtype,
+                alpha=alpha,
+                block_size=block_size,
+                out=out,
+            )
+
         try:
             from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.linear_attnres_partials_gfx1250 import (
-                gluon_linear_attnres_partials_gfx1250 as _linear_attnres_partials_gfx1250_impl,
+                launch_gluon_linear_attnres_partials_gfx1250 as _linear_attnres_partials_gfx1250_impl,
             )
         except ImportError:
             _linear_attnres_partials_gfx1250_impl = None
@@ -165,6 +602,12 @@ if current_platform().is_amd:
 
     else:
 
+        def gluon_mm_mxfp8_ue8m0_gfx1250(*args, **kwargs):
+            raise RuntimeError("gluon_mm_mxfp8_ue8m0_gfx1250 requires CDNA5")
+
+        def gluon_mm_fp8_blockscale_gfx1250(*args, **kwargs):
+            raise RuntimeError("gluon_mm_fp8_blockscale_gfx1250 requires CDNA5")
+
         def gluon_linear_attnres_partials_gfx1250(**kwargs):
             raise RuntimeError("gluon_linear_attnres_partials_gfx1250 requires CDNA5")
 
@@ -175,11 +618,7 @@ if current_platform().is_amd:
             "linear_attnres_partials",
             name="gluon_linear_attnres_partials_gfx950",
             solution="gluon",
-            capability=CapabilityRequirement(
-                min_arch_version=ArchVersion(9, 5),
-                max_arch_version=ArchVersion(9, 5),
-                vendors=frozenset({"amd"}),
-            ),
+            capability=_GFX950_CAPABILITY,
             signatures=frozenset(
                 {
                     format_signature(
@@ -208,10 +647,43 @@ if current_platform().is_amd:
 
         def gluon_linear_attnres_partials_gfx950(**kwargs):
             raise ImportError(
-                "gluon_linear_attnres_partials_gfx950 requires tokenspeed-kernel-amd"
-            ) from _IMPORT_ERROR
+                "gluon_linear_attnres_partials_gfx950 requires "
+                f"tokenspeed-kernel-amd: {_IMPORT_ERROR_MESSAGE}"
+            )
 
 else:
+
+    def gluon_mm_a16w16_prefill_gfx950(**kwargs):
+        raise ImportError(
+            "gluon_mm_a16w16_prefill_gfx950 requires tokenspeed-kernel-amd"
+        )
+
+    def gluon_mm_mxfp8_gfx950(**kwargs):
+        raise ImportError("gluon_mm_mxfp8_gfx950 requires tokenspeed-kernel-amd")
+
+    MXFP4_LINEAR_MFMA_LAYOUT = None
+
+    def prepare_mxfp4_linear_mfma_weight(weight):
+        raise ImportError(
+            "prepare_mxfp4_linear_mfma_weight requires tokenspeed-kernel-amd"
+        )
+
+    def gluon_mxfp4_linear_gfx950(*args, **kwargs):
+        raise ImportError("gluon_mxfp4_linear_gfx950 requires tokenspeed-kernel-amd")
+
+    def gluon_mxfp4_swiglu_linear_gfx950(*args, **kwargs):
+        raise ImportError(
+            "gluon_mxfp4_swiglu_linear_gfx950 requires tokenspeed-kernel-amd"
+        )
+
+    def gluon_mm_mxfp8_decode_gfx950(**kwargs):
+        raise ImportError("gluon_mm_mxfp8_decode_gfx950 requires tokenspeed-kernel-amd")
+
+    def gluon_mm_mxfp8_ue8m0_gfx1250(*args, **kwargs):
+        raise ImportError("gluon_mm_mxfp8_ue8m0_gfx1250 requires AMD CDNA5")
+
+    def gluon_mm_fp8_blockscale_gfx1250(*args, **kwargs):
+        raise ImportError("gluon_mm_fp8_blockscale_gfx1250 requires AMD CDNA5")
 
     def gluon_linear_attnres_partials_gfx950(**kwargs):
         raise ImportError(
@@ -225,6 +697,15 @@ else:
 
 
 __all__ = [
+    "MXFP4_LINEAR_MFMA_LAYOUT",
+    "gluon_mxfp4_linear_gfx950",
+    "gluon_mxfp4_swiglu_linear_gfx950",
+    "prepare_mxfp4_linear_mfma_weight",
+    "gluon_mm_a16w16_prefill_gfx950",
+    "gluon_mm_mxfp8_gfx950",
+    "gluon_mm_mxfp8_decode_gfx950",
+    "gluon_mm_fp8_blockscale_gfx1250",
+    "gluon_mm_mxfp8_ue8m0_gfx1250",
     "gluon_linear_attnres_partials_gfx950",
     "gluon_linear_attnres_partials_gfx1250",
 ]

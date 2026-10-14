@@ -27,10 +27,6 @@ MLA_QK_ROPE_DIM = 64
 MLA_LATENT_DIM = MLA_KV_LORA_RANK + MLA_QK_ROPE_DIM
 
 
-def _poison(shape, device="cuda", dtype=torch.int32):
-    return torch.full(shape, 987_654, device=device, dtype=dtype)
-
-
 def kimi_recipe(
     *,
     text_config=None,
@@ -108,8 +104,11 @@ def kimi_recipe(
     )
     return KimiK3Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             max_total_tokens=None,
             chunked_prefill_size=max_scheduled_tokens,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         ),
@@ -120,6 +119,7 @@ def kimi_recipe(
         ),
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=1 << 34,
+        probe_batch_rows=None,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )
@@ -164,7 +164,7 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
     recipe = kimi_recipe()
     group_ids = recipe.target_group_ids
     layer_types = recipe.layer_types
-    from cache_pool_test_utils import make_pool
+    from test.runtime.cache_pool_test_utils import make_pool
 
     _, pool = make_pool(
         HybridKDATokenToKVPool,
@@ -181,11 +181,6 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
     )
     return pool
-
-
-@pytest.fixture(scope="module")
-def kimi_pool():
-    return make_kimi_pool("cpu", usable_pages=1)
 
 
 def layer_for_group(pool, group_id: str) -> int:

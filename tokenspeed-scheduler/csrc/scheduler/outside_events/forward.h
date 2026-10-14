@@ -51,6 +51,7 @@ struct UpdateReserveNumTokens {
 struct Abort {
     std::string request_id;
 };
+
 }  // namespace forward
 
 using ForwardEvent =

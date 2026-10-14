@@ -73,12 +73,20 @@ class Reg(enum.IntEnum):
     USER1 = 9
     USER2 = 10
     USER3 = 11
+    USER4 = 12
+    USER5 = 13
+    USER6 = 14
+    USER7 = 15
     # Pointer slots: per-step tensor base addresses (data_ptr) go here.
     PTR0 = 16
     PTR1 = 17
     PTR2 = 18
     PTR3 = 19
     PTR4 = 20
+    PTR5 = 21
+    PTR6 = 22
+    PTR7 = 23
+    PTR8 = 24
 
 
 def _ref(v: "int | Reg") -> int:
@@ -235,15 +243,13 @@ class PrepTape:
         state_in: torch.Tensor,
         state_out: torch.Tensor,
         rows_ptr: Reg,
-        seq_lens_ptr: Reg,
         bs: "int | Reg",
-        max_slots: "int | Reg",
-        page_size: int,
+        row_stride: "int | Reg",
     ) -> None:
-        """Decode dual-index state paging for one group (before = after-1):
-        ``state_in[i] = rows[i, clamp((after-2)//P)]`` (0 when no history),
-        ``state_out[i] = rows[i, clamp((after-1)//P)]``. ``rows`` and
-        ``seq_lens`` are per-step tensors passed via pointer registers."""
+        """Decode state paging over one group's two-slot block table:
+        ``state_in[i] = rows[i, 0] if rows[i, 0] > 0 else rows[i, 1]`` and
+        ``state_out[i] = rows[i, 1]``. ``rows`` is a per-step tensor passed
+        via a pointer register; ``row_stride`` is its row stride in int32s."""
         self._stages[-1].append(
             [
                 _OP_STATE_PAGES,
@@ -251,9 +257,9 @@ class PrepTape:
                 _ref(rows_ptr),
                 _check(state_out, "state_out").data_ptr(),
                 _ref(bs),
-                _ref(max_slots),
-                int(page_size),
-                _ref(seq_lens_ptr),
+                _ref(row_stride),
+                0,
+                0,
             ]
         )
         self._keepalive += [state_in, state_out]

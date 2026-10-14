@@ -124,6 +124,8 @@ def _run_case(
         *parameters,
         initial_state=recurrent_state,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens.to("cpu", torch.int64),
+        capacity=None,
         lower_bound=LOWER_BOUND,
         solution="flashkda",
     )

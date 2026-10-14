@@ -87,6 +87,10 @@ POOL = 8  # max_req_pool_size → pool_rows == POOL + 1
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         max_bs=4,
         max_draft_tokens_per_req=4,
         max_req_pool_size=POOL,
@@ -442,6 +446,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         direct_sampler.assert_called_once()
@@ -503,6 +508,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         top_p_sampler.assert_called_once()
@@ -515,6 +521,10 @@ class TestTritonRouteSelection(unittest.TestCase):
         bs, n, vocab = 32, 4, 32768
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                synthetic_acceptance_length=None,
+                enable_speculative_sampling=False,
+                sampling_stream="batch",
+                logprob_order="torch",
                 max_bs=bs,
                 max_draft_tokens_per_req=n,
                 max_req_pool_size=POOL + bs,
@@ -581,6 +591,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         qrita_sampler.assert_called_once()
@@ -596,6 +607,10 @@ class TestTritonRouteSelection(unittest.TestCase):
         bs, n, vocab = 32, 4, 200064
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                synthetic_acceptance_length=None,
+                enable_speculative_sampling=False,
+                sampling_stream="batch",
+                logprob_order="torch",
                 max_bs=bs,
                 max_draft_tokens_per_req=n,
                 max_req_pool_size=POOL + bs,
@@ -662,6 +677,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         qrita_sampler.assert_called_once()
@@ -704,26 +720,6 @@ class TestTritonRouteSelection(unittest.TestCase):
             variant=CUDA_GRAPH_VARIANT_DEFAULT,
         )
         self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_GENERIC)
-
-    def test_triton_verify_is_owned_by_triton_backend(self):
-        self.assertFalse(issubclass(TritonSamplingBackend, FlashInferSamplingBackend))
-        self.assertIsNot(TritonSamplingBackend.verify, FlashInferSamplingBackend.verify)
-        self.assertIsNot(
-            TritonFullSamplingBackend.verify,
-            FlashInferFullSamplingBackend.verify,
-        )
-        self.assertTrue(issubclass(TritonFullSamplingBackend, TritonSamplingBackend))
-        self.assertFalse(
-            issubclass(TritonFullSamplingBackend, FlashInferFullSamplingBackend)
-        )
-
-    def test_triton_reuses_pool_state_without_flashinfer_probability_state(self):
-        self.assertTrue(hasattr(self.backend, "_temperature_pool"))
-        self.assertTrue(hasattr(self.backend, "_top_k_pool"))
-        self.assertTrue(hasattr(self.backend, "_top_p_pool"))
-        self.assertTrue(hasattr(self.backend, "_seed_pool"))
-        self.assertFalse(hasattr(self.backend, "_coins_buf"))
-        self.assertFalse(hasattr(self.backend, "_generator_per_slot"))
 
 
 class TestTritonLogprobOutputs(unittest.TestCase):

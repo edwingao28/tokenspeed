@@ -23,9 +23,9 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
-import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as gluon_sigmoid_topk
+import tokenspeed_kernel.ops.moe.gluon as gluon_sigmoid_topk
 import torch
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
+from tokenspeed_kernel.ops.moe import _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -35,12 +35,10 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import routing  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     _biased_grouped_topk_reference,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (  # noqa: E402
-    gluon_topk_route_supported,
     invoke_sigmoid_bias_topk_route_gluon,
     invoke_sigmoid_bias_topk_route_prefill_gluon,
 )
@@ -64,12 +62,6 @@ def _route_reference(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
     )
-
-
-def test_gluon_topk_route_rejects_cpu_tensor() -> None:
-    router = torch.empty((16, 384), dtype=torch.bfloat16)
-
-    assert not gluon_topk_route_supported(router, 8)
 
 
 def test_public_sigmoid_bias_topk_dispatch_uses_gluon_kernel(
@@ -169,31 +161,6 @@ def test_public_sigmoid_bias_topk_retains_decode_route_above_prefill_topk(
 
     assert actual_weights is sentinel_weights
     assert actual_ids is sentinel_ids
-
-
-@pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
-def test_sigmoid_bias_topk_route_gluon_fuses_sigmoid(
-    monkeypatch: pytest.MonkeyPatch,
-    dtype: torch.dtype,
-) -> None:
-    logits = torch.zeros((1, 8), device="cuda", dtype=dtype)
-    correction_bias = torch.zeros(8, device="cuda", dtype=torch.float32)
-    sentinel_ids = torch.empty((1, 2), device="cuda", dtype=torch.int32)
-    sentinel_weights = torch.empty((1, 2), device="cuda", dtype=torch.float32)
-
-    def launch(route_input, bias, topk, **kwargs):
-        assert route_input is logits
-        assert bias is correction_bias
-        assert topk == 2
-        return sentinel_ids, sentinel_weights
-
-    monkeypatch.setattr(routing, "_launch_sigmoid_bias_topk_route_gluon", launch)
-    actual_ids, actual_weights = invoke_sigmoid_bias_topk_route_gluon(
-        logits, correction_bias, 2
-    )
-
-    assert actual_ids is sentinel_ids
-    assert actual_weights is sentinel_weights
 
 
 @pytest.mark.parametrize("dtype", _ROUTE_DTYPES)

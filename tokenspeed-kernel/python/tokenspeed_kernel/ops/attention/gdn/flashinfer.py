@@ -108,20 +108,6 @@ def is_decode_available() -> bool:
     return platform.is_hopper_plus
 
 
-def is_decode_supported(head_dim: int, dtype: torch.dtype) -> bool:
-    """Whether ``gdn_decode_step``/``gdn_decode_mtp`` support this shape/dtype.
-
-    Both kernels require K == V == 128 and a float16/bfloat16 q/k/v dtype. The
-    recurrent state pool may be float32 or bfloat16; FlashInfer dispatches the
-    latter to its dedicated BF16-state kernel.
-    """
-    return (
-        is_decode_available()
-        and head_dim == SUPPORTED_HEAD_DIM
-        and dtype in (torch.float16, torch.bfloat16)
-    )
-
-
 CHUNK_SIZE = 64
 
 flashinfer_gdn_chunk_prefill = error_fn
@@ -142,13 +128,11 @@ if is_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
-            "head_v_dim": frozenset({SUPPORTED_HEAD_DIM}),
-            "head_v_eq_head_k": frozenset({True}),
+            "value_head_dim": frozenset({SUPPORTED_HEAD_DIM}),
             "num_v_gte_num_q": frozenset({True}),
-            "qk_l2norm": frozenset({False, True}),
             "output_h": frozenset({False, True}),
+            "qk_l2norm": frozenset({False, True}),
         },
-        tags={"hopper", "blackwell", "latency"},
     )
     def flashinfer_gdn_chunk_prefill(
         q: torch.Tensor,
@@ -250,6 +234,9 @@ if is_available():
             # upstream. Disabling CP can slow long-context GDN prefill but
             # does not change correctness.
             use_cp=False,
+            # Keep the CuTe implementation wrapped by our PDL adapter; 0.7.0's
+            # default auto backend may otherwise bypass it through Cake GDN.
+            backend="flashinfer",
             enable_pdl=pdl_enabled(),
         )
 
@@ -297,7 +284,6 @@ if is_decode_available():
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
         },
-        tags={"hopper", "latency"},
     )
     def flashinfer_gdn_decode_step(
         q: torch.Tensor,
@@ -334,6 +320,7 @@ if is_decode_available():
         dt_bias = dt_bias.detach().float()
         out, _ = _gated_delta_rule_decode_pretranspose(
             enable_pdl=pdl_enabled(),
+            backend="flashinfer",
             q=q,
             k=k,
             v=v,
@@ -365,8 +352,9 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "separate_output_state": frozenset({False}),
+            "strided_qkv": frozenset({False}),
         },
-        tags={"hopper", "latency", "speculative-decoding"},
     )
     def flashinfer_gdn_decode_mtp(
         q: torch.Tensor,
@@ -384,6 +372,9 @@ if is_decode_available():
         use_qk_l2norm: bool = True,
         intermediate_states_buffer: torch.Tensor | None = None,
         output_state_indices: torch.Tensor | None = None,
+        output_state: torch.Tensor | None = None,
+        tree_ancestors: torch.Tensor | None,
+        replay_payload: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one multi-token (T>1) GDN MTP verify step, K-last pool+indices.
 
@@ -420,6 +411,14 @@ if is_decode_available():
 
         Returns the [B, T, HV, V] decode output (q.dtype).
         """
+        if tree_ancestors is not None or replay_payload is not None:
+            raise NotImplementedError(
+                "FlashInfer GDN MTP kernels follow a chain; draft trees run the Triton kernel"
+            )
+        if output_state is not None:
+            raise NotImplementedError(
+                "FlashInfer GDN MTP kernels write states into initial_state only"
+            )
         # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
         A_log = A_log.detach().float()
         dt_bias = dt_bias.detach().float()

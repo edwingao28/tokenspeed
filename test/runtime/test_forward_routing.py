@@ -101,9 +101,11 @@ def _handle(trace, kv_transfer=None):
 
 
 def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None):
-    """A round's ExecutionPlan as execute() reads it."""
+    """A round's ExecutionPlan as execute() reads it: every cache group is
+    listed under ``pages_to_zero``, empty or not."""
     return SimpleNamespace(
-        pages_to_zero=list(pages_to_zero),
+        pages_to_zero={"kv": list(pages_to_zero), "state": []},
+        pages_to_copy_arrays=dict,
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
@@ -122,6 +124,8 @@ def _planned(*, num_extends=0):
         grammar_inputs="GRAMMAR",
         multimodal_context="MM",
         ngram_inputs=None,
+        request_history_seeds=None,
+        input_logprob_plan=None,
     )
 
 
@@ -151,7 +155,8 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     remote_prefill = SimpleNamespace(request_pool_indices=[3, 4], num_extends=lambda: 1)
 
     pending = handle.execute(
-        _plan(pages_to_zero=[7], remote_prefill=remote_prefill), None
+        _plan(pages_to_zero=[7], remote_prefill=remote_prefill),
+        None,
     )
     trace.remove("submit")  # the zeroing submission itself
     trace.remove("submit")  # the receive submission itself
@@ -159,7 +164,12 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     # No model output this round, and the whole path ran as one unit on the
     # data plane, with the zeroing barrier before the manifest is published.
     assert pending is None
-    assert trace == [("slots", [3]), "seed-lengths", "zero-sync", "rdma"]
+    assert trace == [
+        ("slots", [3]),
+        "seed-lengths",
+        "zero-sync",
+        "rdma",
+    ]
 
 
 def test_decode_node_masks_local_batches_with_the_batch_grammar():
@@ -181,7 +191,8 @@ def test_prefill_node_sends_remote_decodes_from_the_plan_stream():
     remote_decode = SimpleNamespace(request_ids=["done"])
 
     pending = _handle(trace, _PrefillPeer(trace)).execute(
-        _plan(remote_decode=remote_decode), _planned(num_extends=1)
+        _plan(remote_decode=remote_decode),
+        _planned(num_extends=1),
     )
 
     # The send reads KV that earlier forwards wrote, so it rides the FIFO
@@ -234,7 +245,10 @@ def test_a_failed_transfer_submission_surfaces_at_the_next_round():
 
     peer.execute = _boom
     handle = _handle(trace, peer)
-    handle.execute(_plan(remote_decode=SimpleNamespace(request_ids=["x"])), None)
+    handle.execute(
+        _plan(remote_decode=SimpleNamespace(request_ids=["x"])),
+        None,
+    )
 
     with pytest.raises(RuntimeError, match="transfer submission failed"):
         handle.execute(_plan(), None)

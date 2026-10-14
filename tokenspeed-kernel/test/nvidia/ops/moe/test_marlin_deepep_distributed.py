@@ -42,6 +42,10 @@ import pytest
 import torch
 import torch.distributed as dist
 from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.ops.communication.deep_ep import DeepEPBuffer
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from utils import make_mxfp4_moe_weights
 
 
@@ -58,7 +62,6 @@ def _deepep_mode() -> str:
     reason="launch with torchrun world size 2, 4, or 8",
 )
 def test_marlin_deepep_matches_replicated_reference() -> None:
-    import tokenspeed_kernel
 
     world_size = _world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -120,6 +123,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     module.w13_weight_scale = torch.nn.Parameter(raw["w13_scale"][lo:hi].clone(), False)
     module.w2_weight = torch.nn.Parameter(raw["w2_weight"][lo:hi].clone(), False)
     module.w2_weight_scale = torch.nn.Parameter(raw["w2_scale"][lo:hi].clone(), False)
+    module.hidden_size = hidden_size
     module.top_k = top_k
     module.num_experts = num_experts
     module.num_local_experts = num_local
@@ -130,7 +134,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     module.activation_situ_linear_beta = linear_beta
 
     mode = _deepep_mode()
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -139,17 +143,25 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         ep_size=world_size,
         ispp=intermediate_size,
         internal_activation_dtype="input",
-        deepep_group=dist.group.WORLD,
+        process_group=dist.group.WORLD,
         deepep_mode=mode,
         deepep_low_latency_max_num_tokens_per_gpu=(
             num_tokens if mode == "low_latency" else None
         ),
         solution="marlin",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "marlin_mxfp4_deepep_moe_apply"
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
+    prepared_buffer = DeepEPBuffer._buffer
+    assert prepared_buffer is not None
 
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         x,
         module,
@@ -159,5 +171,6 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         low_latency=(mode == "low_latency"),
     )
 
+    assert DeepEPBuffer._buffer is prepared_buffer
     torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
     dist.barrier()

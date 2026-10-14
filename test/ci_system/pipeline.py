@@ -31,13 +31,30 @@ except ImportError as exc:  # pragma: no cover
 
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
-SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
+# Task types that start a server. They serve with the JIT compile check armed
+# as an error: a compile-time kernel parameter that keeps taking new values
+# after startup (a per-batch constexpr) fails the run instead of stalling it.
+SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
+JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
+SUPPORTED_TRIGGERS = {
+    "per-commit",
+    "post-submit",
+    "manual",
+    "nightly",
+    "debug",
+    "slurm",
+}
+# Task triggers each scan trigger selects. `per-commit` tasks run on pull
+# requests and on pushes to main; `post-submit` tasks run only on pushes.
+SCAN_TRIGGER_TASK_TRIGGERS = {"post-submit": {"per-commit", "post-submit"}}
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
     "kernel-benchmark": {"perf"},
     "model-test": {"eval", "perf"},
 }
 SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
+# Kernel benchmark suite definitions are read only by `kernel-benchmark` tasks.
+KERNEL_BENCHMARK_SUITE_DIRECTORY = "tokenspeed-kernel/benchmarks/"
 SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # Lower sort key = dispatched earlier. GitHub Actions starts matrix jobs in
 # include-list order, so `high` entries reach runner pools first when several
@@ -392,9 +409,10 @@ def build_matrix(
         raise ValueError(f"unsupported multi-node filter: {multi_node!r}")
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
+    task_triggers = SCAN_TRIGGER_TASK_TRIGGERS.get(trigger, {trigger})
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
-        if trigger and trigger not in task["triggers"]:
+        if trigger and task_triggers.isdisjoint(task["triggers"]):
             continue
         is_multi_node = task.get("slurm", {}).get("nodes", 1) > 1
         if multi_node == "only" and not is_multi_node:
@@ -483,6 +501,18 @@ def merge_env(task_env: Dict[str, Any]) -> Dict[str, str]:
     env = os.environ.copy()
     env.update({key: str(value) for key, value in task_env.items()})
     return env
+
+
+def get_stage_command_env(stage_name: str, env: Dict[str, str]) -> Dict[str, str]:
+    """Route evaluation-tool installs to their dedicated package cache."""
+    if stage_name not in {"eval.install", "perf.install"}:
+        return env
+    evalscope_cache = env.get("EVALSCOPE_UV_CACHE_DIR")
+    if not evalscope_cache:
+        return env
+    stage_env = env.copy()
+    stage_env["UV_CACHE_DIR"] = evalscope_cache
+    return stage_env
 
 
 def get_default_runner_env(runner: str) -> Dict[str, str]:
@@ -827,14 +857,14 @@ def setup_runner(
             cwd=cwd,
             dry_run=dry_run,
         )
+    # Runner images normally provide ninja. Avoid refreshing every apt index on
+    # each ephemeral runner when the required executable is already available;
+    # slow package mirrors otherwise hold GPUs idle before task installation.
     shell_run(
-        "sudo apt-get -o Acquire::Retries=5 update -q",
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
-    shell_run(
-        "sudo apt-get install -y ninja-build",
+        "if ! command -v ninja >/dev/null 2>&1; then "
+        "sudo apt-get -o Acquire::Retries=5 update -q && "
+        "sudo apt-get install -y ninja-build; "
+        "fi",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,
@@ -1251,15 +1281,19 @@ def check_eval_score_threshold(
     }
 
 
-PERF_CSV_HEADER = (
-    "config,Conc.,Latency (tps/user),Throughput (tps/gpu),"
-    "Approx Cache Hit,Decoded Tok/Iter"
+PERF_THROUGHPUT_METRICS = (
+    "Throughput (tps/gpu)",
+    "Output Throughput (tok/min/gpu)",
 )
-PERF_REFERENCE_METRICS = ("Latency (tps/user)", "Throughput (tps/gpu)")
+PERF_CSV_HEADERS = tuple(
+    f"config,Conc.,Latency (tps/user),{metric},Approx Cache Hit,Decoded Tok/Iter"
+    for metric in PERF_THROUGHPUT_METRICS
+)
 
 
 def extract_perf_summary_rows(output: str) -> List[Dict[str, str]] | None:
-    idx = output.find(PERF_CSV_HEADER)
+    positions = [output.find(header) for header in PERF_CSV_HEADERS]
+    idx = min((position for position in positions if position >= 0), default=-1)
     if idx < 0:
         return None
     block = output[idx:]
@@ -1320,7 +1354,7 @@ def check_perf_reference(
             ) from exc
         if not isinstance(ref_pair, list) or len(ref_pair) != 2:
             raise ValueError(
-                f"perf_reference[{conc_key}] must be [tps_user, tps_gpu]; "
+                f"perf_reference[{conc_key}] must be [tps_user, throughput_per_gpu]; "
                 f"got {ref_pair!r}"
             )
         match = next((r for r in rows if int(r["Conc."]) == conc), None)
@@ -1328,7 +1362,10 @@ def check_perf_reference(
             failures.append(f"conc={conc}: no matching row in perf summary")
             continue
         entry: Dict[str, Any] = {"conc": conc}
-        for metric, ref in zip(PERF_REFERENCE_METRICS, ref_pair):
+        throughput_metric = next(
+            metric for metric in PERF_THROUGHPUT_METRICS if metric in match
+        )
+        for metric, ref in zip(("Latency (tps/user)", throughput_metric), ref_pair):
             ref_v = float(ref)
             actual = float(match[metric])
             floor = ref_v * threshold
@@ -1387,7 +1424,11 @@ def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
     lines = [header, rule]
     for entry in checks:
         lat = entry.get("Latency (tps/user)") or {}
-        thru = entry.get("Throughput (tps/gpu)") or {}
+        thru = (
+            entry.get("Throughput (tps/gpu)")
+            or entry.get("Output Throughput (tok/min/gpu)")
+            or {}
+        )
         lines.append(
             f"{entry['conc']:>4}  "
             f"{lat.get('actual', 0):>10.2f} "
@@ -1417,7 +1458,11 @@ def format_perf_reference_markdown_table(checks: List[Dict[str, Any]]) -> List[s
     ]
     for entry in checks:
         lat = entry.get("Latency (tps/user)") or {}
-        thru = entry.get("Throughput (tps/gpu)") or {}
+        thru = (
+            entry.get("Throughput (tps/gpu)")
+            or entry.get("Output Throughput (tok/min/gpu)")
+            or {}
+        )
         lines.append(
             f"| {entry['conc']} "
             f"| {lat.get('actual', 0):.2f} "
@@ -1572,6 +1617,19 @@ def write_detailed_step_summary(result: Dict[str, Any]) -> None:
             f"warning: could not write GitHub step summary: {exc}",
             file=sys.stderr,
         )
+
+
+def source_sha(repo_root: Path) -> str | None:
+    # Slurm snapshots have no .git directory; the trusted launcher supplies
+    # their archive SHA, without requiring a git binary inside the container.
+    value = os.environ.get("TOKENSPEED_CI_SOURCE_SHA", "")
+    if re.fullmatch(r"[0-9a-f]{40}", value):
+        return value
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True
+    )
+    value = result.stdout.strip() if result.returncode == 0 else ""
+    return value if re.fullmatch(r"[0-9a-f]{40}", value) else None
 
 
 def write_result(path: str | None, payload: Dict[str, Any]) -> None:
@@ -1798,6 +1856,21 @@ def execute_task(
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
+    if setup_mode == "ci" and runner.startswith("b200v2-"):
+        # Use the same persistent root as package_cache.sh.
+        cache_root = env.get("CI_CACHE_ROOT") or str(
+            Path(env.get("FLASHINFER_CACHE_DIR") or "/raid/cache/flashinfer").parent
+        )
+        env.setdefault(
+            "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR",
+            os.path.join(cache_root, "tokenspeed", "flashinfer-autotune"),
+        )
+    if task["type"] in SERVING_TASK_TYPES:
+        # Only the task itself may relax the check; a value inherited from
+        # the runner's environment must not.
+        env[JIT_COMPILE_CHECK_ENV] = str(
+            task.get("env", {}).get(JIT_COMPILE_CHECK_ENV, "error")
+        )
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
@@ -1890,6 +1963,8 @@ def execute_task(
                     server_command = configure_slurm_server_command(
                         server_command, int(ready["timeout"])
                     )
+                elif not is_amd_runner(runner):
+                    ready["timeout"] = max(int(ready.get("timeout", 600)), 3600)
                 if serve_only:
                     if pgm is not None:
                         command_result = pgm.run(
@@ -1957,16 +2032,17 @@ def execute_task(
                     run_perf_diagnostics(
                         "before perf command", runner_env, repo_root, dry_run
                     )
+                command_env = get_stage_command_env(stage_name, runner_env)
                 if pgm is not None:
                     command_result = pgm.run(
                         command,
                         cwd=repo_root,
-                        env=runner_env,
+                        env=command_env,
                         dry_run=dry_run,
                     )
                 else:
                     command_result = shell_run(
-                        command, env=runner_env, cwd=repo_root, dry_run=dry_run
+                        command, env=command_env, cwd=repo_root, dry_run=dry_run
                     )
                 command_result["stage"] = stage_name
                 command_result.update(
@@ -2040,6 +2116,8 @@ def execute_task(
     result = {
         "ok": error is None,
         "task": task["name"],
+        "config": os.path.relpath(repo_root / config, repo_root),
+        "source_sha": source_sha(repo_root),
         "type": task["type"],
         "runner": runner,
         "setup_mode": setup_mode,
@@ -2074,6 +2152,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
     scan_parser = subparsers.add_parser("scan", help="Scan CI task specs into a matrix")
     scan_parser.add_argument("--root", default="test/ci", help="Task root directory")
+    scan_parser.add_argument(
+        "--changed-files",
+        type=Path,
+        help="Optional changed-path list; only task-YAML-only diffs narrow the matrix",
+    )
     scan_parser.add_argument(
         "--trigger",
         choices=sorted(SUPPORTED_TRIGGERS),
@@ -2181,6 +2264,28 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.workflow_stage,
             args.multi_node,
         )
+        if args.changed_files is not None:
+            changed = args.changed_files.read_text(encoding="utf-8").splitlines()
+            suite_changed = any(
+                path.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY) for path in changed
+            )
+            # GitHub comparisons may truncate the file list at 300 entries.
+            if 0 < len(changed) < 300 and all(
+                (path.startswith("test/ci/") and path.endswith(".yaml"))
+                or path.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY)
+                for path in changed
+            ):
+                # Run the changed tasks, plus every kernel benchmark task when
+                # a suite definition changed; nothing else reads those files.
+                matrix["include"] = [
+                    entry
+                    for entry in matrix["include"]
+                    if entry["config"] in changed
+                    or (
+                        suite_changed
+                        and entry.get("workflow_stage") == "kernel-benchmark"
+                    )
+                ]
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 

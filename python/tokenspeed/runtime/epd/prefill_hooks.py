@@ -122,9 +122,7 @@ class EpdPrefillHooks:
                     loop.kv_transfer.abort(rid, bootstrap)
                 except Exception as exc:  # never let it wedge the loop
                     logger.warning(
-                        "EPD abort->decode signal failed for rid=%s: %s",
-                        rid,
-                        exc,
+                        f"EPD abort->decode signal failed for rid={rid!s}: {exc!s}",
                     )
             state.set_finish_with_abort("EPD embedding receive failed or timed out")
             loop.output_processor.publish_finished_at_admission(rid, state)
@@ -143,7 +141,7 @@ class EpdPrefillHooks:
                 loop.kv_transfer.register(rid, bootstrap)
             admitted_specs.append(spec)
         if admitted_specs:
-            loop.scheduler.submit_requests(admitted_specs)
+            loop._submit_scheduler_requests(admitted_specs)
         elif self._admission.has_pending():
             # Nothing advanced this cycle but requests are still receiving; yield the
             # GIL so the Python daemon transfer/recv threads run (rank-consistent:
@@ -151,12 +149,16 @@ class EpdPrefillHooks:
             time.sleep(0.0005)
 
     def assert_embeddings_received(self, multimodal_context) -> None:
-        """EPD invariant: every handshaked item is filled with its embedding by the
-        async EPD admission drain (EpdPrefillAdmission.drain) BEFORE admission, so by
-        it is already encoded. This is a defensive check, not a receive: a handshaked
-        item that reached the forward un-received leaked past async admission (the
-        only EPD admission path) -- fail loud instead of running the tower or
-        publishing shard-only rows. No-op for non-EPD / text-only requests.
+        """EPD invariant: every handshaked item this forward scatters is filled
+        with its embedding by the async EPD admission drain
+        (EpdPrefillAdmission.drain) BEFORE admission. This is a defensive check,
+        not a receive: such an item reaching the forward un-received leaked past
+        async admission (the only EPD admission path) -- fail loud instead of
+        running the tower or publishing shard-only rows. An item whose tokens
+        were all prefilled by an earlier chunk no longer holds its encoding
+        (the embedder drops it once nothing reads it) and is not scattered
+        again, so only items overlapping this chunk count. No-op for non-EPD /
+        text-only requests.
         """
         if (
             self._admission is None
@@ -164,14 +166,20 @@ class EpdPrefillHooks:
             or not multimodal_context.has_extend_inputs()
         ):
             return
-        for mm in multimodal_context.mm_inputs:
-            if mm is None:
+        for row, mm in enumerate(multimodal_context.mm_inputs):
+            if mm is None or row >= len(multimodal_context.extend_seq_lens):
                 continue
+            chunk_start = multimodal_context.extend_prefix_lens[row]
+            chunk_end = chunk_start + multimodal_context.extend_seq_lens[row]
             missing = [
                 i
                 for i, item in enumerate(mm.mm_items)
                 if getattr(item, "encode_handshake", None) is not None
                 and item.encoded is None
+                and any(
+                    start < chunk_end and chunk_start <= end
+                    for start, end in item.offsets or ()
+                )
             ]
             if missing:
                 raise RuntimeError(
